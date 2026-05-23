@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+*.egg-info/
+
+# MicroPython
+*.mpy
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# SDR captures — these are huge (MBs to GBs per file)
+*.bin
+*.iq
+*.complex
+*.cfile
+*.cu8
+*.cs8
+*.cs16
+*.cf32
+captures/
+sdr/captures/
+sdr/recordings/
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+build/
+dist/
+*.bin.firmware
+firmware-*.bin
+
+# Pi
+.cache/
+boot.log
+
+# Secrets (don't commit keys, wifi passwords, MQTT creds, etc.)
+secrets.py
+secrets.json
+config.local.*
+*.key
+keeloq_device_key.txt
+
+# Local notes that shouldn't be public
+TODO.local.md
+notes.local.md
+.scratch/
+
+# Claude Code local settings (not shared)
+.claude/settings.local.json

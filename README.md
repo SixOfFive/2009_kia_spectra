@@ -1,13 +1,13 @@
 # 2009 Kia Spectra — voltage-triggered remote start + telematics
 
-A pair of in-car ESP32 + Raspberry Pi Zero 2 W units that:
+An in-car ESP32 + Raspberry Pi Zero 2 W unit that:
 
-- Monitor battery voltage continuously at sub-mA average draw
-- Trigger the factory-installed Compustar remote start when voltage drops below a configurable threshold
-- Run the engine for 15 minutes, then shut it off
-- Stream live OBD-II data (RPM, speed, coolant, fuel, voltage, etc.) over CAN
-- Display gauges + a map on a 5" touchscreen
-- Expose state to the home network via WiFi (web UI + MQTT)
+- Monitors battery voltage continuously at sub-mA average draw
+- Triggers the factory-installed Compustar remote start when voltage drops below a configurable threshold
+- Runs the engine for 15 minutes, then shuts it off
+- Streams live OBD-II data (RPM, speed, coolant, fuel, voltage, etc.) over CAN
+- Displays gauges + a map on a 5" touchscreen
+- Exposes state to the home network via WiFi (web UI + MQTT)
 - Optional Bluetooth proximity tricks via phone
 
 The Compustar trigger is performed by software synthesis of the Keeloq rolling-code RF signal — the ESP32 plays the role of the FOB, allowing the in-car system to stay self-contained (FOB remains in the house).
@@ -50,10 +50,23 @@ The Compustar trigger is performed by software synthesis of the Keeloq rolling-c
 | `esp32/` | MicroPython firmware — voltage monitor, RF, CAN, comms |
 | `pi/` | Raspberry Pi Python application — UI, logging, MQTT, web |
 | `sdr/` | Tools and notes for SDR capture + Keeloq analysis |
+| `logs/` | Day-by-day build journal |
 
 ## Build status
 
-Pre-prototype. Parts on order.
+Pre-prototype. Parts on order. Follow [`logs/`](logs/) for day-by-day progress.
+
+## Reproducing this build
+
+This documentation describes a **single** unit. Parts list, wiring, and code are all single-unit. Build one and learn from it; scale to multiple if you have more vehicles.
+
+Start here:
+
+1. Read [`docs/BOM.md`](docs/BOM.md) — what to order
+2. Read [`docs/architecture.md`](docs/architecture.md) — how the pieces fit together
+3. Read [`docs/compustar-research.md`](docs/compustar-research.md) — what was learned about the installed remote start
+4. Follow [`sdr/README.md`](sdr/README.md) — the SDR capture + Keeloq reverse-engineering workflow
+5. Build out `esp32/` and `pi/` per their READMEs
 
 ## License
 

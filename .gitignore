@@ -37,9 +37,8 @@ captures/
 sdr/captures/
 sdr/recordings/
 
-# Logs
+# Logs (application logs only — NOT the daily journal at logs/YYYY-MM-DD.md)
 *.log
-logs/
 
 # Build artifacts
 build/

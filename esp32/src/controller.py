@@ -17,9 +17,12 @@ State transitions:
   - COOLDOWN:   no new triggers for START_COOLDOWN_S after a run
 
 Persistence:
-  - Compustar rolling counter in a flash JSON file (survives power loss)
   - Consecutive-low-voltage sample count in RTC memory via lib.persistence
     (survives deep sleep, NOT power loss — fresh boot starts at 0)
+  - The Compustar 1WSHR-PRO is a FIXED-CODE FOB so no rolling counter
+    needs to be persisted. (Earlier revisions of this controller saved
+    a KeeLoq counter to flash. That logic was removed after SDR analysis
+    confirmed the protocol — see sdr/analysis/framing.md.)
 
 Deep sleep behavior:
   - In MONITORING, after each sample the controller calls machine.deepsleep
@@ -42,8 +45,6 @@ Pi-side commands accepted via UART:
 Runs on MicroPython on ESP32; importable in CPython for unit testing with
 mocked hardware.
 """
-
-import json
 
 from lib import pi_link, persistence
 
@@ -80,7 +81,6 @@ class State:
     COOLDOWN = "cooldown"
 
 
-COUNTER_FILE = "compustar_counter.json"
 LOG_TAG = "[controller]"
 
 
@@ -108,7 +108,6 @@ class VroomController:
         # Pi P-MOSFET is active-low: high = OFF. Boot with Pi OFF.
         self.pi_power.on()
 
-        self.counter = self._load_counter()
         self.last_trigger_ts = 0
         self.state = State.MONITORING
         # Sample-based streak counter survives deep sleep via RTC memory.
@@ -127,24 +126,6 @@ class VroomController:
         # to decide whether to deep-sleep before the next tick).
         self._just_sampled = False
 
-    # ----- Persistent counter (Compustar rolling code) -----
-
-    def _load_counter(self):
-        cfg_counter = getattr(self.cfg, "COMPUSTAR_COUNTER", 0) or 0
-        try:
-            with open(COUNTER_FILE) as f:
-                data = json.load(f)
-            return max(cfg_counter, int(data.get("counter", 0)))
-        except (OSError, ValueError):
-            return cfg_counter
-
-    def _save_counter(self):
-        try:
-            with open(COUNTER_FILE, "w") as f:
-                json.dump({"counter": self.counter}, f)
-        except OSError as e:
-            self._log("WARN counter save failed: %s" % e)
-
     # ----- Pi power control -----
 
     def _power_on_pi(self):
@@ -157,39 +138,43 @@ class VroomController:
 
     # ----- RF transmit -----
 
-    def _transmit_function(self, function_code, label):
-        """Build, persist, and transmit a Compustar packet for the given function."""
+    def _transmit_button(self, button_name):
+        """Transmit the Compustar packet for the given button.
+
+        The bit-pattern for each button is captured once from the FOB via
+        SDR (see sdr/06-framing-extraction.md) and stored verbatim in
+        ``cfg.COMPUSTAR_PACKETS``. Same press = identical packet on the
+        wire — no rolling code, no counter, no key.
+        """
         from lib import compustar
-        device_key = getattr(self.cfg, "COMPUSTAR_DEVICE_KEY", None)
-        serial = getattr(self.cfg, "COMPUSTAR_SERIAL", None)
-        if device_key is None or serial is None:
-            self._log("ERROR no device key or serial — cannot transmit %s" % label)
+        packets = getattr(self.cfg, "COMPUSTAR_PACKETS", None)
+        if packets is None or button_name not in packets:
+            self._log("ERROR no packet stored for %s" % button_name)
             self.uart.send(pi_link.event(
-                pi_link.EVENT_KEELOQ_TX_FAIL,
-                function=label, reason="no_secrets",
+                pi_link.EVENT_COMPUSTAR_TX_FAIL,
+                button=button_name, reason="no_packet",
             ))
             return False
 
-        # Persist BEFORE transmit so a crash mid-burst doesn't reuse counter.
-        self.counter += 1
-        self._save_counter()
+        try:
+            pulses = compustar.build_pulses_for_button(button_name, packets)
+        except (ValueError, KeyError) as e:
+            self._log("ERROR malformed packet for %s: %s" % (button_name, e))
+            self.uart.send(pi_link.event(
+                pi_link.EVENT_COMPUSTAR_TX_FAIL,
+                button=button_name, reason="malformed_packet",
+            ))
+            return False
 
-        packet = compustar.build_packet(
-            serial=serial,
-            function_code=function_code,
-            counter=self.counter,
-            device_key=device_key,
-        )
-        pulses = compustar.packet_to_pulses(packet["bits"], te_us=self.cfg.RF_TE_US)
         self.radio.transmit_burst(
             pulses,
             repeats=self.cfg.RF_BURST_REPEATS,
             guard_ms=self.cfg.RF_GUARD_MS,
         )
-        self._log("RF %s sent (counter=%d)" % (label, self.counter))
+        self._log("RF %s sent" % button_name)
         self.uart.send(pi_link.event(
-            pi_link.EVENT_KEELOQ_TX,
-            function=label, counter=self.counter,
+            pi_link.EVENT_COMPUSTAR_TX,
+            button=button_name,
         ))
         return True
 
@@ -221,7 +206,7 @@ class VroomController:
 
         # Pi is off in MONITORING, so this status message goes nowhere on hardware.
         # Still emit for log visibility when debugging via the dev dashboard.
-        self.uart.send(pi_link.status(v, self.state, counter=self.counter))
+        self.uart.send(pi_link.status(v, self.state))
 
         if self.low_v_count >= self._samples_needed():
             self._trigger_start("low_voltage")
@@ -230,10 +215,7 @@ class VroomController:
         # transmit already happened during _trigger_start; just advance state.
         self.run_start_ts = self._now()
         self.state = State.RUNNING
-        self.uart.send(pi_link.event(
-            pi_link.EVENT_ENGINE_STARTED,
-            counter=self.counter,
-        ))
+        self.uart.send(pi_link.event(pi_link.EVENT_ENGINE_STARTED))
 
     def _running_step(self):
         now = self._now()
@@ -278,15 +260,16 @@ class VroomController:
         self.state = State.STARTING
         self._power_on_pi()
         from lib import compustar
-        self._transmit_function(compustar.Function.START, "START")
+        self._transmit_button(compustar.Button.START)
 
     def _trigger_stop(self, reason):
         if self.state != State.RUNNING:
             return
         from lib import compustar
-        # Compustar protocol: re-pressing Start while running stops the engine.
-        # If your variant uses a dedicated stop code, swap to it here.
-        self._transmit_function(compustar.Function.START, "STOP")
+        # Compustar 1-way protocol: re-pressing Start while running stops the
+        # engine. The 1WSHR-PRO doesn't have a dedicated stop button — same
+        # 35-bit Start packet starts AND stops, depending on engine state.
+        self._transmit_button(compustar.Button.START)
         self.state = State.STOPPING
         self.uart.send(pi_link.log("info", "stopping: %s" % reason))
 

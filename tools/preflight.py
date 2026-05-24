@@ -73,8 +73,7 @@ def check_esp32(res):
         ("RUN_DURATION_S", 60, 1800),
         ("WAKE_INTERVAL_S", 10, 600),
         ("START_COOLDOWN_S", 600, 86400),
-        ("RF_TE_US", 25, 1600),
-        ("RF_BURST_REPEATS", 1, 10),
+        ("RF_BURST_REPEATS", 1, 20),
     ]:
         if not hasattr(config, name):
             res.err(f"config.{name} missing")
@@ -93,25 +92,43 @@ def check_esp32(res):
         )
     else:
         if config.secrets_ready():
-            res.ok("config.secrets_ready() = True (WiFi + Compustar key + serial set)")
+            res.ok("config.secrets_ready() = True (WiFi + Compustar packets set)")
         else:
-            res.warn("config.secrets_ready() = False - fill in WiFi or Compustar values")
+            res.warn(
+                "config.secrets_ready() = False - fill in WiFi or "
+                "COMPUSTAR_PACKETS values"
+            )
 
-        # Spot-check Compustar values for obvious placeholders
-        for name in ("COMPUSTAR_DEVICE_KEY", "COMPUSTAR_SERIAL"):
-            v = getattr(config, name, None)
-            if v is None:
-                res.warn(f"secrets.{name} is None - recover via sdr/07 before deploy")
-            elif isinstance(v, int) and v in (0, 0x1234, 0xDEADBEEF, 0xDEADBEEFCAFEBABE):
-                res.warn(f"secrets.{name} = {hex(v)} looks like a placeholder")
-            else:
-                res.ok(f"secrets.{name} populated (looks real)")
-
-        counter = getattr(config, "COMPUSTAR_COUNTER", 0)
-        if counter == 0:
-            res.warn("secrets.COMPUSTAR_COUNTER = 0 - set to current FOB counter + 10 margin")
+        # Validate the captured Compustar packets
+        from lib import compustar
+        packets = getattr(config, "COMPUSTAR_PACKETS", None)
+        errors = compustar.validate_packets(packets)
+        if not errors:
+            res.ok("secrets.COMPUSTAR_PACKETS has all 4 buttons (35 bits each)")
+            # Reject obvious placeholders (all zeros)
+            placeholders = [
+                name for name in compustar.Button.ALL
+                if packets[name].replace(" ", "").replace("_", "")
+                .replace("-", "") == "0" * compustar.PACKET_BITS
+            ]
+            if placeholders:
+                res.warn(
+                    "secrets.COMPUSTAR_PACKETS still has placeholders for: "
+                    + ", ".join(placeholders)
+                    + " - capture real bit patterns via sdr/06"
+                )
         else:
-            res.ok(f"secrets.COMPUSTAR_COUNTER = {counter}")
+            for e in errors:
+                res.warn("secrets.COMPUSTAR_PACKETS: " + e)
+
+        remote_id = getattr(config, "COMPUSTAR_REMOTE_ID", None)
+        if remote_id in (None, 0):
+            res.warn(
+                "secrets.COMPUSTAR_REMOTE_ID is unset - cosmetic but please "
+                "fill in from sdr/analysis/framing.local.md"
+            )
+        else:
+            res.ok(f"secrets.COMPUSTAR_REMOTE_ID = 0x{remote_id:04X}")
 
     # Module imports
     section("ESP32 firmware modules")

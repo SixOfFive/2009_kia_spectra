@@ -32,17 +32,18 @@ START_COOLDOWN_S = 2 * 3600  # don't re-trigger for at least 2 hours
 
 # ----- Compustar RF -----
 
-# Frequency for CC1101 (Hz). 1WSHR-PRO is 433.92 MHz nominal.
+# Frequency for CC1101 (Hz). 1WSHR-PRO is 433.92 MHz nominal. Our specific
+# FOB transmits ~82 kHz below this per rtl_433 -A measurement; receivers
+# tolerate a few hundred kHz offset so the nominal value works fine.
 RF_FREQUENCY_HZ = 433_920_000
 
-# Bit element time. HCS300/301 default ~400us — confirm by SDR capture
-# and override in `secrets.py` if needed.
-RF_TE_US = 400
-
 # Number of repeat packets in a burst (mimics FOB hold-to-press behavior).
-RF_BURST_REPEATS = 4
+# The genuine FOB transmits 8 internal packet repeats per burst; that
+# baseline plus a couple of extra burst attempts gives healthy margin.
+RF_BURST_REPEATS = 8
 
-# Inter-packet guard time in milliseconds (HCS default 39ms).
+# Inter-packet guard time in milliseconds. The genuine FOB leaves
+# ~30-40 ms between bursts.
 RF_GUARD_MS = 39
 
 
@@ -111,9 +112,8 @@ try:
         MQTT_USERNAME,
         MQTT_PASSWORD,
         MQTT_TOPIC_PREFIX,
-        COMPUSTAR_DEVICE_KEY,
-        COMPUSTAR_SERIAL,
-        COMPUSTAR_COUNTER,
+        COMPUSTAR_REMOTE_ID,
+        COMPUSTAR_PACKETS,
     )
 except ImportError:
     # secrets.py doesn't exist yet. Provide sentinels so the rest of
@@ -125,15 +125,19 @@ except ImportError:
     MQTT_USERNAME = None
     MQTT_PASSWORD = None
     MQTT_TOPIC_PREFIX = "vroom"
-    COMPUSTAR_DEVICE_KEY = None
-    COMPUSTAR_SERIAL = None
-    COMPUSTAR_COUNTER = 0
+    COMPUSTAR_REMOTE_ID = None
+    COMPUSTAR_PACKETS = None
 
 
 def secrets_ready():
     """Return True iff all secrets needed for start operations are set."""
-    required = (
-        WIFI_SSID, WIFI_PASSWORD,
-        COMPUSTAR_DEVICE_KEY, COMPUSTAR_SERIAL,
-    )
-    return all(s is not None for s in required)
+    if WIFI_SSID is None or WIFI_PASSWORD is None:
+        return False
+    # Late import to avoid the lib/* path needing to be set up at config
+    # import time. validate_packets returns [] when packets dict has all
+    # four buttons with valid 35-bit patterns.
+    try:
+        from lib import compustar
+        return not compustar.validate_packets(COMPUSTAR_PACKETS)
+    except ImportError:
+        return COMPUSTAR_PACKETS is not None

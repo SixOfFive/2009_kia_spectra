@@ -46,8 +46,10 @@ EVENT_ENGINE_STOPPED = "engine_stopped"
 EVENT_LOW_VOLTAGE_TRIGGER = "low_voltage_trigger"
 EVENT_PI_BOOT = "pi_boot"
 EVENT_PI_SHUTDOWN_REQUEST = "pi_shutdown_request"
-EVENT_KEELOQ_TX = "keeloq_tx"
-EVENT_KEELOQ_TX_FAIL = "keeloq_tx_fail"
+# Compustar RF transmit events. Renamed 2026-05-24 from EVENT_KEELOQ_TX
+# after we discovered the 1WSHR-PRO is fixed-code, not KeeLoq rolling code.
+EVENT_COMPUSTAR_TX = "compustar_tx"
+EVENT_COMPUSTAR_TX_FAIL = "compustar_tx_fail"
 
 
 def _now_ms():

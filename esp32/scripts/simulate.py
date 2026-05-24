@@ -15,18 +15,12 @@ Run from the repo root:
 import argparse
 import os
 import sys
-import tempfile
 import textwrap
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
 
-import controller as ctrl_mod   # noqa: E402
 from controller import VroomController, State  # noqa: E402
-
-
-# Force counter file into tmp so simulator runs are idempotent
-ctrl_mod.COUNTER_FILE = os.path.join(tempfile.gettempdir(), "simulate_counter.json")
 
 
 # ----- Fake hardware -----
@@ -63,7 +57,7 @@ class TracingUart:
     def send(self, msg):
         mtype = msg.get("type", "?")
         if mtype == "STATUS":
-            print(f"  -> STATUS  v={msg.get('v_battery'):.2f}  state={msg.get('state')}  counter={msg.get('counter')}")
+            print(f"  -> STATUS  v={msg.get('v_battery'):.2f}  state={msg.get('state')}")
         elif mtype == "EVENT":
             print(f"  ->EVENT   {msg.get('event')}  detail={msg.get('detail')}")
         elif mtype == "COMMAND":
@@ -80,6 +74,14 @@ class TracingUart:
         return self.inbox.pop(0) if self.inbox else None
 
 
+_SIM_PACKETS = {
+    "START":  "0" * 35,
+    "LOCK":   "1" * 35,
+    "UNLOCK": "01" * 17 + "0",
+    "TRUNK":  "10" * 17 + "1",
+}
+
+
 class Config:
     """Modifiable config defaults for the simulator."""
     ADC_DIVIDER_RATIO = 4.0
@@ -89,27 +91,17 @@ class Config:
     RUN_DURATION_S = 900
     WAKE_INTERVAL_S = 60
     START_COOLDOWN_S = 7200
-    RF_TE_US = 400
-    RF_BURST_REPEATS = 4
+    RF_BURST_REPEATS = 8
     RF_GUARD_MS = 39
     OBD_POLL_INTERVAL_S = 1
     OBD_POLL_PIDS = ()
     PI_SHUTDOWN_GRACE_S = 30
     WDT_ENABLED = False
-    COMPUSTAR_DEVICE_KEY = 0xDEADBEEFCAFEBABE
-    COMPUSTAR_SERIAL = 0x0ABCDE1
-    COMPUSTAR_COUNTER = 100
-
-
-def _cleanup():
-    try:
-        os.remove(ctrl_mod.COUNTER_FILE)
-    except OSError:
-        pass
+    COMPUSTAR_REMOTE_ID = 0x2DD6
+    COMPUSTAR_PACKETS = _SIM_PACKETS
 
 
 def _build(cfg_overrides=None):
-    _cleanup()
     cfg = Config()
     for k, v in (cfg_overrides or {}).items():
         setattr(cfg, k, v)
@@ -234,7 +226,6 @@ def main():
     SCENARIOS[args.scenario](args)
     print()
     print("=== Simulation complete ===")
-    _cleanup()
 
 
 if __name__ == "__main__":

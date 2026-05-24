@@ -1,21 +1,22 @@
 """Controller state-machine tests — pure logic, no hardware required."""
 import os
 import sys
-import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
 
-# Force controller.py into its CPython branch and ensure no leftover counter file
-COUNTER_FILE_PATH = os.path.join(tempfile.gettempdir(), "test_compustar_counter.json")
-try:
-    os.remove(COUNTER_FILE_PATH)
-except OSError:
-    pass
-
 from controller import VroomController, State  # noqa: E402
-import controller as ctrl_mod  # noqa: E402
-ctrl_mod.COUNTER_FILE = COUNTER_FILE_PATH
+from lib import compustar  # noqa: E402
+
+
+# Synthetic 35-bit patterns for tests. Not real FOB data — the controller
+# only cares that the patterns parse + render to pulses; the radio is mocked.
+TEST_PACKETS = {
+    "START":  "0" * 35,
+    "LOCK":   "1" * 35,
+    "UNLOCK": "01" * 17 + "0",
+    "TRUNK":  "10" * 17 + "1",
+}
 
 
 class FakePin:
@@ -65,24 +66,17 @@ class Config:
     WAKE_INTERVAL_S = 60
     START_COOLDOWN_S = 7200
     RF_FREQUENCY_HZ = 433_920_000
-    RF_TE_US = 400
-    RF_BURST_REPEATS = 4
+    RF_BURST_REPEATS = 8
     RF_GUARD_MS = 39
     OBD_POLL_INTERVAL_S = 1
     OBD_POLL_PIDS = ()
     PI_SHUTDOWN_GRACE_S = 30
-    # Secrets — supplied so transmit doesn't bail
-    COMPUSTAR_DEVICE_KEY = 0xDEADBEEFCAFEBABE
-    COMPUSTAR_SERIAL = 0x0ABCDE1
-    COMPUSTAR_COUNTER = 100
+    # Captured 35-bit packets (synthetic for tests)
+    COMPUSTAR_REMOTE_ID = 0x2DD6
+    COMPUSTAR_PACKETS = TEST_PACKETS
 
 
 def _make_ctrl(voltage=12.8):
-    # Clean counter file for each test
-    try:
-        os.remove(COUNTER_FILE_PATH)
-    except OSError:
-        pass
     adc = FakeAdc(voltage=voltage)
     radio = FakeRadio()
     uart = FakeUart()
@@ -130,13 +124,13 @@ def test_sustained_low_voltage_triggers_start():
     assert ctrl.state == State.STARTING
     assert pi_power.value() == 0       # Pi powered on
     assert len(radio.bursts) == 1
-    assert radio.bursts[0]["repeats"] == 4
+    assert radio.bursts[0]["repeats"] == 8
     # Streak reset after trigger (otherwise we'd immediately re-trigger after cooldown)
     assert ctrl.low_v_count == 0
     events = [m for m in uart.sent if m["type"] == "EVENT"]
     event_names = [m["event"] for m in events]
     assert "low_voltage_trigger" in event_names
-    assert "keeloq_tx" in event_names
+    assert "compustar_tx" in event_names
 
 
 def test_one_short_low_then_recovery_does_not_trigger():
@@ -160,22 +154,46 @@ def test_cooldown_clears_streak_and_returns_to_monitoring():
     assert ctrl.low_v_count == 0
 
 
-def test_counter_increments_and_persists():
+def test_transmit_button_renders_correct_pulse_count():
+    """The Start packet should produce 3 sync + 35 data = 38 pulses."""
     ctrl, _, radio, _, _ = _make_ctrl()
-    initial_counter = ctrl.counter
-    from lib import compustar
-    ctrl._transmit_function(compustar.Function.START, "START")
-    assert ctrl.counter == initial_counter + 1
+    ctrl._transmit_button(compustar.Button.START)
+    assert len(radio.bursts) == 1
+    pulses = radio.bursts[0]["pulses"]
+    assert len(pulses) == compustar.SYNC_COUNT + compustar.PACKET_BITS
 
-    # New controller should load the bumped counter from flash
-    ctrl2, *_ = _make_ctrl()
-    # Note: _make_ctrl removes the counter file. To test persistence, manually save.
-    ctrl.counter = 5555
-    ctrl._save_counter()
-    import json
-    with open(COUNTER_FILE_PATH) as f:
-        data = json.load(f)
-    assert data["counter"] == 5555
+
+def test_transmit_button_missing_packet_fails_gracefully():
+    """No COMPUSTAR_PACKETS → emit failure event, don't crash."""
+    ctrl, _, radio, uart, _ = _make_ctrl()
+    ctrl.cfg.COMPUSTAR_PACKETS = None
+    result = ctrl._transmit_button(compustar.Button.START)
+    assert result is False
+    assert len(radio.bursts) == 0
+    fail_events = [m for m in uart.sent
+                   if m["type"] == "EVENT" and m["event"] == "compustar_tx_fail"]
+    assert len(fail_events) == 1
+
+
+def test_transmit_button_malformed_pattern_fails_gracefully():
+    """Wrong-length pattern in packets dict → failure event, no crash."""
+    ctrl, _, radio, uart, _ = _make_ctrl()
+    ctrl.cfg.COMPUSTAR_PACKETS = dict(TEST_PACKETS)
+    ctrl.cfg.COMPUSTAR_PACKETS["START"] = "01010"  # 5 bits, expected 35
+    result = ctrl._transmit_button(compustar.Button.START)
+    assert result is False
+    assert len(radio.bursts) == 0
+    fail_events = [m for m in uart.sent
+                   if m["type"] == "EVENT" and m["event"] == "compustar_tx_fail"]
+    assert len(fail_events) == 1
+
+
+def test_compustar_tx_event_has_button_in_detail():
+    ctrl, _, _, uart, _ = _make_ctrl()
+    ctrl._transmit_button(compustar.Button.START)
+    tx_event = next(m for m in uart.sent
+                    if m["type"] == "EVENT" and m["event"] == "compustar_tx")
+    assert tx_event["detail"]["button"] == "START"
 
 
 def test_uart_start_command_triggers_start():

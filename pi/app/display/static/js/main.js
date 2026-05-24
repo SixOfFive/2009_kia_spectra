@@ -28,10 +28,10 @@ const els = {
 const EVENT_CLASS = {
   engine_started:       'event-good',
   engine_stopped:       'event-good',
-  keeloq_tx:            'event-good',
+  compustar_tx:         'event-good',
   pi_boot:              'event-good',
   low_voltage_trigger:  'event-error',
-  keeloq_tx_fail:       'event-error',
+  compustar_tx_fail:    'event-error',
 };
 
 // ----- Rendering helpers -----

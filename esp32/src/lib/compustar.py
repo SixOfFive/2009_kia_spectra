@@ -1,169 +1,190 @@
 """
-Compustar / HCS-family rolling-code packet builder.
+Compustar 1-way 1WSHR-PRO / 1WG3R-family FIXED-CODE remote packet builder.
 
-The Compustar 1WSHR-PRO FOB transmits 433.92 MHz OOK packets in the standard
-Microchip HCS300/301/361 format. Each packet contains:
+The 1WSHR-PRO FOB transmits 433.92 MHz OOK packets in a fixed-code
+PWM-encoded protocol that's a structural sub-variant of the canonical
+rtl_433 ``compustar_1wg3r`` decoder (which covers 1WG3R-SH and
+1WAMR-1900). Verified via SDR + rtl_433 ``-A`` pulse-analyzer on a
+known-good FOB. See ``sdr/analysis/framing.md`` (public) and
+``sdr/analysis/framing.local.md`` (gitignored) for the underlying
+measurements.
 
-    [preamble][header gap][32-bit hopping code][28-bit fixed code][2-bit status]
+PROTOCOL SUMMARY
+----------------
 
-  - Preamble: ~12 cycles of alternating bits at TE rate
-  - Header gap: ~10 * TE silence
-  - Hopping code: 32-bit KeeLoq encryption of [counter(16) | discrimination(4) | function(4) | OVR(2) | nothing(6)]
-    using the FOB's device key (64-bit, secret)
-  - Fixed code: 28-bit FOB serial + 4-bit function code (sent in the clear)
-  - Status: 1-bit V-LOW + 1-bit repeat indicator
+Modulation: OOK, **symmetric** PWM (HIGH and LOW both vary per bit).
+Each bit is encoded as a (HIGH_us, LOW_us) pulse pair:
 
-Each bit on the wire uses PWM-style encoding:
-    binary 0 = short high pulse (~TE) + long low (~2*TE)
-    binary 1 = long high (~2*TE) + short low (~TE)
+    bit 0 = HIGH(~732 us)  + LOW(~1136 us)   (HIGH short, LOW long)
+    bit 1 = HIGH(~1100 us) + LOW(~756 us)    (HIGH long,  LOW short)
+    sync  = HIGH(~1476 us) + LOW(~1500 us)   (both long, ~equal)
 
-Constants below for function codes and exact TE timing are PLACEHOLDERS until
-we confirm them via SDR capture of the actual 1WSHR-PRO FOB. Pin them down
-in `sdr/analysis/framing.md` once captures are processed.
+Pulse-pair sum is approximately constant at ~1860 us, so the bit
+period is ~1860 us; the asymmetry between HIGH and LOW encodes the
+bit value.
 
-This module runs in both CPython and MicroPython.
+Per-packet structure (1WSHR-PRO sub-variant):
+
+    [3 x sync pulse]  +  [35 data bits]
+
+The canonical rtl_433 1WG3R protocol is documented as ``1 sync + 36
+bits`` with the field layout ``[16-bit Remote ID][3-bit 0b111][8-bit
+~button][8-bit button][1-bit 0]``. Our specific FOB transmits 3 sync
+pulses and 35 data bits whose middle field doesn't quite match that
+layout. Since we replay captured bit patterns verbatim rather than
+re-encode from a button code, we don't need to fully reverse the
+field structure. The capture-then-replay approach works on every
+1WG3R-family FOB regardless of sub-variant.
+
+NO KeeLoq, NO rolling counter, NO device key are needed. Same press =
+identical packet on the wire. Different button = different bit pattern.
+
+USAGE
+-----
+
+::
+
+    from lib import compustar
+
+    pulses = compustar.build_pulses_for_button(
+        compustar.Button.START,
+        packets=cfg.COMPUSTAR_PACKETS,
+    )
+    radio.transmit_burst(pulses, repeats=cfg.RF_BURST_REPEATS,
+                         guard_ms=cfg.RF_GUARD_MS)
+
+The 35-bit patterns in ``cfg.COMPUSTAR_PACKETS`` come from SDR
+captures of the FOB (see ``sdr/06-framing-extraction.md``).
+
+Runs in both CPython (for unit tests) and MicroPython (for the
+on-device firmware).
 """
 
-from lib import keeloq
+# ----- Pulse widths in microseconds (rtl_433 -A measured on our FOB) -----
+# These match the 1WG3R rtl_433 spec to within ~3% and are well inside
+# Compustar receiver tolerance. Override per-call if a different sub-variant
+# needs slightly different timing.
+
+SHORT_HIGH_US = 732
+SHORT_LOW_US = 1136
+LONG_HIGH_US = 1100
+LONG_LOW_US = 756
+SYNC_HIGH_US = 1476
+SYNC_LOW_US = 1500
+
+# Each packet starts with this many sync pulses (3 for 1WSHR-PRO; canonical
+# 1WG3R uses 1). Adjust if your FOB sub-variant differs.
+SYNC_COUNT = 3
+
+# Number of data bits per packet (35 for 1WSHR-PRO; canonical 1WG3R uses 36).
+PACKET_BITS = 35
 
 
-# ----- Placeholders to verify from SDR captures -----
-
-# Element time (basic bit period) for HCS series. Datasheet default is
-# ~400 us but each chip can be configured 25-1600 us. Confirm by measuring
-# the preamble cycle width on an SDR capture.
-TE_MICROSECONDS = 400
-
-# Preamble length in TE cycles (HCS300/301 default is 23 half-bit cycles,
-# producing ~11.5 high/low transitions before the header gap).
-PREAMBLE_HALF_BITS = 23
-
-# Header gap is silence after the preamble. Datasheet default = 10 * TE.
-HEADER_GAP_TE = 10
-
-# Guard time between repeat packets in a multi-press burst.
-# Datasheet default = 39 ms but varies.
-GUARD_TIME_MS = 39
+class Button:
+    """Canonical button identifiers. Used as keys into the
+    per-FOB packets dictionary in ``secrets.py``."""
+    START = "START"
+    LOCK = "LOCK"
+    UNLOCK = "UNLOCK"
+    TRUNK = "TRUNK"
+    ALL = (START, LOCK, UNLOCK, TRUNK)
 
 
-# ----- Function codes (placeholder; verify with SDR per button) -----
-# These are the 4-bit codes the FOB transmits in the fixed-code portion
-# AND that get hashed into the hopping code's discrimination bits.
-# The mapping is manufacturer-specific. Compustar values to be confirmed.
-class Function:
-    START = 0x4   # placeholder
-    LOCK = 0x2    # placeholder
-    UNLOCK = 0x1  # placeholder
-    TRUNK = 0x8   # placeholder
+# ----- Packet parsing -----
 
-
-# ----- Packet builder -----
-
-def build_hopping_code(counter, function_code, discrimination, device_key):
+def parse_bit_pattern(pattern, expected_bits=PACKET_BITS):
     """
-    Build the 32-bit hopping code by KeeLoq-encrypting the 32-bit
-    [counter | discrimination | function | overflow] plaintext.
+    Convert a string of ``"0"`` and ``"1"`` characters into a list of ints.
 
-    Plaintext layout (LSB-first per HCS301 datasheet, AN642 figure 3-3):
-      bits  0..15  = counter (16 bits)
-      bits 16..19  = discrimination (4 bits — typically low nibble of serial)
-      bits 20..23  = function code (4 bits)
-      bits 24..25  = overflow flags (2 bits; set 0 for normal transmit)
-      bits 26..31  = reserved / 0
+    Whitespace is silently stripped (so you can store patterns in
+    secrets.py with spaces / underscores for readability if you want).
 
-    :param counter:        16-bit rolling counter
-    :param function_code:  4-bit function (see Function class)
-    :param discrimination: 4-bit discrimination value
-    :param device_key:     64-bit per-device secret
-    :return:               32-bit hopping code
+    :param pattern: str like ``"00101101110101100001000010011111011"``
+    :param expected_bits: enforce this length after stripping whitespace
+    :return: list of 0/1 ints, length ``expected_bits``
+    :raises ValueError: on any non-bit character or wrong length
     """
-    plaintext = (
-        (counter & 0xFFFF)
-        | ((discrimination & 0xF) << 16)
-        | ((function_code & 0xF) << 20)
-        # overflow bits and reserved stay 0 for normal transmissions
-    )
-    return keeloq.encrypt(plaintext, device_key)
-
-
-def build_packet(serial, function_code, counter, device_key, v_low=0, repeat=0):
-    """
-    Assemble a complete 66-bit Compustar transmission packet.
-
-    :param serial:        28-bit FOB serial number
-    :param function_code: 4-bit function code (see Function class)
-    :param counter:       16-bit rolling counter (incremented each press)
-    :param device_key:    64-bit per-device secret KeeLoq key
-    :param v_low:         1-bit low-battery indicator (default 0)
-    :param repeat:        1-bit repeat indicator (default 0; set 1 for repeats in burst)
-    :return: dict with keys:
-        - hopping_code: 32-bit encrypted block
-        - fixed_code:   32-bit (28-bit serial | 4-bit function)
-        - status:       2-bit (v_low | repeat)
-        - bits:         list of 66 individual bits in transmit order (MSB first)
-    """
-    serial &= 0x0FFFFFFF  # 28 bits
-    function_code &= 0xF
-    # Discrimination is typically the low nibble of the serial.
-    discrimination = serial & 0xF
-
-    hopping = build_hopping_code(counter, function_code, discrimination, device_key)
-    fixed = (serial << 4) | function_code  # 32 bits = 28-bit serial + 4-bit fn
-    status = ((v_low & 1) << 1) | (repeat & 1)
-
-    bits = _pack_bits(hopping, 32) + _pack_bits(fixed, 32) + _pack_bits(status, 2)
-    assert len(bits) == 66, "packet must be exactly 66 bits"
-
-    return {
-        "hopping_code": hopping,
-        "fixed_code": fixed,
-        "status": status,
-        "bits": bits,
-    }
-
-
-def _pack_bits(value, width):
-    """Return ``value`` as a list of ``width`` bits, MSB first."""
-    return [(value >> (width - 1 - i)) & 1 for i in range(width)]
+    bits = []
+    for c in pattern:
+        if c in ("0", "1"):
+            bits.append(int(c))
+        elif c in (" ", "\t", "\n", "\r", "_", "-"):
+            continue
+        else:
+            raise ValueError("invalid bit char %r in pattern" % (c,))
+    if len(bits) != expected_bits:
+        raise ValueError(
+            "pattern has %d bits, expected %d" % (len(bits), expected_bits)
+        )
+    return bits
 
 
 # ----- OOK waveform generation -----
 
-def packet_to_pulses(packet_bits, te_us=TE_MICROSECONDS,
-                     preamble_half_bits=PREAMBLE_HALF_BITS,
-                     header_gap_te=HEADER_GAP_TE):
+def packet_to_pulses(bits,
+                     sync_count=SYNC_COUNT,
+                     short_high_us=SHORT_HIGH_US, short_low_us=SHORT_LOW_US,
+                     long_high_us=LONG_HIGH_US, long_low_us=LONG_LOW_US,
+                     sync_high_us=SYNC_HIGH_US, sync_low_us=SYNC_LOW_US):
     """
-    Render a packet as a list of (high_us, low_us) pulse pairs suitable for
-    feeding into a CC1101 GPIO toggle or a microcontroller PWM-style output.
+    Render a list of bits into a chronological list of OOK pulse pairs.
 
-    PWM encoding (HCS series):
-      bit 0 = high TE,  low 2*TE
-      bit 1 = high 2*TE, low TE
+    Output ordering: ``sync_count`` sync pulses first, then one pulse pair
+    per data bit. Each pulse pair is ``(high_us, low_us)`` so the CC1101
+    driver toggles GDO0 high for ``high_us`` then low for ``low_us``.
 
-    Preamble:
-      alternating high/low half-bits of TE each, ``preamble_half_bits`` of them.
-
-    Header gap:
-      silence of ``header_gap_te * TE`` after the preamble.
-
-    Returns a list of (high_microseconds, low_microseconds) tuples representing
-    the full transmission in chronological order.
+    :param bits: list of 0/1 ints, typically the output of
+        ``parse_bit_pattern(pattern)``
+    :return: list of (high_us, low_us) tuples, length
+        ``sync_count + len(bits)``
     """
     pulses = []
-
-    # Preamble: alternating TE high / TE low half-bits
-    for _ in range(preamble_half_bits):
-        pulses.append((te_us, te_us))
-
-    # Header gap: one final silence before data begins.
-    # Append zero high + long low to represent the gap as a pulse pair.
-    pulses.append((0, header_gap_te * te_us))
-
-    # Data bits in PWM encoding
-    for bit in packet_bits:
-        if bit:
-            pulses.append((2 * te_us, te_us))
+    for _ in range(sync_count):
+        pulses.append((sync_high_us, sync_low_us))
+    for b in bits:
+        if b:
+            pulses.append((long_high_us, long_low_us))
         else:
-            pulses.append((te_us, 2 * te_us))
-
+            pulses.append((short_high_us, short_low_us))
     return pulses
+
+
+def build_pulses_for_button(button_name, packets):
+    """
+    Look up the captured bit pattern for ``button_name`` in ``packets``
+    and render it to a pulse list.
+
+    :param button_name: one of ``Button.START`` / ``LOCK`` / ``UNLOCK``
+        / ``TRUNK`` (or any custom button key present in ``packets``)
+    :param packets: dict mapping button name → bit-pattern string
+    :return: list of (high_us, low_us) pulse pairs ready for
+        ``cc1101.transmit_burst``
+    :raises KeyError: if ``button_name`` isn't a key in ``packets``
+    :raises ValueError: if the stored pattern is malformed
+    """
+    pattern = packets[button_name]
+    bits = parse_bit_pattern(pattern)
+    return packet_to_pulses(bits)
+
+
+def validate_packets(packets):
+    """
+    Sanity-check a packets dict at startup. Returns a list of error
+    strings; empty list means all good.
+
+    :param packets: dict (or None) of button name → pattern str
+    """
+    errors = []
+    if packets is None:
+        return ["COMPUSTAR_PACKETS is None"]
+    if not isinstance(packets, dict):
+        return ["COMPUSTAR_PACKETS is not a dict: %r" % type(packets)]
+    for name in Button.ALL:
+        if name not in packets:
+            errors.append("missing button %r in COMPUSTAR_PACKETS" % name)
+            continue
+        try:
+            parse_bit_pattern(packets[name])
+        except ValueError as e:
+            errors.append("button %r: %s" % (name, e))
+    return errors

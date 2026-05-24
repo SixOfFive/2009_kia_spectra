@@ -146,6 +146,41 @@ main {
 
 .btn[disabled] { opacity: 0.4; cursor: not-allowed; }
 
+/* Manual-transmit panel — four small fob-style buttons under the main
+ * controls. Only the "Start" tile is fully wired today; the other three
+ * return HTTP 501 until the wire-protocol CMD_TRANSMIT_BUTTON lands. */
+.manual-tx {
+  margin-top: 8px;
+  background: #0f1419;
+  border: 1px solid #1f2733;
+  border-radius: 8px;
+  padding: 6px 10px 8px;
+}
+
+.manual-tx-header {
+  font-size: 11px;
+  color: #6e7681;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+
+.manual-tx-buttons {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.btn-tx {
+  padding: 10px 6px;
+  font-size: 13px;
+}
+
+.btn-tx-start  { background: #1b4332; color: #4ade80; border-color: #2d6a4f; }
+.btn-tx-lock   { background: #1f2733; color: #c9d1d9; }
+.btn-tx-unlock { background: #1f2733; color: #c9d1d9; }
+.btn-tx-trunk  { background: #1f2733; color: #c9d1d9; }
+
 .status-bar {
   display: flex;
   justify-content: space-between;

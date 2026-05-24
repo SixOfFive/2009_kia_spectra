@@ -163,3 +163,34 @@ els.btnStop.addEventListener('click', () => {
   if (confirm('Stop the engine?')) sendCommand('stop_engine');
 });
 els.btnPing.addEventListener('click', () => sendCommand('ping'));
+
+// ----- Manual transmit buttons (start/lock/unlock/trunk) -----
+
+async function sendTransmit(button) {
+  try {
+    const res = await fetch(`/api/transmit/${button}`, {method: 'POST'});
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 501) {
+      showToast(`${button}: not yet wired on ESP32`, 'info');
+      return;
+    }
+    if (!res.ok) {
+      const reason = body.error || body.detail || ('HTTP ' + res.status);
+      showToast(`${button}: ${reason}`, 'bad');
+      return;
+    }
+    showToast(`${button} sent`, 'good');
+    poll();
+  } catch (err) {
+    showToast(`${button} failed: ${err.message}`, 'bad');
+  }
+}
+
+document.querySelectorAll('button[data-tx]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const which = btn.dataset.tx;
+    // Start has destructive potential; the other buttons are quick taps.
+    if (which === 'start' && !confirm('Transmit start?')) return;
+    sendTransmit(which);
+  });
+});

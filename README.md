@@ -78,7 +78,7 @@ This documentation describes a **single** unit. The full path from "nothing" to 
 2. [`docs/architecture.md`](docs/architecture.md) — how the pieces fit together
 3. [`docs/reproduce.md`](docs/reproduce.md) — the master walkthrough index
 4. Phase 1: [`sdr/README.md`](sdr/README.md) — capture and reverse-engineer the FOB
-5. Phase 2: [`docs/08-flash-micropython.md`](docs/08-flash-micropython.md) → [`docs/12-keeloq-bench-validation.md`](docs/12-keeloq-bench-validation.md) — bench prototype + first car test
+5. Phase 2: [`docs/08-flash-micropython.md`](docs/08-flash-micropython.md) → [`docs/12-bench-validation.md`](docs/12-bench-validation.md) — bench prototype + first car test
 6. Phase 3-4: in-car install + polish (written as those phases happen)
 
 ## Running the tests

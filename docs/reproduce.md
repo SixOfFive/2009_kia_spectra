@@ -25,9 +25,9 @@ the build. The repo grows along with the project.
 - [ ] [02 — Verify the dongle works](../sdr/02-hardware-verification.md)
 - [ ] [03 — Confirm the FOB transmit frequency](../sdr/03-frequency-confirmation.md)
 - [ ] [04 — Record clean captures of each button](../sdr/04-recording-captures.md)
-- [ ] [05 — Demodulate in Universal Radio Hacker](../sdr/05-urh-analysis.md)
-- [ ] [06 — Extract framing (preamble, serial, function code)](../sdr/06-framing-extraction.md)
-- [ ] [07 — Recover the KeeLoq device key](../sdr/07-key-recovery.md)
+- [ ] [05 — Demodulate captures to bit sequences](../sdr/05-demodulation.md)
+- [ ] [06 — Capture per-button packet patterns](../sdr/06-framing-extraction.md)
+- [ ] [07 — Recover the KeeLoq device key](../sdr/07-key-recovery.md) (HCS-KeeLoq FOBs only — skip for Compustar 1WG3R-family)
 
 ## Phase 2 — Bench prototype (after parts arrive)
 
@@ -37,7 +37,7 @@ the build. The repo grows along with the project.
 - [ ] [09 — Bench smoke-test each module](09-bench-smoke-tests.md) (ADS1115, CC1101, CAN, ESP32 WiFi)
 - [ ] [10 — Set up the Raspberry Pi Zero 2 W](10-pi-setup.md) (provision.sh, dashboard, kiosk)
 - [ ] [11 — Wire ESP32 ↔ Pi UART link](11-uart-link.md)
-- [ ] [12 — KeeLoq bench validation + first car Lock test](12-keeloq-bench-validation.md)
+- [ ] [12 — Compustar bench validation + first car Lock test](12-bench-validation.md)
 
 ## Phase 3 — In-car install — WIP
 

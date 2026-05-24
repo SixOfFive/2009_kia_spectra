@@ -182,7 +182,7 @@ Soft-stop with `Ctrl-C` in Thonny when you've confirmed the link.
 
 ## Next
 
-[`12-keeloq-bench-validation.md`](12-keeloq-bench-validation.md) — final
-bench step before the car: synthesize a real Keeloq packet with the
-device key from step 07, validate it against the captured FOB pattern,
-do a Lock-cycle test in the car.
+[`12-bench-validation.md`](12-bench-validation.md) — final bench step
+before the car: load captured Compustar bit patterns into `secrets.py`,
+SDR-validate the synthesized transmission against the genuine FOB
+waveform, then do a Lock-cycle test in the car.

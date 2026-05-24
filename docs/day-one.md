@@ -64,14 +64,14 @@ Follow these in order. Each step is its own doc — link goes deeper.
 
 ### Day 2 afternoon — SDR phase (if not done already)
 
-9. Run through [`sdr/01-...`](../sdr/01-software-setup.md) through [`sdr/07-key-recovery.md`](../sdr/07-key-recovery.md)
-10. Recover the KeeLoq device key
-11. Validate with `python sdr/scripts/validate-key.py ...` → all deltas should be 1
-12. Update `esp32/src/secrets.py` and `compustar.Function` codes per `sdr/analysis/framing.md`
+9. Run through [`sdr/01-...`](../sdr/01-software-setup.md) through [`sdr/06-framing-extraction.md`](../sdr/06-framing-extraction.md)
+10. For Compustar 1WG3R-family FOBs (this project's case): capture each button's 35-bit pattern once; same press = identical bits, no key to recover
+11. Update `esp32/src/secrets.py` with `COMPUSTAR_REMOTE_ID` + `COMPUSTAR_PACKETS` per `sdr/analysis/framing.local.md`
+12. _(For HCS-KeeLoq FOBs only: run [`sdr/07-key-recovery.md`](../sdr/07-key-recovery.md) and use the legacy build_packet path from git history — see doc 07's note.)_
 
 ### Day 2 evening — the moment of truth
 
-13. [`docs/12-keeloq-bench-validation.md`](12-keeloq-bench-validation.md) — synthesize → SDR-confirm → first car Lock cycle
+13. [`docs/12-bench-validation.md`](12-bench-validation.md) — verify on SDR → first car Lock cycle
 14. Re-run `python tools/preflight.py` — should now report 0 warnings (secrets populated)
 15. **Lock works** in the car → onto Unlock → onto Start (in that order, with valet switch flipped)
 

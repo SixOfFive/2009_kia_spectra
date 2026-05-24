@@ -1,10 +1,37 @@
 # 07 — Recover the KeeLoq device key + replicate the FOB
 
-## Goal
+## NOT NEEDED for Compustar 1WG3R-family FOBs
+
+This step exists for FOBs that use the **HCS-KeeLoq rolling-code**
+protocol. The project's actual FOB — Compustar 1WSHR-PRO — is part
+of the **1WG3R fixed-code family** and does NOT use KeeLoq. There's
+no rolling counter, no 64-bit device key, and nothing to recover.
+
+If you confirmed at [step 06](06-framing-extraction.md) that
+consecutive captures of the same button produce **identical 35-bit
+patterns**, you have a 1WG3R-family FOB. Skip this entire doc and
+proceed to [`docs/12-bench-validation.md`](../docs/12-bench-validation.md).
+
+If your FOB's bits genuinely vary between consecutive presses (you saw
+~32 hopping bits flipping in step 06's diff), it's an HCS-KeeLoq
+variant — continue reading this doc to recover the device key.
+
+## What follows applies to HCS-KeeLoq FOBs only
+
+The remainder of this document is preserved from the original
+walkthrough. It describes how to extract the 64-bit KeeLoq device
+key for the HCS300/301/361/362 family of encoder chips. None of the
+project's actual code (in `esp32/src/lib/`) needs these values for
+the 1WG3R case — but the `keeloq.py` module and `try-mfkeys.py` /
+`validate-key.py` helpers are still in tree for HCS-KeeLoq users.
+
+---
+
+## Goal (HCS-KeeLoq variants)
 
 Get the 64-bit KeeLoq device key embedded in your FOB so the ESP32 can encrypt new (counter, function) pairs and produce valid hopping codes the receiver will accept.
 
-**This is the step that turns the project from "we can decode the FOB" into "we can replicate the FOB."** Without this, you have observation; with it, you have control.
+**For an HCS-KeeLoq FOB, this is the step that turns the project from "we can decode the FOB" into "we can replicate the FOB."** Without this, you have observation; with it, you have control.
 
 ## Why this is hard, and why it's possible
 
@@ -124,47 +151,42 @@ The script decrypts each capture and prints the counter, discrimination, and fun
 
 If you see `All deltas = 1. Key is almost certainly correct.` — done. Drop the values into `secrets.py` and move on.
 
-## Replicate the FOB from the ESP32
+## Replicate the FOB from the ESP32 (HCS-KeeLoq path)
 
-Once you have:
-- Device key (`COMPUSTAR_DEVICE_KEY` in `secrets.py`)
-- Serial (`COMPUSTAR_SERIAL` in `secrets.py`)
-- Current counter + safety margin (`COMPUSTAR_COUNTER` in `secrets.py`)
-- Function codes (`compustar.Function.START` etc. in `esp32/src/lib/compustar.py`)
-- TE timing (`RF_TE_US` etc. in `esp32/src/config.py`)
+Once you have the device key, serial, counter, function codes, and TE
+timing, you need an HCS-KeeLoq packet builder + counter persistence on
+the ESP32. The project's `esp32/src/lib/compustar.py` was rewritten in
+2026 to handle the 1WG3R-family fixed-code path and no longer ships
+a `build_packet` / `build_hopping_code` / TE-PWM `packet_to_pulses`
+API.
 
-…the existing `esp32/src/lib/compustar.py` will generate valid packets the receiver accepts. The flow on the ESP32:
+For an HCS-KeeLoq FOB you have two practical options:
 
-```python
-from lib import compustar
-from config import COMPUSTAR_DEVICE_KEY, COMPUSTAR_SERIAL
+1. **Resurrect the original API from git history.** Commit
+   [`80bef8d`](https://github.com/SixOfFive/2009_kia_spectra/commit/80bef8d)
+   was the one that replaced the KeeLoq path with the fixed-code path.
+   Its parent commit still has the HCS66 `build_packet()` /
+   `build_hopping_code()` and the TE-PWM `packet_to_pulses()`. Restore
+   those functions into `compustar.py` and the matching counter
+   persistence into `controller.py`.
 
-# Read current counter from persisted flash storage
-counter = load_counter_from_flash()  # e.g. 1234
-
-# Build packet
-packet = compustar.build_packet(
-    serial=COMPUSTAR_SERIAL,
-    function_code=compustar.Function.START,
-    counter=counter,
-    device_key=COMPUSTAR_DEVICE_KEY,
-)
-
-# Render to PWM pulses for CC1101
-pulses = compustar.packet_to_pulses(packet["bits"])
-
-# Send via CC1101 driver (created in a later step)
-cc1101.transmit_ook(pulses, frequency=433_920_000)
-
-# Persist incremented counter
-save_counter_to_flash(counter + 1)
-```
+2. **Write your own.** `esp32/src/lib/keeloq.py` is still in tree
+   (the cipher implementation didn't change). You need a `build_packet`
+   that emits the HCS66 layout `[hopping(32)][serial(28)][function(4)][status(2)]`
+   bit list and a `packet_to_pulses` that renders standard 1:2-ratio
+   PWM with a preamble + header gap. Counter persistence: write the
+   16-bit counter to a flash JSON file after every successful TX.
 
 ### Counter sync notes
 
-The receiver tracks the counter you sent. If you skip ahead too far (e.g. >16 missed presses), it'll go into "re-sync" mode and require two consecutive valid codes before accepting again. The ESP32 firmware handles this by transmitting **two packets** if a single one is rejected (detected by lack of expected response).
+The receiver tracks the counter you sent. If you skip ahead too far
+(e.g. >16 missed presses), it'll go into "re-sync" mode and require
+two consecutive valid codes before accepting again. Whichever
+implementation you use, transmit **two packets** in the burst so the
+receiver can re-sync if needed.
 
-Persist the counter to flash after every successful TX so a power cycle doesn't re-send an old value.
+Persist the counter to flash after every successful TX so a power
+cycle doesn't re-send an old value.
 
 ## Initial bench validation (before driving the car)
 

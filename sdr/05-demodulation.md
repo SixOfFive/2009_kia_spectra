@@ -6,15 +6,30 @@ Convert the raw IQ `.bin` files from step 04 into clean `.bits` text files
 (one bit per character, MSB-first transmit order) that the framing analysis
 in step 06 can diff against each other.
 
-This step uses the project's own Python demodulator
-(`sdr/scripts/demod-ook.py`). Earlier drafts of this walkthrough used
-Universal Radio Hacker (URH), but URH has heavy install gotchas on Windows
-(Python 3.13 only) and freezes on large multi-press captures. The Python
-demodulator handles those scenarios out of the box and is what we now use.
+This step uses the project's own Python demodulators. There are TWO
+choices, depending on which FOB family you're working with:
+
+- `sdr/scripts/demod-compustar.py` — Compustar 1WG3R-family FOBs
+  (1WSHR-PRO, 1WG3R-SH, 1WAMR-1900). PWM pulse widths 708/1076/1448 µs.
+  This is the project's actual FOB. **Use this one first.**
+- `sdr/scripts/demod-ook.py` — generic 1:2-ratio PWM (standard HCS
+  configuration, used by many other rolling-code FOBs). Kept around as
+  a fallback for non-Compustar HCS variants. Don't use this one for
+  Compustar FOBs — its 1:2 ratio assumption misclassifies 1WG3R's
+  ~1:1.5 pulses.
+
+Earlier drafts of this walkthrough used Universal Radio Hacker (URH),
+but URH has heavy install gotchas on Windows (Python 3.13 only) and
+freezes on large multi-press captures. The Python demodulators handle
+those scenarios out of the box and are what we now use.
 
 URH remains a perfectly fine alternative if you want a GUI for visual
-inspection — see the [URH alternative](#urh-alternative-optional) section
-at the bottom.
+inspection — see the [URH alternative](#urh-alternative-optional)
+section at the bottom.
+
+You can also cross-check our demod output against `rtl_433`'s reference
+decoder — see the [rtl_433 cross-check](#rtl_433-cross-check-optional)
+section at the bottom.
 
 ## Prerequisites
 
@@ -32,7 +47,7 @@ fob-start-001.bin
    v
 fob-start-001-b1.bin  fob-start-001-b2.bin  fob-start-001-b3.bin
    |
-   v  (demod-ook.py — produces one .bits file per packet)
+   v  (demod-compustar.py for 1WG3R-family FOBs; or demod-ook.py for HCS)
    v
 fob-start-001-b1.bits  fob-start-001-b2.bits  fob-start-001-b3.bits
 ```
@@ -75,64 +90,86 @@ Skip this step if you recorded as one-press-per-file in step 04.
 
 ## Step 3 — Demodulate to bits
 
-Run the demodulator on each single-burst file:
+For a **Compustar 1WG3R-family FOB** (1WSHR-PRO, 1WG3R-SH, 1WAMR-1900),
+run the Compustar-specific demodulator:
 
 ```powershell
-python sdr\scripts\demod-ook.py sdr\captures\fob-start-001-b1.bin
+python sdr\scripts\demod-compustar.py sdr\captures\fob-start-001-b1.bin
 ```
 
 Expected output:
 
 ```
 File: sdr/captures/fob-start-001-b1.bin
-Bursts: 1, packets decoded: 1
-  -> sdr/captures/fob-start-001-b1.bits: 0101011...1101
+Burst regions: 1, packets decoded: 8
+Valid packets (integrity check passed): 0
+WARN no valid packets — possible decoder issue. First few raw:
+  ID=0x2DD6 button=0x9F ~button=0x60 unk1=000 unk2=0
 ```
 
-The `.bits` file contains:
-- A few comment lines starting with `#` (source, sample rate, measured TE, etc.)
-- One line of 66 `0`/`1` characters — your demodulated packet
+(Don't worry about "Valid packets: 0" — the integrity check is for
+the canonical 1WG3R layout; our 1WSHR-PRO is a structural sub-variant
+and the `unk1` field is `000` instead of `111`. The Remote ID and
+per-button bit patterns still extract correctly, which is what we
+need.)
 
-If the demodulator fails to decode (`packets decoded: 0`), it will print
-diagnostic hints. The two most common causes:
+For a **standard HCS-PWM FOB**, run the generic demodulator instead:
 
-1. **AGC compression** — the capture was made at too-high gain, so the
-   on-air OOK signal got squashed into <1% modulation depth and is
-   buried in noise. Re-record with `-g 20` instead of `-g 40` (see
-   step 04 troubleshooting).
-2. **TE mismatch** — your specific FOB uses a non-default bit element
-   time. Try `--te-us 200`, `--te-us 800`, or `--te-us 600` to find one
-   that works.
+```powershell
+python sdr\scripts\demod-ook.py sdr\captures\fob-start-001-b1.bin
+```
+
+Both demodulators emit `.bits` files in `sdr/captures/`:
+- A few comment lines starting with `#` (source, sample rate, measured
+  pulse widths, etc.)
+- One line of `0`/`1` characters — your demodulated packet.
+
+For Compustar 1WG3R-family FOBs the bit line is **35 characters** long
+(between sync triplets); for HCS-PWM FOBs it's **66 characters**.
+
+If `demod-compustar.py` reports `Burst regions: 0`, the burst detector
+missed the packet — typically because the capture was made at too-high
+gain (`-g 40`) so AGC compression killed the modulation depth. Re-record
+with `-g 20` per step 04's troubleshooting and try again.
 
 Run with `--verbose` to see what's happening internally:
 
 ```powershell
-python sdr\scripts\demod-ook.py sdr\captures\fob-start-001-b1.bin --verbose
+python sdr\scripts\demod-compustar.py sdr\captures\fob-start-001-b1.bin --verbose
 ```
 
 ## Step 4 — Demodulate all your bursts
 
-You want at minimum 3 Start `.bits` files plus 1 each of Lock / Unlock /
-Trunk for step 06 (framing extraction). With the trimmed-burst files
-from step 2 you can pick any three Start bursts:
+For a Compustar 1WG3R-family FOB, you need at minimum **1 burst per
+button** (4 buttons = 4 files) since the protocol is fixed-code and all
+repeats of a given button are identical. Multiple Start captures are
+useful to confirm that — they should produce byte-identical 35-bit
+patterns.
+
+For an HCS-KeeLoq FOB you need 3+ Start captures plus 1 each of
+Lock/Unlock/Trunk so that step 06 can diff them and identify the
+hopping-code position.
 
 ```powershell
-python sdr\scripts\demod-ook.py sdr\captures\fob-start-001-b1.bin
-python sdr\scripts\demod-ook.py sdr\captures\fob-start-002-b1.bin
-python sdr\scripts\demod-ook.py sdr\captures\fob-start-003-b1.bin
-python sdr\scripts\demod-ook.py sdr\captures\fob-lock-001-b1.bin
-python sdr\scripts\demod-ook.py sdr\captures\fob-unlock-001-b1.bin
-python sdr\scripts\demod-ook.py sdr\captures\fob-trunk-001-b1.bin
+python sdr\scripts\demod-compustar.py sdr\captures\fob-start-001-b1.bin
+python sdr\scripts\demod-compustar.py sdr\captures\fob-start-002-b1.bin
+python sdr\scripts\demod-compustar.py sdr\captures\fob-start-003-b1.bin
+python sdr\scripts\demod-compustar.py sdr\captures\fob-lock-001-b1.bin
+python sdr\scripts\demod-compustar.py sdr\captures\fob-unlock-001-b1.bin
+python sdr\scripts\demod-compustar.py sdr\captures\fob-trunk-001-b1.bin
 ```
 
-(All `.bits` files land next to the `.bin` they came from, in `sdr/captures/`.)
+(All `.bits` files land next to the `.bin` they came from, in
+`sdr/captures/`.)
 
 ## Step 5 — Quick eyeball verification
 
-Open one of the `.bits` files. The bit string after the `#` comment lines
-is your packet. For three consecutive Start captures, the bits should
-look mostly similar but with about 32 positions different — that's the
-hopping code changing as the FOB counter increments.
+Open one of the `.bits` files. The bit string after the `#` comment
+lines is your packet.
+
+**For a Compustar 1WG3R-family FOB**, three consecutive Start
+captures should produce **identical** 35-bit patterns — the protocol is
+fixed-code, no rolling counter. That's the project's actual case.
 
 ```powershell
 type sdr\captures\fob-start-001-b1.bits
@@ -140,17 +177,28 @@ type sdr\captures\fob-start-002-b1.bits
 type sdr\captures\fob-start-003-b1.bits
 ```
 
-That eyeball check is the gateway to step 06. If two consecutive Start
-captures' bits are *identical*, the FOB counter didn't increment (rare,
-might mean you accidentally analyzed the same burst twice). If 60+ bits
-differ between them, the demodulator got confused — re-record at lower
-gain or try a different `--te-us` value.
+If they aren't identical, either the demodulator missed sync alignment
+(re-run with `--verbose`) or you accidentally captured a different
+button.
+
+**For an HCS-KeeLoq FOB**, three Start captures should differ in
+about 32 positions — the hopping code changes as the FOB counter
+increments. If two consecutive Start captures' bits are identical
+on an HCS FOB, the FOB counter didn't increment (rare, might mean
+you analyzed the same burst twice). If 60+ bits differ, the demod
+got confused — re-record at lower gain or try a different `--te-us`.
 
 ## What you should have when done
 
-- One `.bits` file per packet you care about (3 Start + 1 each of
-  Lock/Unlock/Trunk minimum)
-- Quick eyeball confirmation that:
+For a Compustar 1WG3R-family FOB:
+- 4 `.bits` files (one per button) with stable 35-bit patterns
+- Optional: multiple `.bits` per button confirming patterns are
+  byte-identical across presses
+
+For an HCS-KeeLoq FOB:
+- 3+ Start `.bits` files (varying hopping code)
+- 1 `.bits` each for Lock/Unlock/Trunk
+- Eyeball confirmation that:
   - Start vs Start: ~32 bits different (the hopping code)
   - Start vs Lock: ~36 bits different (hopping + 4-bit function code)
 
@@ -170,6 +218,37 @@ gain or try a different `--te-us` value.
 | 60+ bits differ between two Start captures | Demod is misaligning bits, probably wrong TE. Try a few `--te-us` values; pick the one where Start-vs-Start diffs are ~32 bits. |
 | `pattern break at run N` | The demodulator found preamble + header gap, started decoding bits, then hit a non-PWM section. Usually means the capture had RF interference mid-packet — pick a different burst's `-b2.bin` or `-b3.bin` instead. |
 | `decode error: short read` | Capture got truncated before 66 bits were received. Use one of the other bursts (the `-b2.bin` or `-b3.bin` files) which should have full packets. |
+
+## rtl_433 cross-check (optional)
+
+If you want a second opinion on the on-air pulse structure, install
+[`rtl_433`](https://github.com/merbanan/rtl_433/releases) (use the
+**nightly** build on Windows — release 25.12 doesn't have the
+`compustar_1wg3r` decoder yet). Then:
+
+```powershell
+rtl_433.exe -r cu8:sdr\captures\fob-start-001-b1.bin -s 250000 -f 433968000 -A
+```
+
+`-A` runs the pulse-width analyzer (independent of any specific
+decoder). You should see three pulse-width clusters near 732 / 1100 /
+1476 µs for a Compustar 1WG3R-family FOB. The histogram counts also
+let you verify the burst structure: for ours, 142 short + 144 long +
+24 sync pulses = 310 total pulses, which is 8 packets × (3 sync + 35
+data) + ~6-pulse preamble.
+
+The full 1WG3R decoder runs with `-R 302`:
+
+```powershell
+rtl_433.exe -r cu8:sdr\captures\fob-start-001-b1.bin -s 250000 -f 433968000 -R 302
+```
+
+For 1WG3R-SH and 1WAMR-1900 FOBs this prints `{"model":"Compustar-1WG3R","id":...,"button_str":...}`
+JSON per packet. For 1WSHR-PRO it produces no output — our sub-variant
+has 3 sync pulses + 35 data bits instead of 1 sync + 36 bits, and
+rtl_433's strict structural check rejects the framing. That's fine —
+the project's own `demod-compustar.py` handles the sub-variant, and
+the `-A` output above gives ground-truth on pulse widths.
 
 ## URH alternative (optional)
 

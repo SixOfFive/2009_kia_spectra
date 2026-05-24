@@ -4,7 +4,13 @@ Context-preservation document. A future Claude (or future-me) should be
 able to read this file and pick up where we left off without
 reconstructing from chat history.
 
-**Last updated: 2026-05-24 (late-day, post-protocol-discovery).**
+**Last updated: 2026-05-24 (late-day, post-firmware-rewrite + doc cleanup).**
+
+> **State note for future Claude**: Section 4 steps 1-6 are COMPLETE.
+> The firmware was rewritten to the fixed-code path in commits
+> `0df2936` / `80bef8d` / `1bebd81` and the docs were updated in this
+> round. Only Step 7 (hardware bench validation) remains, and it's
+> blocked on parts arrival. Don't re-do steps 1-6.
 
 ---
 
@@ -164,9 +170,10 @@ vroom/
 
 ## 4. NEXT STEPS (where to pick up)
 
-Numbered in order. **Do these in this order**, don't skip ahead.
+Numbered in order. Steps 1-6 are DONE as of 2026-05-24 evening. Only
+Step 7 remains, blocked on parts arrival.
 
-### Step 1 — Install rtl_433 on Windows for ground-truth validation
+### ✅ Step 1 — Install rtl_433 on Windows for ground-truth validation
 
 The rtl_433 project has the working compustar_1wg3r decoder. Install it
 to verify our findings before rewriting any code.
@@ -197,7 +204,7 @@ If rtl_433 outputs valid packets, we have GROUND TRUTH for:
 If rtl_433 fails to decode (different protocol variant), we fall back
 to bit-pattern replay using the captures we already have.
 
-### Step 2 — Update `framing.local.md` with rtl_433's output
+### ✅ Step 2 — Update `framing.local.md` with rtl_433's output
 
 Whatever rtl_433 extracts, write to `sdr/analysis/framing.local.md`:
 - Remote ID (16-bit hex)
@@ -207,7 +214,7 @@ Whatever rtl_433 extracts, write to `sdr/analysis/framing.local.md`:
   fall back to bit-pattern replay (the existing patterns in
   framing.local.md are still valid for verbatim transmission)
 
-### Step 3 — Rewrite `esp32/src/lib/compustar.py`
+### ✅ Step 3 — Rewrite `esp32/src/lib/compustar.py`
 
 Strip out KeeLoq and replace with a 36-bit fixed-code builder:
 
@@ -242,14 +249,14 @@ empirically. **Keep `keeloq.py` and its tests** — leave them alone, they
 just become unused code for this specific FOB. (Future-proof for HCS
 variants.)
 
-### Step 4 — Update `esp32/src/controller.py`
+### ✅ Step 4 — Update `esp32/src/controller.py`
 
 The state machine doesn't change shape, but the RF transmit logic
 simplifies dramatically. Replace the keeloq counter-update logic with
 just "look up button code, transmit packet". Counter persistence in
 `persistence.py` becomes optional / unused.
 
-### Step 5 — Update `esp32/src/secrets.py.example`
+### ✅ Step 5 — Update `esp32/src/secrets.py.example`
 
 ```python
 # Compustar 1-way fixed code remote (1WG3R protocol family).
@@ -264,17 +271,23 @@ COMPUSTAR_BUTTON_CODES = {
 # (Remove COMPUSTAR_DEVICE_KEY and COMPUSTAR_COUNTER — no longer used.)
 ```
 
-### Step 6 — Update reproduction docs
+### ✅ Step 6 — Update reproduction docs
 
-- `docs/12-keeloq-bench-validation.md` → rename to `docs/12-compustar-bench-validation.md`
-  and rewrite for the fixed-code path (capture → store → replay).
-- `sdr/07-key-recovery.md` → mark as obsolete, or convert to a "key
-  recovery for HCS-KeeLoq FOB variants" doc for future readers whose
-  FOBs aren't 1WG3R family.
-- `sdr/05-demodulation.md` → add note that demod-compustar.py is the
-  Compustar-specific tool, demod-ook.py is the generic path.
-- `sdr/06-framing-extraction.md` → simplify, replace HCS layout with
-  the 1WG3R 36-bit layout.
+Done in commits during the doc-cleanup round:
+
+- `docs/12-keeloq-bench-validation.md` renamed to `docs/12-bench-validation.md`
+  and rewritten for the fixed-code capture-store-replay path.
+- `sdr/07-key-recovery.md` now opens with a "NOT NEEDED for Compustar
+  1WG3R-family FOBs" callout. Content preserved for any HCS-KeeLoq
+  reader.
+- `sdr/05-demodulation.md` points readers at `demod-compustar.py`
+  first; `demod-ook.py` documented as the generic HCS fallback. Added
+  an rtl_433 `-A` cross-check section.
+- `sdr/06-framing-extraction.md` simplified to "capture 35-bit pattern
+  per button + Remote ID". HCS-KeeLoq diff-based discovery moved to
+  an appendix.
+- Cross-references updated in `docs/reproduce.md`, `docs/day-one.md`,
+  `docs/11-uart-link.md`, `README.md`.
 
 ### Step 7 — Test on hardware
 
@@ -435,14 +448,24 @@ into `esp32/src/secrets.py` (also gitignored) as plain Python constants.
 
 ## 13. Quick "I'm coming back fresh" cheat sheet
 
-1. Read this file (you're doing it)
-2. Read `sdr/analysis/framing.local.md` for per-FOB values
-3. `git log --oneline -20` to see what's been pushed
-4. Check `sdr/captures/*.bin` exists and `sdr/captures/*.bits` has been generated
-5. Try the next step (section 4 step 1): install rtl_433 nightly Windows build,
-   run on a capture, verify it outputs `Compustar-1WG3R` with matching Remote ID
-6. Update `framing.local.md` with rtl_433's extracted button codes
-7. Rewrite `compustar.py` per section 4 step 3
+1. Read this file (you're doing it). Section 4 steps 1-6 are DONE.
+2. Read `sdr/analysis/framing.local.md` for per-FOB values (Remote ID
+   `0x2DD6`, plus the 4 captured 35-bit patterns).
+3. `git log --oneline -20` to see recent commits. Key landmarks:
+   - `0fa7dc8` — protocol-discovery braindump
+   - `0df2936` — framing.md updated with rtl_433 verification
+   - `80bef8d` — firmware rewrite (KeeLoq path removed)
+   - `1bebd81` — daily log update
+   - Doc cleanup follows after that.
+4. Verify the firmware passes tests:
+   `cd esp32 && python tests/test_compustar.py && python tests/test_controller.py && python tests/test_integration.py`
+   Expected: 23 + 17 + 9 tests passing.
+5. The only remaining work is **Step 7 — hardware bench validation**,
+   per `docs/12-bench-validation.md`. It's blocked on parts arrival
+   (CC1101 / ESP32 / Pi / ADS1115 / OBD-II pigtails).
+6. When parts arrive, walk `docs/day-one.md` end to end. The "moment
+   of truth" steps are Lock cycle (safest first button) → Unlock →
+   Start.
 
 The user is willing to iterate — don't be afraid to ask clarifying
 questions or commit partial progress.

@@ -83,7 +83,7 @@ If you want to visualize: load the CSV in Excel/LibreOffice and chart the averag
 python sdr/scripts/plot-power-csv.py sdr/captures/band-baseline.csv
 ```
 
-(The helper script is in step 03 — we'll create it then.)
+This prints the top peaks and the estimated noise floor — see `sdr/scripts/README.md`.
 
 ## What you should have when done
 

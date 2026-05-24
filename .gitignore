@@ -34,7 +34,8 @@ desktop.ini
 *.cs16
 *.cf32
 captures/
-sdr/captures/
+sdr/captures/*
+!sdr/captures/.gitkeep
 sdr/recordings/
 
 # Logs (application logs only — NOT the daily journal at logs/YYYY-MM-DD.md)

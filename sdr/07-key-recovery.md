@@ -42,14 +42,19 @@ For Compustar / Firstech specifically — at time of writing the situation is mi
 
 **Action**: download keeloq_mfcodes from a current Unleashed firmware build, search for entries matching "Compustar", "Firstech", or "1WSHR", and try each candidate manufacturer key with the standard derivation functions.
 
-A helper script lives at `sdr/scripts/try-mfkeys.py` (to be created when we actually run this) that:
-1. Loads candidate manufacturer keys from a file
-2. For your FOB serial, computes the device key per each derivation
-3. Tries to decrypt one of your captured hopping codes
-4. Checks if the result looks like a sensible (counter, discrimination, function) plaintext
-5. Reports any matches
+The helper [`sdr/scripts/try-mfkeys.py`](scripts/try-mfkeys.py) does the search:
 
-If you get a hit, **that's your device key**. Drop into `secrets.py` and skip to "Validate" below.
+1. Loads candidate manufacturer keys from a Flipper-format file
+2. For each (key, derivation_type) pair, computes the device key from your FOB serial
+3. Decrypts one captured hopping code with it
+4. Checks if the plaintext is plausible (counter < 50000, discrimination nibble matches the low nibble of the serial, function nibble nonzero)
+5. Prints any hits
+
+```powershell
+python sdr/scripts/try-mfkeys.py --serial 0xABCDEF1 --hopping 0xDEADBEEF --mfkeys path/to/keeloq_mfcodes
+```
+
+If you get exactly one hit, **that's your device key**. Drop into `secrets.py` and confirm with `validate-key.py` (see "Validate" below). If you get many hits, you'll narrow it down by running `validate-key.py` with 3+ consecutive captures — only the right key produces counters that increment by 1.
 
 ## Path B — Read the chip's EEPROM directly (most reliable, ~$30)
 
@@ -103,30 +108,21 @@ In practice this is academic interest, not a real production path. If A and B bo
 
 ## Validate the recovered key
 
-Once you have a candidate device key (from any of the paths above), confirm it by decrypting one of your captured hopping codes:
+Once you have a candidate device key (from any of the paths above), confirm it with the [`sdr/scripts/validate-key.py`](scripts/validate-key.py) helper using 3+ consecutive Start captures:
 
-```python
-# In Python REPL or a test script
-import sys
-sys.path.insert(0, "esp32/src")
-from lib import keeloq
-
-device_key = 0x_____  # your candidate
-hopping_code = 0x_____  # from sdr/analysis/fob-start-001.bits, hopping field
-
-plaintext = keeloq.decrypt(hopping_code, device_key)
-counter = plaintext & 0xFFFF
-discrim = (plaintext >> 16) & 0xF
-function = (plaintext >> 20) & 0xF
-
-print(f"Counter:  {counter}")
-print(f"Discrim:  {discrim:x}  (should equal low nibble of your serial)")
-print(f"Function: {function:x}  (should equal your Start function code from step 06)")
+```powershell
+python sdr/scripts/validate-key.py `
+    --device-key 0xAABBCCDDEEFF0011 `
+    --serial 0xABCDEF1 `
+    0xHOP1 0xHOP2 0xHOP3
 ```
 
-If the decrypted counter is plausible (small integer, e.g. between 1 and 65535) AND the discrimination matches the low nibble of your serial AND the function code matches what you measured in step 06 → **your key is correct**.
+The script decrypts each capture and prints the counter, discrimination, and function values. The gold-standard confirmation is:
 
-Then decrypt 3+ consecutive Start captures and check that the counter increments by exactly 1 between them — that's the gold-standard confirmation.
+- All rows say `yes` in the ok? column (discrimination matches serial low nibble, function nonzero, counter reasonable)
+- Counter deltas are `[1, 1]` — meaning the captures are 3 consecutive presses and the key recovers them correctly
+
+If you see `All deltas = 1. Key is almost certainly correct.` — done. Drop the values into `secrets.py` and move on.
 
 ## Replicate the FOB from the ESP32
 

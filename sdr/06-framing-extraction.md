@@ -132,34 +132,11 @@ Commit these updates with a message like `Update Compustar function codes from S
 
 ## Helper script: diff-bits.py
 
-If `sdr/scripts/diff-bits.py` doesn't exist yet, create it:
-
-```python
-"""Compare two .bits files and report positions where they differ."""
-import sys
-
-def load_bits(path):
-    bits = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or line.startswith("["):
-                continue
-            for ch in line:
-                if ch in "01":
-                    bits.append(int(ch))
-    return bits
-
-a = load_bits(sys.argv[1])
-b = load_bits(sys.argv[2])
-assert len(a) == len(b), f"length mismatch: {len(a)} vs {len(b)}"
-
-diffs = [i for i in range(len(a)) if a[i] != b[i]]
-print(f"{len(diffs)} bits differ out of {len(a)}")
-print(f"Positions: {diffs}")
-```
-
-Save to `sdr/scripts/diff-bits.py` and `chmod +x` if you want.
+The helper at [`sdr/scripts/diff-bits.py`](scripts/diff-bits.py) loads both
+`.bits` files (skipping `#` comments and `[label]` markers from URH),
+reports how many bits differ, and groups contiguous runs of differing
+positions — which is exactly what makes the hopping-code region visually
+obvious.
 
 ## What you should have when done
 

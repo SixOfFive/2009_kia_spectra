@@ -32,7 +32,11 @@ sdr/
 ├── 06-framing-extraction.md        │
 ├── 07-key-recovery.md              ┘
 ├── captures/        (gitignored — raw IQ binary files, can be huge)
-├── scripts/         (helper Python / shell scripts)
+├── scripts/         (helper Python — see scripts/README.md)
+│   ├── plot-power-csv.py   (find frequency peaks in rtl_power output)
+│   ├── diff-bits.py        (compare two .bits files)
+│   ├── try-mfkeys.py       (brute-force a manufacturer-key database)
+│   └── validate-key.py     (confirm a candidate device key against captures)
 └── analysis/
     ├── framing.md              (committed — your final findings about the FOB protocol)
     ├── screenshots/            (gitignored by default — selectively commit ones worth keeping)

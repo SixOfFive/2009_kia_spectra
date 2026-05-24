@@ -1,0 +1,24 @@
+[Unit]
+Description=Vroom remote-start dashboard daemon
+Documentation=https://github.com/SixOfFive/2009_kia_spectra
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/vroom
+Environment=PYTHONPATH=/opt/vroom
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m pi.app.daemon
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# The daemon needs sudo to shutdown the Pi when the ESP32 requests it.
+# Configure passwordless shutdown via /etc/sudoers.d/vroom (provision.sh does this).
+
+[Install]
+WantedBy=multi-user.target

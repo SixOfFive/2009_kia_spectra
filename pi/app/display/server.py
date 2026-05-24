@@ -3,17 +3,18 @@ Flask dashboard server for the in-cab 5" touchscreen + LAN access.
 
 Routes:
     GET  /            -> dashboard.html (the main UI rendered in chromium kiosk)
-    GET  /api/state   -> current state as JSON (browser polls this every 1s)
-    POST /api/command -> manually trigger start/stop/etc. via the UI buttons
+    GET  /api/state   -> current STATE snapshot as JSON (browser polls this 1Hz)
+    POST /api/command -> manually trigger start/stop/etc via the UI buttons —
+                         forwarded to the ESP32 via the shared Esp32Link
 
-Shared state lives in module-level ``STATE`` and is updated by the UART
-listener thread (separate file). For now we only mock the data — the real
-listener gets wired up once the ESP32 is on the bench.
+The actual STATE dict and ESP32 link live in pi.app.state — see daemon.py
+for the process layout.
 """
 
 from flask import Flask, jsonify, render_template, request, abort
 
-from pi.app import config
+from pi.app import config, state
+from pi.app.comms import esp32_link
 
 
 app = Flask(
@@ -23,15 +24,13 @@ app = Flask(
 )
 
 
-# Module-level state. In production this is updated by the UART listener
-# thread; here we initialize with mocked values so the UI renders sensibly
-# before any hardware is attached.
-STATE = {
-    "v_battery": 12.6,
-    "engine_running": False,
-    "esp32_state": "idle",
-    "last_start_ts": None,
-    "last_obd": {
+# Initial fields for STATE so the dashboard renders sensibly before any
+# real messages arrive. The UART listener overwrites these as data flows.
+state.update_state(
+    v_battery=12.6,
+    engine_running=False,
+    esp32_state="boot",
+    last_obd={
         "rpm": 0.0,
         "speed": 0.0,
         "coolant_temp": 24,
@@ -39,9 +38,14 @@ STATE = {
         "fuel_level": 75.0,
         "control_module_voltage": 12.6,
     },
-    "wifi_rssi": None,
-    "uptime_s": 0,
-}
+)
+
+
+_VALID_COMMANDS = (
+    esp32_link.CMD_START_ENGINE,
+    esp32_link.CMD_STOP_ENGINE,
+    esp32_link.CMD_PING,
+)
 
 
 @app.route("/")
@@ -54,32 +58,37 @@ def dashboard():
 
 @app.route("/api/state")
 def api_state():
-    return jsonify(STATE)
+    return jsonify(state.snapshot())
 
 
 @app.route("/api/command", methods=["POST"])
 def api_command():
     payload = request.get_json(silent=True) or {}
     cmd = payload.get("cmd")
-    if cmd not in ("start_engine", "stop_engine", "ping"):
+    if cmd not in _VALID_COMMANDS:
         abort(400, "unknown command")
-    # TODO: forward to the ESP32 via the UART link once it's wired up.
-    # For now just acknowledge so the UI button feedback works.
+
+    link = state.get_link()
+    if link is None:
+        return jsonify({"ok": False, "cmd": cmd, "error": "esp32 link not initialized"}), 503
+
+    try:
+        link.send(esp32_link.command(cmd, **{k: v for k, v in payload.items() if k != "cmd"}))
+    except Exception as e:
+        return jsonify({"ok": False, "cmd": cmd, "error": str(e)}), 502
+
     return jsonify({"ok": True, "cmd": cmd, "queued": True})
 
 
-def update_state(**fields):
-    """Merge fields into the shared STATE dict. Called by the UART listener."""
-    STATE.update(fields)
-
-
-def update_obd(name, value):
-    """Update one OBD-II field by name."""
-    STATE["last_obd"][name] = value
+# Backwards-compatible aliases — kept for any code that previously did
+# `from pi.app.display.server import STATE, update_state, update_obd`.
+STATE = state.STATE
+update_state = state.update_state
+update_obd = state.update_obd
 
 
 if __name__ == "__main__":
-    # Manual run for development / testing.
+    # Manual run for development; the daemon is the production entrypoint.
     app.run(
         host=config.DISPLAY_BIND_HOST,
         port=config.DISPLAY_BIND_PORT,

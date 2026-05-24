@@ -33,6 +33,33 @@ def test_rtc_magic_and_format_match_layout():
     assert struct.calcsize(persistence._RTC_FORMAT) == 2
 
 
+def test_reset_cause_string_cpython_fallback():
+    # No machine.reset_cause available in CPython → stable sentinel.
+    assert persistence.reset_cause_string() == "cpython"
+
+
+def test_reset_cause_string_known_codes_via_monkeypatch():
+    # Simulate MicroPython by injecting a reset_cause() returning each known
+    # code, and confirm we get the documented label.
+    saved = persistence.reset_cause
+    try:
+        for code, expected in [
+            (0, "PWRON_RESET"),
+            (1, "HARD_RESET"),
+            (2, "WDT_RESET"),
+            (4, "DEEPSLEEP_RESET"),
+            (5, "SOFT_RESET"),
+        ]:
+            persistence.reset_cause = (lambda c=code: c)
+            assert persistence.reset_cause_string() == expected, (
+                "code %d → %s, got %s" % (code, expected, persistence.reset_cause_string()))
+        # An unknown code returns "unknown(<n>)" rather than blowing up.
+        persistence.reset_cause = lambda: 99
+        assert persistence.reset_cause_string() == "unknown(99)"
+    finally:
+        persistence.reset_cause = saved
+
+
 def run():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:

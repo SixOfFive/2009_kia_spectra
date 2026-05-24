@@ -79,5 +79,10 @@ notes.local.md
 # contain the leaked values literally. Must never be committed.
 tools/scrub-history/
 
+# Context-preservation document for Claude sessions. Contains
+# operational details and forward-looking project state that shouldn't
+# be public. Always lives locally only.
+braindump.md
+
 # Claude Code local settings (not shared)
 .claude/settings.local.json

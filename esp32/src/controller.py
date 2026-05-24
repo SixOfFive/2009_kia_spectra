@@ -366,6 +366,12 @@ class VroomController:
             self.state, self.low_v_count,
             "deep_sleep" if persistence.was_deep_sleep_wake() else "cold_boot",
         ))
+        # Post-mortem visibility — emit the reset cause to the Pi log so we
+        # can answer "did the WDT fire?" / "was this a brown-out?" from the
+        # event archive without needing a serial console attached.
+        self.uart.send(pi_link.log(
+            "info", "reset_cause=%s" % persistence.reset_cause_string(),
+        ))
         while True:
             try:
                 self.tick()

@@ -36,8 +36,41 @@ try:
 except ImportError:
     _HAS_RTC = False
     DEEPSLEEP_RESET = 4      # ESP32 constant; useful for CPython mock comparison
-    def reset_cause():       # noqa
-        return 0
+    reset_cause = None       # noqa — signals CPython fallback to reset_cause_string
+
+
+# MicroPython machine.* reset_cause() return codes. The exact ints aren't part
+# of MicroPython's public API but they've been stable on ESP32 for years.
+# Mapping captured here so the controller can emit a human-readable label
+# at boot — useful post-mortem ("did the WDT actually fire?").
+_RESET_CAUSE_NAMES = {
+    0: "PWRON_RESET",
+    1: "HARD_RESET",
+    2: "WDT_RESET",
+    3: "DEEPSLEEP_RESET",  # historical alias on some ports
+    4: "DEEPSLEEP_RESET",
+    5: "SOFT_RESET",
+    6: "BROWNOUT_RESET",
+}
+
+
+def reset_cause_string():
+    """Return a stable human-readable name for the most recent reset cause.
+
+    Returns "cpython" on the CPython host (no machine.reset_cause available)
+    and "unknown(<n>)" if MicroPython returns a code we don't have a label for.
+    Never raises.
+    """
+    if reset_cause is None:
+        return "cpython"
+    try:
+        code = reset_cause()
+    except Exception:
+        return "cpython"
+    name = _RESET_CAUSE_NAMES.get(code)
+    if name is not None:
+        return name
+    return "unknown(%d)" % code
 
 
 def save_streak(low_v_count):

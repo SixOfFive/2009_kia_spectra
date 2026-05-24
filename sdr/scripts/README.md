@@ -12,6 +12,8 @@ stays the single source of truth.
 | `trim-burst.py` | [04](../04-recording-captures.md), [05](../05-demodulation.md) | Extract each strong burst from a long capture as its own small `.bin` |
 | `demod-ook.py` | [05](../05-demodulation.md) | Headless OOK demodulator — turns an IQ capture into a 66-bit `.bits` packet. Replaces URH for our purposes. |
 | `debug-envelope.py` | troubleshooting | Diagnostic dump of envelope statistics + run-length histograms when `demod-ook.py` can't find packets |
+| `consensus-bits.py` | [06](../06-framing-extraction.md) | Majority-vote across .bits files (multiple decodes of same press) to produce a clean bit string |
+| `analyze-framing.py` | [06](../06-framing-extraction.md) | Classify each bit position as HOPPING / FUNCTION-code / SERIAL given multiple captures across multiple buttons |
 | `diff-bits.py` | [06](../06-framing-extraction.md) | Compare two `.bits` files, report positions where bits flip |
 | `try-mfkeys.py` | [07](../07-key-recovery.md) Path A | Brute-force a manufacturer-key database to derive a candidate device key |
 | `validate-key.py` | [07](../07-key-recovery.md) | Decrypt captured hopping codes with a candidate device key, check counter increments by 1 |

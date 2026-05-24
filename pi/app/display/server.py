@@ -13,7 +13,7 @@ for the process layout.
 
 from flask import Flask, jsonify, render_template, request, abort
 
-from pi.app import config, state
+from pi.app import config, state, trip_log
 from pi.app.comms import esp32_link
 
 
@@ -128,6 +128,21 @@ def api_transmit(button):
             "handler in controller.py"
         ),
     }), 501
+
+
+@app.route("/api/trips")
+def api_trips():
+    """Return the last N persisted trips, newest first."""
+    try:
+        limit = int(request.args.get("limit", config.TRIP_LOG_DEFAULT_LIMIT))
+    except (TypeError, ValueError):
+        limit = config.TRIP_LOG_DEFAULT_LIMIT
+    limit = max(1, min(limit, 200))
+    try:
+        trips = trip_log.read_recent(config.TRIP_LOG_PATH, limit=limit)
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "trips": trips, "open": trip_log.open_trip_snapshot()})
 
 
 # Backwards-compatible aliases — kept for any code that previously did

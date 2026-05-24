@@ -181,6 +181,56 @@ main {
 .btn-tx-unlock { background: #1f2733; color: #c9d1d9; }
 .btn-tx-trunk  { background: #1f2733; color: #c9d1d9; }
 
+/* Trips panel — small read-only table of the last few engine-run cycles. */
+.trips {
+  margin-top: 8px;
+  background: #0f1419;
+  border: 1px solid #1f2733;
+  border-radius: 8px;
+  padding: 6px 10px 8px;
+}
+
+.trips-header {
+  font-size: 11px;
+  color: #6e7681;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+
+.trips-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.trips-table th {
+  text-align: left;
+  font-weight: 500;
+  color: #6e7681;
+  padding: 2px 4px;
+  border-bottom: 1px solid #1f2733;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+}
+
+.trips-table td {
+  padding: 3px 4px;
+  color: #c9d1d9;
+}
+
+.trips-table tr + tr td {
+  border-top: 1px solid #161b22;
+}
+
+.trips-empty {
+  color: #6e7681;
+  font-style: italic;
+  text-align: center;
+}
+
 .status-bar {
   display: flex;
   justify-content: space-between;

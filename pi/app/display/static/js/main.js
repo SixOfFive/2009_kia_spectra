@@ -18,6 +18,7 @@ const els = {
   uptime:     document.getElementById('uptime'),
 
   eventsList: document.getElementById('events-list'),
+  tripsBody:  document.getElementById('trips-body'),
 
   btnStart: document.getElementById('btn-start'),
   btnStop:  document.getElementById('btn-stop'),
@@ -119,6 +120,62 @@ async function poll() {
 
 setInterval(poll, POLL_MS);
 poll();  // initial fire
+
+// ----- Trips panel (polled less often — append-only file) -----
+
+function fmtDuration(s) {
+  if (s === null || s === undefined) return '--';
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}m${String(r).padStart(2, '0')}`;
+}
+
+function fmtIso(iso) {
+  if (!iso) return '--';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+  } catch (e) {
+    return iso;
+  }
+}
+
+function renderTrips(payload) {
+  const trips = payload.trips || [];
+  if (!els.tripsBody) return;
+  if (!trips.length) {
+    els.tripsBody.innerHTML = '<tr><td class="trips-empty" colspan="7">No trips yet</td></tr>';
+    return;
+  }
+  els.tripsBody.innerHTML = trips.slice(0, 10).map(t => {
+    const peak = t.peak_obd || {};
+    return `<tr>
+      <td>${fmtIso(t.ts_start)}</td>
+      <td>${fmtDuration(t.duration_s)}</td>
+      <td>${t.trigger_source || '--'}</td>
+      <td>${fmt(t.v_start, 1)}</td>
+      <td>${fmt(t.v_end, 1)}</td>
+      <td>${fmt(peak.rpm, 0)}</td>
+      <td>${fmt(peak.coolant_temp, 0)}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function pollTrips() {
+  try {
+    const res = await fetch('/api/trips?limit=10');
+    if (!res.ok) return;
+    const body = await res.json();
+    renderTrips(body);
+  } catch (err) {
+    // Silent — the panel just stays stale.
+  }
+}
+
+// Trips don't update every second; once a minute is plenty since rows
+// only land at engine_stopped.
+setInterval(pollTrips, 30_000);
+pollTrips();
 
 // ----- Buttons -----
 

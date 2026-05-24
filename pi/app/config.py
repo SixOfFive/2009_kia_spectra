@@ -40,6 +40,12 @@ OBD_HISTORY_POINTS = 600  # ~10 minutes at 1 sample/sec
 STATE_DIR = "/var/lib/vroom"
 LOG_DIR = "/var/log/vroom"
 
+# JSONL trip log — one line per remote-start cycle. See pi.app.trip_log.
+TRIP_LOG_PATH = "/var/log/vroom/trips.jsonl"
+
+# How many trips the /api/trips endpoint returns by default.
+TRIP_LOG_DEFAULT_LIMIT = 20
+
 
 # ----- MQTT publisher -----
 

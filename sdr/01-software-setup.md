@@ -60,23 +60,31 @@ Expected output: model info + tuner type + supported sample rates. If you get "N
 pip install --user urh
 ```
 
-**Python 3.13 / 3.14 gotcha**: URH publishes prebuilt wheels for Python
-3.10-3.12. On 3.13+ pip falls back to a source build and fails with
-`You need Cython to build URH's extensions!` — even with Cython installed,
-the source build then typically fails on a missing MSVC compiler.
+**Python version gotcha (Windows)**: as of URH 2.10.0, the ONLY Windows
+wheel on PyPI is `cp313-win_amd64` — i.e. Python **3.13** only. Trying
+to install URH on Windows under Python 3.10, 3.11, 3.12, or 3.14 falls
+back to a source build that requires both Cython and MSVC Build Tools;
+even with both installed it often still fails.
 
-The clean fix is to use Python 3.12 *just for URH* (your other Python
-tooling — Thonny, the test suite — can stay on 3.14):
+The clean fix is to install Python 3.13 alongside your existing Python
+(other tooling — Thonny, our test suite — can stay on whatever version
+you already use):
 
-1. Install [Python 3.12](https://www.python.org/downloads/release/python-31210/)
-   alongside your existing Python. **Uncheck** "Add to PATH" so it doesn't
-   shadow your default Python.
-2. Use the Python launcher to target it explicitly:
+1. Install [Python 3.13](https://www.python.org/downloads/release/python-3137/).
+   **Uncheck** "Add to PATH" during install so it doesn't shadow your
+   default Python.
+2. Use the Python launcher to target 3.13 explicitly:
 
    ```powershell
-   py -3.12 -m pip install --user urh
-   py -3.12 -m urh
+   py -3.13 -m pip install --user urh
+   py -3.13 -m urh
    ```
+
+   This grabs the prebuilt `urh-2.10.0-cp313-cp313-win_amd64.whl` —
+   no compilation needed.
+
+(Linux ships wheels for Python 3.10-3.14 — no Python-version juggling
+required.)
 
 Launch URH once to confirm — a GUI window should open. Close it; we'll
 come back to it in step 05.

@@ -99,7 +99,7 @@ def parse_bit_pattern(pattern, expected_bits=PACKET_BITS):
     Whitespace is silently stripped (so you can store patterns in
     secrets.py with spaces / underscores for readability if you want).
 
-    :param pattern: str like ``"00101101110101100001000010011111011"``
+    :param pattern: str like ``"01101001011010010110100101101001011"`` (35 chars)
     :param expected_bits: enforce this length after stripping whitespace
     :return: list of 0/1 ints, length ``expected_bits``
     :raises ValueError: on any non-bit character or wrong length

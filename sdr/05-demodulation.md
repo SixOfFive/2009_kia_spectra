@@ -104,7 +104,7 @@ File: sdr/captures/fob-start-001-b1.bin
 Burst regions: 1, packets decoded: 8
 Valid packets (integrity check passed): 0
 WARN no valid packets — possible decoder issue. First few raw:
-  ID=0x2DD6 button=0x9F ~button=0x60 unk1=000 unk2=0
+  ID=0x<your-id> button=0x<bc> ~button=0x<~bc> unk1=000 unk2=0
 ```
 
 (Don't worry about "Valid packets: 0" — the integrity check is for

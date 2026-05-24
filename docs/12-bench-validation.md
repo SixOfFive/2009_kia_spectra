@@ -88,7 +88,7 @@ Copy the file to the ESP32 via Thonny (or
 >>> config.secrets_ready()
 True
 >>> hex(config.COMPUSTAR_REMOTE_ID)
-'0x2dd6'
+'0x<your-fob-id>'
 >>> from lib import compustar
 >>> compustar.validate_packets(config.COMPUSTAR_PACKETS)
 []

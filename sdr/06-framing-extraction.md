@@ -134,15 +134,17 @@ Fill it in. Minimum content:
 ### Per-button 35-bit data
 
 ```
-Start  : 0010110111010110000100001001111101
-Lock   : 0010110111010110000100011111111000
-Unlock : 0010110111010110000100001111111100
-Trunk  : 0010110111010110000100000101111110
+Start  : <35-character string from your demod output>
+Lock   : <35-character string from your demod output>
+Unlock : <35-character string from your demod output>
+Trunk  : <35-character string from your demod output>
 ```
 ```
 
-(Those are illustrative values — yours will differ in the trailing
-19 bits per button.)
+(All four entries share the same first 16 bits — the Remote ID — and
+differ only in the trailing 19 bits per button. Don't post your real
+captured patterns publicly: combined with the Remote ID they're
+sufficient material to operate your car remotely.)
 
 Pulse-width measurements (from `demod-compustar.py` or rtl_433 `-A`)
 can go in the committed `framing.md` if you want public reference
@@ -155,12 +157,12 @@ Once `framing.local.md` has your values, you're ready to fill in
 is:
 
 ```python
-COMPUSTAR_REMOTE_ID = 0x____            # from step 2
+COMPUSTAR_REMOTE_ID = 0x____            # from step 2 (16-bit)
 COMPUSTAR_PACKETS = {
-    "START":  "0010110111010110000100001001111101",  # from step 3
-    "LOCK":   "0010110111010110000100011111111000",
-    "UNLOCK": "0010110111010110000100001111111100",
-    "TRUNK":  "0010110111010110000100000101111110",
+    "START":  "<35 chars from your demod output>",   # from step 3
+    "LOCK":   "<35 chars from your demod output>",
+    "UNLOCK": "<35 chars from your demod output>",
+    "TRUNK":  "<35 chars from your demod output>",
 }
 ```
 

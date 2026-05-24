@@ -72,7 +72,7 @@ class Config:
     OBD_POLL_PIDS = ()
     PI_SHUTDOWN_GRACE_S = 30
     # Captured 35-bit packets (synthetic for tests)
-    COMPUSTAR_REMOTE_ID = 0x2DD6
+    COMPUSTAR_REMOTE_ID = 0xABCD
     COMPUSTAR_PACKETS = TEST_PACKETS
 
 

@@ -195,7 +195,7 @@ rtl_433 -r cu8:sdr\captures\fob-start-lg20-b1.bin -s 250000 -f 433968000 -R 302
 # -R 302 = enable Compustar 1WG3R decoder protocol number
 ```
 
-Expected output: `{"model": "Compustar-1WG3R", "id": "2DD6", "button_code": ..., "button_str": "Start", ...}` per packet.
+Expected output: `{"model": "Compustar-1WG3R", "id": "XXXX", "button_code": ..., "button_str": "Start", ...}` per packet, where the `id` field is your FOB's 16-bit Remote ID.
 
 If rtl_433 outputs valid packets, we have GROUND TRUTH for:
 - The Remote ID
@@ -261,7 +261,7 @@ just "look up button code, transmit packet". Counter persistence in
 ```python
 # Compustar 1-way fixed code remote (1WG3R protocol family).
 # Capture once via SDR + rtl_433, never changes.
-COMPUSTAR_REMOTE_ID = 0x2DD6  # 16-bit ID
+COMPUSTAR_REMOTE_ID = 0x____  # 16-bit ID (set this from framing.local.md)
 COMPUSTAR_BUTTON_CODES = {
     "START":  0x__,
     "LOCK":   0x__,
@@ -449,8 +449,8 @@ into `esp32/src/secrets.py` (also gitignored) as plain Python constants.
 ## 13. Quick "I'm coming back fresh" cheat sheet
 
 1. Read this file (you're doing it). Section 4 steps 1-6 are DONE.
-2. Read `sdr/analysis/framing.local.md` for per-FOB values (Remote ID
-   `0x2DD6`, plus the 4 captured 35-bit patterns).
+2. Read `sdr/analysis/framing.local.md` for per-FOB values (16-bit
+   Remote ID + 4 captured 35-bit patterns; these are gitignored).
 3. `git log --oneline -20` to see recent commits. Key landmarks:
    - `0fa7dc8` — protocol-discovery braindump
    - `0df2936` — framing.md updated with rtl_433 verification

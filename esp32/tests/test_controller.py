@@ -60,6 +60,7 @@ class Config:
     """Duck-typed config namespace for tests."""
     ADC_DIVIDER_RATIO = 4.0
     ADC_CALIBRATION_OFFSET = 0.0
+    ADC_DRIFT_WARN_V = 1.0
     LOW_V_TRIGGER = 12.2
     LOW_V_SUSTAIN_S = 300
     RUN_DURATION_S = 900
@@ -260,6 +261,55 @@ def test_wdt_feed_is_called_each_tick():
     ctrl.tick()
     ctrl.tick()
     assert fed["count"] == 3
+
+
+def test_adc_drift_above_threshold_emits_warn():
+    """A >1V jump between successive samples should emit a warn LOG event."""
+    ctrl, adc, _, uart, _ = _make_ctrl(voltage=12.5 / 4.0)
+    ctrl._monitor_step()                  # first sample: prev was None, no warn
+    warns_before = [m for m in uart.sent
+                    if m["type"] == "LOG" and m.get("level") == "warn"]
+    assert warns_before == []
+    # Jump from 12.5 V to 10.2 V (delta = -2.3 V, exceeds 1.0 threshold)
+    adc.voltage = 10.2 / 4.0
+    ctrl._monitor_step()
+    drift_warns = [m for m in uart.sent
+                   if m["type"] == "LOG"
+                   and m.get("level") == "warn"
+                   and "ADC drift" in m.get("msg", "")]
+    assert len(drift_warns) == 1
+    # The trigger logic still runs — state machine isn't short-circuited.
+    # First sample 12.5 V is above the 12.2 V trigger so streak stayed 0.
+    # Second sample 10.2 V is below trigger so streak advanced to 1.
+    assert ctrl.state == State.MONITORING
+    assert ctrl.low_v_count == 1
+
+
+def test_adc_drift_below_threshold_does_not_warn():
+    """A <1V jump should NOT emit a drift warn — normal cabling slop."""
+    ctrl, adc, _, uart, _ = _make_ctrl(voltage=12.5 / 4.0)
+    ctrl._monitor_step()                  # first sample
+    adc.voltage = 12.0 / 4.0              # 0.5 V delta — well under threshold
+    ctrl._monitor_step()
+    adc.voltage = 12.8 / 4.0              # 0.8 V delta from previous — still under
+    ctrl._monitor_step()
+    drift_warns = [m for m in uart.sent
+                   if m["type"] == "LOG"
+                   and m.get("level") == "warn"
+                   and "ADC drift" in m.get("msg", "")]
+    assert drift_warns == []
+
+
+def test_adc_drift_first_sample_after_boot_does_not_warn():
+    """No previous reading exists on first sample — must not false-positive."""
+    ctrl, _, _, uart, _ = _make_ctrl(voltage=12.5 / 4.0)
+    assert ctrl.last_voltage is None
+    ctrl._monitor_step()                  # the very first sample
+    drift_warns = [m for m in uart.sent
+                   if m["type"] == "LOG"
+                   and m.get("level") == "warn"
+                   and "ADC drift" in m.get("msg", "")]
+    assert drift_warns == []
 
 
 def test_unknown_command_acks_failure():

@@ -12,7 +12,7 @@ and gives us easy reload-on-file-change during bench debugging.
 """
 
 from pi.app import config, state
-from pi.app.comms import esp32_link, mqtt_publisher, uart_listener
+from pi.app.comms import esp32_link, mqtt_publisher, mqtt_subscriber, uart_listener
 from pi.app.display import server
 
 
@@ -34,6 +34,7 @@ def main():
         link, poll_interval_s=config.UART_POLL_INTERVAL_S,
     )
     mqtt_publisher.start_thread()
+    mqtt_subscriber.start_thread()
 
     print(f"[daemon] dashboard on http://{config.DISPLAY_BIND_HOST}:{config.DISPLAY_BIND_PORT}")
     server.app.run(

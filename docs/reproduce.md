@@ -17,6 +17,7 @@ the build. The repo grows along with the project.
 - [ ] [Hardware bill of materials](BOM.md) — what to order
 - [ ] [Architecture overview](architecture.md) — how the pieces fit together
 - [ ] [What we learned about the Compustar install](compustar-research.md)
+- [ ] [Power budget analysis](power-budget.md) — predicted parked draw, days-to-trigger, net energy effect
 
 ## Phase 1 — SDR capture and analysis (do this with the FOB before the rest of the parts arrive)
 

@@ -68,14 +68,15 @@ def api_command():
     if cmd not in _VALID_COMMANDS:
         abort(400, "unknown command")
 
-    link = state.get_link()
-    if link is None:
-        return jsonify({"ok": False, "cmd": cmd, "error": "esp32 link not initialized"}), 503
-
     try:
-        link.send(esp32_link.command(cmd, **{k: v for k, v in payload.items() if k != "cmd"}))
+        sent = state.send_to_esp32(
+            esp32_link.command(cmd, **{k: v for k, v in payload.items() if k != "cmd"})
+        )
     except Exception as e:
         return jsonify({"ok": False, "cmd": cmd, "error": str(e)}), 502
+
+    if not sent:
+        return jsonify({"ok": False, "cmd": cmd, "error": "esp32 link not initialized"}), 503
 
     return jsonify({"ok": True, "cmd": cmd, "queued": True})
 

@@ -114,6 +114,24 @@ Common issues:
 - Permission denied on `/dev/serial0` — `pi` user not in `dialout` group:
   `sudo usermod -aG dialout pi && reboot`
 
+### MQTT topics published / subscribed
+
+If `MQTT_BROKER` is set in secrets, the daemon also:
+
+- Publishes `<MQTT_TOPIC_PREFIX>/state` every `MQTT_PUBLISH_INTERVAL_S` (retained, full snapshot JSON)
+- Subscribes to `<MQTT_TOPIC_PREFIX>/cmd` and forwards allowed commands to the ESP32
+
+Example Home Assistant automation to trigger a start from anywhere:
+
+```yaml
+service: mqtt.publish
+data:
+  topic: vroom/spectra/cmd
+  payload: '{"cmd": "start_engine"}'
+```
+
+Allowed `cmd` values: `start_engine`, `stop_engine`, `ping`, `set_threshold` (with `value`). Other commands are silently dropped (whitelist defense).
+
 ## Step 7 — Open the dashboard
 
 In a browser on your dev machine:

@@ -32,6 +32,20 @@ STATE_LOCK = threading.Lock()
 # UART link isn't up — request handlers should refuse to forward commands.
 ESP32_LINK = None
 
+# Held while writing to the ESP32 link from any thread (Flask, MQTT
+# subscriber, etc.) to avoid interleaving JSON lines on the UART wire.
+ESP32_LINK_LOCK = threading.Lock()
+
+
+def send_to_esp32(msg):
+    """Thread-safe send wrapper. Returns True if sent, False if no link."""
+    link = ESP32_LINK
+    if link is None:
+        return False
+    with ESP32_LINK_LOCK:
+        link.send(msg)
+    return True
+
 # Maximum number of EVENT records retained for the dashboard's recent-events feed.
 MAX_EVENTS = 100
 

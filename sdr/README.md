@@ -1,73 +1,56 @@
-# SDR capture + Keeloq analysis
+# SDR phase — reverse-engineering the Compustar FOB
 
-Tools and notes for reverse-engineering the Compustar FOB transmission so the ESP32 can synthesize valid packets.
+This directory holds everything related to capturing, analyzing, and
+ultimately replicating the 1WSHR-PRO FOB's rolling-code transmissions
+so the ESP32 can play the role of the remote.
 
-## Hardware
+If you're working through this for the first time, follow the numbered
+files **in order**. Each one is a self-contained step with prerequisites,
+exact commands, expected outputs, and where to put the artifacts you
+generate.
 
-- **RTL-SDR:** Vomeko 100 kHz – 1.7 GHz with HF upconverter (R820T2 + RTL2832U)
-- 433 MHz antenna (the stock telescoping whip works fine for inside-the-house captures)
+## Walkthrough
 
-## Software dependencies
+1. [`01-software-setup.md`](01-software-setup.md) — install rtl-sdr drivers, URH, supporting tools
+2. [`02-hardware-verification.md`](02-hardware-verification.md) — confirm the dongle is detected and receives signal
+3. [`03-frequency-confirmation.md`](03-frequency-confirmation.md) — verify the FOB transmits at 433.92 MHz
+4. [`04-recording-captures.md`](04-recording-captures.md) — record clean 1-second IQ samples of each button press
+5. [`05-urh-analysis.md`](05-urh-analysis.md) — open captures in Universal Radio Hacker, demodulate to bits
+6. [`06-framing-extraction.md`](06-framing-extraction.md) — identify preamble, FOB serial, function codes, hopping code position
+7. [`07-key-recovery.md`](07-key-recovery.md) — recover the FOB's KeeLoq device key so the ESP32 can synthesize new packets
 
-- `rtl-sdr` — drivers and command-line tools (`rtl_sdr`, `rtl_power`, `rtl_test`)
-- **URH (Universal Radio Hacker)** — pip-installable GUI for signal analysis
-- Optional: GQRX for live spectrum viewing, `inspectrum` for offline inspection
+## Directory layout
 
-```bash
-# Linux
-sudo apt install rtl-sdr librtlsdr-dev
-pip install urh
-
-# Windows
-# Use Zadig to install the RTL-SDR USB driver
-# Download URH installer from github.com/jopohl/urh/releases
+```
+sdr/
+├── README.md                       (this file)
+├── 01-software-setup.md            ┐
+├── 02-hardware-verification.md     │
+├── 03-frequency-confirmation.md    │  step-by-step walkthrough
+├── 04-recording-captures.md        │
+├── 05-urh-analysis.md              │
+├── 06-framing-extraction.md        │
+├── 07-key-recovery.md              ┘
+├── captures/        (gitignored — raw IQ binary files, can be huge)
+├── scripts/         (helper Python / shell scripts)
+└── analysis/
+    ├── framing.md              (committed — your final findings about the FOB protocol)
+    ├── screenshots/            (gitignored by default — selectively commit ones worth keeping)
+    └── press-logs/             (per-button capture session notes)
 ```
 
-## Capture workflow
+## What you need before starting
 
-### Step 1 — Confirm frequency
+- An RTL-SDR dongle (RTL2832U + R820T2 chipset is standard; verified working with the Vomeko 100kHz–1.7GHz model used in this project)
+- A 433 MHz-ish antenna (the stock telescoping whip that ships with most SDR dongles is fine for indoor captures)
+- The aftermarket FOB you want to clone (1WSHR-PRO in our case)
+- A computer to run the SDR software on (Windows 10/11, Linux, or macOS — instructions cover all three)
+- The car within FOB radio range OR a Faraday-style enclosure to isolate captures from background RF (a metal cookie tin or microwave oven works in a pinch)
 
-```bash
-rtl_power -f 433M:434M:1k -i 1 -g 40 -e 60 fob_sweep.csv
-```
+## Important: this is for your own car
 
-Run while pressing the FOB Start button. The transmission should peak at 433.92 MHz.
-
-### Step 2 — Capture clean IQ samples
-
-```bash
-rtl_sdr -f 433920000 -s 2000000 -g 40 captures/fob_start_001.bin
-```
-
-Press Start once, release, Ctrl-C the capture after ~1 second. Repeat 10× into separate files. Repeat for each button on the FOB.
-
-**`captures/` is in `.gitignore` — these files are huge.** Keep the raw bins locally only.
-
-### Step 3 — Demodulate in URH
-
-1. Open URH → File → Import → Complex Signal → choose your .bin
-2. Set sample rate to 2 MS/s
-3. Switch modulation to ASK
-4. URH auto-detects bit length
-5. Look at the demodulated bitstream — expect:
-   - ~12-cycle preamble
-   - ~10×TE header gap
-   - 66 bits of data payload
-
-### Step 4 — Identify framing
-
-Compare captures of:
-- Multiple Start presses → 32 bits change (hopping code), 28 stay same (serial), function code identifies Start
-- Different buttons → 4-bit function code differs
-
-Document findings in `framing.md` (to be created).
-
-## Notes (to be filled in as we learn)
-
-- [ ] Confirmed frequency: _____
-- [ ] TE (bit period): _____
-- [ ] FOB serial (28-bit, hex): _____
-- [ ] Function code Start: _____
-- [ ] Function code Lock: _____
-- [ ] Function code Unlock: _____
-- [ ] Encoder chip identified: _____
+The techniques in this walkthrough — extracting your FOB's device key,
+synthesizing valid Keeloq packets — work because **you legitimately own
+the FOB**. Doing this to a car you don't own or have permission to
+operate is theft, fraud, and a variety of criminal offences depending
+on jurisdiction. Don't.

@@ -57,16 +57,29 @@ Expected output: model info + tuner type + supported sample rates. If you get "N
 ### Install Universal Radio Hacker
 
 ```powershell
-pip install urh
+pip install --user urh
 ```
 
-Launch it once to make sure it works:
+**Python 3.13 / 3.14 gotcha**: URH publishes prebuilt wheels for Python
+3.10-3.12. On 3.13+ pip falls back to a source build and fails with
+`You need Cython to build URH's extensions!` — even with Cython installed,
+the source build then typically fails on a missing MSVC compiler.
 
-```powershell
-urh
-```
+The clean fix is to use Python 3.12 *just for URH* (your other Python
+tooling — Thonny, the test suite — can stay on 3.14):
 
-A GUI window should open. Close it; we'll come back to it in step 05.
+1. Install [Python 3.12](https://www.python.org/downloads/release/python-31210/)
+   alongside your existing Python. **Uncheck** "Add to PATH" so it doesn't
+   shadow your default Python.
+2. Use the Python launcher to target it explicitly:
+
+   ```powershell
+   py -3.12 -m pip install --user urh
+   py -3.12 -m urh
+   ```
+
+Launch URH once to confirm — a GUI window should open. Close it; we'll
+come back to it in step 05.
 
 ## Linux (Debian / Ubuntu / Raspberry Pi OS)
 

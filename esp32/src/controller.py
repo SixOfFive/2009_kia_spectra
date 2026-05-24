@@ -181,9 +181,26 @@ class VroomController:
     # ----- ADC / battery voltage -----
 
     def _read_battery_v(self):
+        # Capture previous reading BEFORE overwriting so we can compare.
+        # None on the very first sample after boot — skip the drift check then.
+        prev = self.last_voltage
         adc_v = self.adc.read_voltage()
         battery_v = adc_v * self.cfg.ADC_DIVIDER_RATIO + self.cfg.ADC_CALIBRATION_OFFSET
         self.last_voltage = battery_v
+
+        if prev is not None:
+            threshold = getattr(self.cfg, "ADC_DRIFT_WARN_V", 1.0)
+            delta = battery_v - prev
+            if abs(delta) > threshold:
+                # Observability only — caller still uses battery_v for trigger logic.
+                # Catches stuck ADCs, brown-outs, or a flaky divider connector.
+                self.uart.send(pi_link.log(
+                    "warn",
+                    "ADC drift: prev=%.2f V, now=%.2f V, delta=%+.2f V" % (
+                        prev, battery_v, delta,
+                    ),
+                ))
+
         return battery_v
 
     def _samples_needed(self):
@@ -228,6 +245,28 @@ class VroomController:
 
     def _stopping_step(self):
         now = self._now()
+        # Safety: hard cap on total time spent in the run+stopping cycle.
+        # If we got here normally the grace timer expires well before this.
+        # If the Pi hung or UART died, the grace clock might never tick;
+        # this catches that and force-cuts power so the state machine
+        # doesn't wedge in STOPPING forever.
+        if self.run_start_ts is not None:
+            grace = self.cfg.PI_SHUTDOWN_GRACE_S
+            mult = getattr(self.cfg, "STOPPING_HARD_CAP_MULT", 2.0)
+            hard_cap = self.cfg.RUN_DURATION_S + mult * grace
+            if now - self.run_start_ts >= hard_cap:
+                self.uart.send(pi_link.log(
+                    "warn",
+                    "stopping hard cap: forced power-off after %.0fs "
+                    "(grace=%ds mult=%.1f)" % (now - self.run_start_ts, grace, mult),
+                ))
+                self._power_off_pi()
+                self.stop_grace_until = None
+                self.state = State.COOLDOWN
+                self.last_trigger_ts = now
+                self.uart.send(pi_link.event(pi_link.EVENT_ENGINE_STOPPED))
+                return
+
         if self.stop_grace_until is None:
             self.uart.send(pi_link.command(pi_link.CMD_SHUTDOWN_PI))
             self.stop_grace_until = now + self.cfg.PI_SHUTDOWN_GRACE_S

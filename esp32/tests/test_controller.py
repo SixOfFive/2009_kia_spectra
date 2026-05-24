@@ -60,6 +60,7 @@ class Config:
     """Duck-typed config namespace for tests."""
     ADC_DIVIDER_RATIO = 4.0
     ADC_CALIBRATION_OFFSET = 0.0
+    ADC_DRIFT_WARN_V = 1.0
     LOW_V_TRIGGER = 12.2
     LOW_V_SUSTAIN_S = 300
     RUN_DURATION_S = 900
@@ -71,6 +72,7 @@ class Config:
     OBD_POLL_INTERVAL_S = 1
     OBD_POLL_PIDS = ()
     PI_SHUTDOWN_GRACE_S = 30
+    STOPPING_HARD_CAP_MULT = 2.0
     # Captured 35-bit packets (synthetic for tests)
     COMPUSTAR_REMOTE_ID = 0xABCD
     COMPUSTAR_PACKETS = TEST_PACKETS
@@ -245,6 +247,56 @@ def test_stop_after_run_duration_powers_off_pi():
     assert ctrl.state == State.COOLDOWN
 
 
+def test_stopping_normal_grace_completes_within_hard_cap():
+    """The normal grace path should complete before the hard cap fires
+    and should NOT emit a hard-cap warn LOG."""
+    ctrl, _, _, uart, pi_power = _make_ctrl()
+    ctrl.state = State.STOPPING
+    ctrl.run_start_ts = 0
+    # First _stopping_step at t = RUN_DURATION_S + 1 (just past the run window,
+    # well under the hard cap of RUN_DURATION_S + 2 * PI_SHUTDOWN_GRACE_S).
+    # Second _stopping_step at t = RUN_DURATION_S + PI_SHUTDOWN_GRACE_S + 2,
+    # which clears stop_grace_until cleanly.
+    grace = ctrl.cfg.PI_SHUTDOWN_GRACE_S
+    run_dur = ctrl.cfg.RUN_DURATION_S
+    times = iter([run_dur + 1, run_dur + grace + 2])
+    ctrl._now = lambda: next(times)
+    ctrl._stopping_step()   # sends shutdown_pi, sets stop_grace_until
+    ctrl._stopping_step()   # grace elapsed normally → COOLDOWN
+    assert ctrl.state == State.COOLDOWN
+    assert pi_power.value() == 1
+    hard_cap_warns = [m for m in uart.sent
+                      if m["type"] == "LOG"
+                      and m.get("level") == "warn"
+                      and "hard cap" in m.get("msg", "")]
+    assert hard_cap_warns == []
+
+
+def test_stopping_hard_cap_fires_when_grace_blocked():
+    """If time advances past the hard cap without the grace path completing
+    (Pi hung, UART dead, grace clock never ticked), the controller should
+    force-cut power, emit a warn LOG, and transition to COOLDOWN."""
+    ctrl, _, _, uart, pi_power = _make_ctrl()
+    ctrl.state = State.STOPPING
+    ctrl.run_start_ts = 0
+    grace = ctrl.cfg.PI_SHUTDOWN_GRACE_S
+    run_dur = ctrl.cfg.RUN_DURATION_S
+    mult = ctrl.cfg.STOPPING_HARD_CAP_MULT
+    # Jump straight past the hard cap (simulating a wedged grace path).
+    ctrl._now = lambda: int(run_dur + mult * grace + 5)
+    ctrl._stopping_step()
+    assert ctrl.state == State.COOLDOWN
+    assert pi_power.value() == 1
+    hard_cap_warns = [m for m in uart.sent
+                      if m["type"] == "LOG"
+                      and m.get("level") == "warn"
+                      and "hard cap" in m.get("msg", "")]
+    assert len(hard_cap_warns) == 1
+    stopped_events = [m for m in uart.sent
+                      if m["type"] == "EVENT" and m["event"] == "engine_stopped"]
+    assert len(stopped_events) == 1
+
+
 def test_wdt_is_none_in_cpython():
     ctrl, *_ = _make_ctrl()
     assert ctrl.wdt is None        # CPython has no machine.WDT
@@ -260,6 +312,55 @@ def test_wdt_feed_is_called_each_tick():
     ctrl.tick()
     ctrl.tick()
     assert fed["count"] == 3
+
+
+def test_adc_drift_above_threshold_emits_warn():
+    """A >1V jump between successive samples should emit a warn LOG event."""
+    ctrl, adc, _, uart, _ = _make_ctrl(voltage=12.5 / 4.0)
+    ctrl._monitor_step()                  # first sample: prev was None, no warn
+    warns_before = [m for m in uart.sent
+                    if m["type"] == "LOG" and m.get("level") == "warn"]
+    assert warns_before == []
+    # Jump from 12.5 V to 10.2 V (delta = -2.3 V, exceeds 1.0 threshold)
+    adc.voltage = 10.2 / 4.0
+    ctrl._monitor_step()
+    drift_warns = [m for m in uart.sent
+                   if m["type"] == "LOG"
+                   and m.get("level") == "warn"
+                   and "ADC drift" in m.get("msg", "")]
+    assert len(drift_warns) == 1
+    # The trigger logic still runs — state machine isn't short-circuited.
+    # First sample 12.5 V is above the 12.2 V trigger so streak stayed 0.
+    # Second sample 10.2 V is below trigger so streak advanced to 1.
+    assert ctrl.state == State.MONITORING
+    assert ctrl.low_v_count == 1
+
+
+def test_adc_drift_below_threshold_does_not_warn():
+    """A <1V jump should NOT emit a drift warn — normal cabling slop."""
+    ctrl, adc, _, uart, _ = _make_ctrl(voltage=12.5 / 4.0)
+    ctrl._monitor_step()                  # first sample
+    adc.voltage = 12.0 / 4.0              # 0.5 V delta — well under threshold
+    ctrl._monitor_step()
+    adc.voltage = 12.8 / 4.0              # 0.8 V delta from previous — still under
+    ctrl._monitor_step()
+    drift_warns = [m for m in uart.sent
+                   if m["type"] == "LOG"
+                   and m.get("level") == "warn"
+                   and "ADC drift" in m.get("msg", "")]
+    assert drift_warns == []
+
+
+def test_adc_drift_first_sample_after_boot_does_not_warn():
+    """No previous reading exists on first sample — must not false-positive."""
+    ctrl, _, _, uart, _ = _make_ctrl(voltage=12.5 / 4.0)
+    assert ctrl.last_voltage is None
+    ctrl._monitor_step()                  # the very first sample
+    drift_warns = [m for m in uart.sent
+                   if m["type"] == "LOG"
+                   and m.get("level") == "warn"
+                   and "ADC drift" in m.get("msg", "")]
+    assert drift_warns == []
 
 
 def test_unknown_command_acks_failure():

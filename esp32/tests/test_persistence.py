@@ -60,6 +60,75 @@ def test_reset_cause_string_known_codes_via_monkeypatch():
         persistence.reset_cause = saved
 
 
+class _FakeRTC:
+    """Stand-in for machine.RTC() — owns a single mutable blob."""
+    _blob = b""
+    def memory(self, blob=None):
+        if blob is None:
+            return _FakeRTC._blob
+        _FakeRTC._blob = bytes(blob)
+
+
+def _with_fake_rtc(blob):
+    """Install _FakeRTC + the given blob and return restore() to undo."""
+    import struct  # noqa: F401  (kept for clarity)
+    saved_has = persistence._HAS_RTC
+    saved_rtc = getattr(persistence, "RTC", None)
+    _FakeRTC._blob = bytes(blob)
+    persistence._HAS_RTC = True
+    persistence.RTC = _FakeRTC
+
+    def restore():
+        persistence._HAS_RTC = saved_has
+        if saved_rtc is None:
+            try:
+                del persistence.RTC
+            except AttributeError:
+                pass
+        else:
+            persistence.RTC = saved_rtc
+
+    return restore
+
+
+def test_load_streak_caps_corrupt_huge_count_to_zero():
+    """A blob with valid magic but a 0xFFFF count (looks like erased RTC /
+    brown-out garbage) must be rejected — otherwise we'd trigger the engine
+    on the very next sample."""
+    import struct
+    # Valid magic, count = 0xFFFF, reserved = 0
+    blob = persistence.RTC_MAGIC + struct.pack("<H", 0xFFFF) + b"\x00\x00"
+    restore = _with_fake_rtc(blob)
+    try:
+        assert persistence.load_streak() == 0
+    finally:
+        restore()
+
+
+def test_load_streak_caps_count_above_reasonable_ceiling():
+    """Any count above _MAX_REASONABLE_STREAK is treated as corruption."""
+    import struct
+    blob = persistence.RTC_MAGIC + struct.pack(
+        "<H", persistence._MAX_REASONABLE_STREAK + 1
+    ) + b"\x00\x00"
+    restore = _with_fake_rtc(blob)
+    try:
+        assert persistence.load_streak() == 0
+    finally:
+        restore()
+
+
+def test_load_streak_accepts_reasonable_count():
+    """Sanity: legitimate small counts still round-trip through load_streak."""
+    import struct
+    blob = persistence.RTC_MAGIC + struct.pack("<H", 5) + b"\x00\x00"
+    restore = _with_fake_rtc(blob)
+    try:
+        assert persistence.load_streak() == 5
+    finally:
+        restore()
+
+
 def run():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:

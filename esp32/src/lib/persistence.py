@@ -29,6 +29,14 @@ RTC_MAGIC = b"VRM2"
 _RTC_FORMAT = "<H"           # uint16 little-endian
 _RTC_BLOB_SIZE = 8           # magic(4) + count(2) + reserved(2)
 
+# Sanity ceiling for the loaded streak count. The legitimate maximum is
+# bounded by LOW_V_SUSTAIN_S / WAKE_INTERVAL_S which in any realistic
+# config sits in the single-digits-to-low-hundreds. If we read a value
+# above this, treat it as RTC corruption (e.g. partial magic match with
+# garbage data after a brown-out, all-0xFF flash, etc.) and reset to 0
+# rather than trigger the engine immediately on next sample.
+_MAX_REASONABLE_STREAK = 10000
+
 
 try:
     from machine import RTC, reset_cause, DEEPSLEEP_RESET
@@ -96,9 +104,14 @@ def load_streak():
         return 0
     try:
         (count,) = struct.unpack(_RTC_FORMAT, blob[4:6])
-        return count
     except Exception:
         return 0
+    # Defend against partial-magic-match-with-garbage scenarios (low-voltage
+    # glitch, all-0xFF flash, etc.). 0xFFFF would otherwise look like a huge
+    # streak and trigger the engine on the very next sample.
+    if count > _MAX_REASONABLE_STREAK:
+        return 0
+    return count
 
 
 def clear_streak():

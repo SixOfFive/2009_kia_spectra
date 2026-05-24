@@ -16,6 +16,12 @@ ADC_DIVIDER_RATIO = 4.0   # (R1 + R2) / R2 — pin 16 V = ADC V * ratio
 ADC_REFERENCE_V = 3.3     # ADS1115 input range with default PGA = ±4.096V
 ADC_CALIBRATION_OFFSET = 0.0  # post-divider correction; tweak after measuring known good battery
 
+# Drift detection: if a successive ADC reading jumps by more than this many
+# volts (battery-side, post-divider) emit a warn LOG event. Catches stuck
+# ADC channels, brown-out conditions, or a divider connector going flaky.
+# Observability only — the trigger logic still runs on the new reading.
+ADC_DRIFT_WARN_V = 1.0
+
 # Trigger thresholds. The ESP32 starts the car when V_BATTERY drops below
 # LOW_V_TRIGGER for at least LOW_V_SUSTAIN_S consecutive seconds.
 LOW_V_TRIGGER = 12.2       # volts
@@ -58,6 +64,13 @@ UART_BAUDRATE = 115_200
 PI_POWER_GPIO = 25
 # How long to wait after sending SHUTDOWN before cutting power, in seconds.
 PI_SHUTDOWN_GRACE_S = 30
+# Safety cap on the STOPPING phase. If the controller is still in STOPPING
+# after RUN_DURATION_S + STOPPING_HARD_CAP_MULT * PI_SHUTDOWN_GRACE_S have
+# elapsed since run_start_ts, force the cleanup path (power off Pi, transition
+# to COOLDOWN, emit warn LOG). Default 2.0 means hard-cut at 2× the grace.
+# Guards against a hung Pi or a UART death that would otherwise wedge the
+# state machine in STOPPING forever.
+STOPPING_HARD_CAP_MULT = 2.0
 
 
 # ----- CAN bus (TWAI) -----

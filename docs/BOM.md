@@ -8,7 +8,7 @@ Single unit. Prices in CAD as of 2026-05. Sourced from Amazon.ca where shipping 
 |---|---|-----|---|
 | 1 | Raspberry Pi Zero 2 W | $25 | UI brain, WiFi, map display |
 | 2 | SanDisk 32GB microSD (U3/A1) | $12 | Pi OS + user storage |
-| 3 | ESP32-WROOM-32U DevKit (external antenna connector) | $12 | Always-on monitor, RF, CAN |
+| 3 | ESP32-WROOM-32U DevKit (external antenna connector) | $12 | Always-on monitor, RF, CAN — **see warning below** |
 | 4 | IPEX-to-SMA pigtail × 2 | $6 | ESP32 WiFi + 433 MHz external antennas |
 | 5 | 433 MHz SMA whip antenna | $3 | Compustar RF transmit |
 | 6 | 2.4 GHz SMA antenna | $4 | ESP32 WiFi reach to house |
@@ -31,6 +31,18 @@ Single unit. Prices in CAD as of 2026-05. Sourced from Amazon.ca where shipping 
 | 23 | 3M VHB tape strip | $3 | Display dash mount |
 
 **Hardware subtotal: $218**
+
+## ⚠ Buyer warning — ESP32-WROOM-32U on AliExpress
+
+Several AliExpress listings for "ESP32-WROOM-32U DevKitC" advertise a **headline price of ~$3 CAD** that looks like the actual development board. It isn't. The cheapest variant on most of these listings is the **antenna only** — a small bundled 2.4 GHz whip, not the ESP32 board. The actual board variant is buried in the variant selector at a much higher price (often $8-12).
+
+**How to avoid the trap:**
+- Read the variant dropdown carefully before adding to cart. Look for variants like "Just Antenna" or "Antenna Only" — these are the bait.
+- The actual board variant will usually mention "DevKitC", "Board", or include a count like "1pc Board"
+- If the headline price is dramatically below the going rate (genuine ESP32-WROOM-32U boards generally run $5-10 even in bulk), check the default variant assumption
+- Hold the cart at the variant selector page until you have visually confirmed you're buying the board, not the bundled accessory
+
+This bait pattern is common on several "DevKit" SKUs across AliExpress. The pricing in this BOM ($12 CAD) assumes a legitimate listing of the actual board.
 
 ## Consumables
 

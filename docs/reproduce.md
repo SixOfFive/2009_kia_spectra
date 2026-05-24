@@ -31,6 +31,8 @@ the build. The repo grows along with the project.
 
 ## Phase 2 — Bench prototype (after parts arrive)
 
+**Take-to-the-bench cheat sheet**: [`day-one.md`](day-one.md) — combines steps 08-12 into a printable checklist with triage table and "when things go wrong" troubleshooting.
+
 - [ ] [08 — Flash MicroPython on the ESP32](08-flash-micropython.md)
 - [ ] [09 — Bench smoke-test each module](09-bench-smoke-tests.md) (ADS1115, CC1101, CAN, ESP32 WiFi)
 - [ ] [10 — Set up the Raspberry Pi Zero 2 W](10-pi-setup.md) (provision.sh, dashboard, kiosk)

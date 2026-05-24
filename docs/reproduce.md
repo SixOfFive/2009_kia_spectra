@@ -28,13 +28,13 @@ the build. The repo grows along with the project.
 - [ ] [06 — Extract framing (preamble, serial, function code)](../sdr/06-framing-extraction.md)
 - [ ] [07 — Recover the KeeLoq device key](../sdr/07-key-recovery.md)
 
-## Phase 2 — Bench prototype (after parts arrive) — WIP
+## Phase 2 — Bench prototype (after parts arrive)
 
-- [ ] 08 — Flash MicroPython on the ESP32
-- [ ] 09 — Smoke-test each module on a breadboard (ADS1115, CC1101, CAN, ESP32 WiFi)
-- [ ] 10 — Wire up the Pi Zero 2 W with display
-- [ ] 11 — UART link between ESP32 and Pi
-- [ ] 12 — Validate the Keeloq encoder against your real FOB captures
+- [ ] [08 — Flash MicroPython on the ESP32](08-flash-micropython.md)
+- [ ] [09 — Bench smoke-test each module](09-bench-smoke-tests.md) (ADS1115, CC1101, CAN, ESP32 WiFi)
+- [ ] [10 — Set up the Raspberry Pi Zero 2 W](10-pi-setup.md) (provision.sh, dashboard, kiosk)
+- [ ] [11 — Wire ESP32 ↔ Pi UART link](11-uart-link.md)
+- [ ] [12 — KeeLoq bench validation + first car Lock test](12-keeloq-bench-validation.md)
 
 ## Phase 3 — In-car install — WIP
 

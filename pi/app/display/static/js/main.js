@@ -17,9 +17,21 @@ const els = {
   lastUpdate: document.getElementById('last-update'),
   uptime:     document.getElementById('uptime'),
 
+  eventsList: document.getElementById('events-list'),
+
   btnStart: document.getElementById('btn-start'),
   btnStop:  document.getElementById('btn-stop'),
   btnPing:  document.getElementById('btn-ping'),
+};
+
+// Event display classification — these get extra color in the events list
+const EVENT_CLASS = {
+  engine_started:       'event-good',
+  engine_stopped:       'event-good',
+  keeloq_tx:            'event-good',
+  pi_boot:              'event-good',
+  low_voltage_trigger:  'event-error',
+  keeloq_tx_fail:       'event-error',
 };
 
 // ----- Rendering helpers -----
@@ -65,6 +77,31 @@ function render(state) {
 
   els.lastUpdate.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
   els.uptime.textContent     = `Uptime: ${fmtUptime(state.uptime_s)}`;
+
+  renderEvents(state.events || []);
+}
+
+function renderEvents(events) {
+  if (!events.length) {
+    els.eventsList.innerHTML = '<li class="events-empty">No events yet</li>';
+    return;
+  }
+  // Newest first, cap at 8 visible
+  const recent = events.slice(-8).reverse();
+  els.eventsList.innerHTML = recent.map(e => {
+    const cls = EVENT_CLASS[e.event] || '';
+    const t = e.ts ? new Date(e.ts).toLocaleTimeString() : '';
+    const meta = e.detail && Object.keys(e.detail).length
+        ? ` <span class="event-meta">${formatDetail(e.detail)}</span>` : '';
+    return `<li class="${cls}"><span class="event-name">${e.event || '?'}</span>${meta}<span class="event-meta">${t}</span></li>`;
+  }).join('');
+}
+
+function formatDetail(detail) {
+  // Compact one-line render: key=value pairs, truncated
+  return Object.entries(detail)
+    .map(([k, v]) => `${k}=${typeof v === 'number' ? v : String(v).slice(0, 12)}`)
+    .join(' ');
 }
 
 // ----- Polling -----

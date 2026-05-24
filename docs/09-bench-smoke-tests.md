@@ -25,8 +25,19 @@ Five tests, each ~10 minutes:
 
 ## Step 1 — Copy the project code onto the ESP32
 
-In Thonny: **View → Files**. The right pane is the ESP32 filesystem.
-Drag the contents of `esp32/src/` to the ESP32 root:
+Two options:
+
+**Option A — mpremote** (faster, scriptable):
+
+```powershell
+pip install mpremote
+esp32\scripts\install.ps1 COM7        # adjust COM port
+```
+
+(Or `bash esp32/scripts/install.sh /dev/ttyUSB0` on Linux/macOS.)
+
+**Option B — Thonny GUI**: **View → Files**. The right pane is the ESP32
+filesystem. Drag the contents of `esp32/src/` to the ESP32 root:
 
 ```
 esp32/src/config.py     -> /config.py
@@ -35,7 +46,7 @@ esp32/src/main.py       -> /main.py
 esp32/src/lib/          -> /lib/
 ```
 
-Don't drag `secrets.py` yet — we'll create it locally after the SDR
+Either way, don't copy `secrets.py` yet — create it locally after the SDR
 walkthrough recovers the device key.
 
 ## Step 2 — Blink LED

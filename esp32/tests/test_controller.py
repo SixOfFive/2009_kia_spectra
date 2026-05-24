@@ -227,6 +227,23 @@ def test_stop_after_run_duration_powers_off_pi():
     assert ctrl.state == State.COOLDOWN
 
 
+def test_wdt_is_none_in_cpython():
+    ctrl, *_ = _make_ctrl()
+    assert ctrl.wdt is None        # CPython has no machine.WDT
+
+
+def test_wdt_feed_is_called_each_tick():
+    ctrl, *_ = _make_ctrl()
+    fed = {"count": 0}
+    class FakeWDT:
+        def feed(self): fed["count"] += 1
+    ctrl.wdt = FakeWDT()
+    ctrl.tick()
+    ctrl.tick()
+    ctrl.tick()
+    assert fed["count"] == 3
+
+
 def test_unknown_command_acks_failure():
     ctrl, _, _, uart, _ = _make_ctrl()
     uart.inbox.append({"type": "COMMAND", "cmd": "fake_command"})

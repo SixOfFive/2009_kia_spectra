@@ -91,6 +91,15 @@ REPORT_INTERVAL_S = 10
 LOG_LEVEL = "info"  # debug / info / warn / error
 
 
+# ----- Hardware watchdog -----
+
+# WDT auto-resets the ESP32 if the main loop hangs for longer than the
+# timeout. Set to comfortably exceed WAKE_INTERVAL_S + boot time so deep
+# sleep doesn't trip it.
+WDT_ENABLED = True
+WDT_TIMEOUT_MS = 120_000   # 2 minutes; default WAKE_INTERVAL_S is 60s
+
+
 # ----- Secrets (loaded from secrets.py, which is gitignored) -----
 
 try:

@@ -115,6 +115,9 @@ class VroomController:
         # Each MONITORING tick samples once; if V is low we increment, else reset.
         # Trigger fires when low_v_count * WAKE_INTERVAL_S >= LOW_V_SUSTAIN_S.
         self.low_v_count = persistence.load_streak()
+        # Hardware watchdog (optional). Constructed lazily so tests/CPython
+        # don't accidentally pull in machine.WDT.
+        self.wdt = self._init_wdt()
         self.run_start_ts = None
         self.stop_grace_until = None
         self.last_voltage = None
@@ -338,8 +341,29 @@ class VroomController:
 
     # ----- Main loop -----
 
+    def _init_wdt(self):
+        """Return a WDT instance or None if disabled / unavailable."""
+        if not getattr(self.cfg, "WDT_ENABLED", False):
+            return None
+        if not _MICROPYTHON:
+            return None
+        try:
+            from machine import WDT
+            return WDT(timeout=int(self.cfg.WDT_TIMEOUT_MS))
+        except Exception as e:
+            self._log("WARN WDT init failed: %s" % e)
+            return None
+
+    def _feed_wdt(self):
+        if self.wdt is not None:
+            try:
+                self.wdt.feed()
+            except Exception:
+                pass
+
     def tick(self):
         """One pass through the state machine. Call repeatedly from run()."""
+        self._feed_wdt()
         self._just_sampled = False
         if self.state == State.MONITORING:
             self._monitor_step()

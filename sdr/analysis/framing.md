@@ -6,12 +6,16 @@ through SDR steps 03-07. **Do NOT put the device key in this file** — that
 goes in the gitignored `secrets.py` only.
 
 ## FOB transmit frequency
-_filled in after step 03_
+_measured 2026-05-24_
 
-- Measured center: 433.____ MHz
-- Bandwidth: roughly ±____ kHz
-- Source: rtl_power sweep on YYYY-MM-DD with `-g 40 -i 1 -e 60`
+- **Measured center: 433.968 MHz** (peak at 433.9678 MHz, +19.4 dB above noise floor)
+- **Bandwidth: roughly ±5 kHz** (cluster spans 433.961-433.971 MHz at +4 dB)
+- Offset from nominal: 433.920 nominal → +48 kHz higher. Could be the FOB
+  itself or the R828D dongle's non-TCXO crystal (~110 ppm). Doesn't matter
+  for capture — use the measured value everywhere.
+- Source: `rtl_power -f 433M:434M:1k -i 1 -g 40 -e 60` on the Vomeko / R828D dongle
 - Capture file: `sdr/captures/fob-frequency-sweep.csv`
+- **Use `-f 433968000` in all subsequent rtl_sdr commands.**
 
 ## Packet layout (66 bits, MSB first as transmitted)
 _filled in / confirmed after step 06_

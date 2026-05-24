@@ -27,29 +27,64 @@ Originally assumed this was a Microchip HCS300/301 with KeeLoq rolling code.
 **Wrong assumption.** Confirmed via rtl_433 project's `compustar_1wg3r.c`
 decoder (covers 1WG3R-SH, 1WAMR-1900 — same protocol family as 1WSHR-PRO):
 
-- **Modulation: OOK_PULSE_PWM**
-- `short_width`: 708 µs (= "0" bit's HIGH pulse width)
-- `long_width`: 1076 µs (= "1" bit's HIGH pulse width)
-- `sync_width`: 1448 µs (= sync pulse at start of packet)
-- `reset_limit`: 1532 µs (= inter-packet gap)
+- **Modulation: OOK_PULSE_PWM (symmetric — HIGH and LOW both vary)**
+- `short_width`: 708 µs (1WG3R spec), measured 732 µs on this FOB
+- `long_width`: 1076 µs (1WG3R spec), measured 1100 µs on this FOB
+- `sync_width`: 1448 µs (1WG3R spec), measured 1476 µs on this FOB
+- `reset_limit`: 1532 µs (1WG3R spec)
 - **FIXED CODE — NO KeeLoq, NO rolling counter, NO device key**
 
-Bit encoding per the rtl_433 PWM model: each HIGH pulse encodes one bit
-based on its width. Short pulse (≈708 µs) = "0". Long pulse (≈1076 µs) = "1".
-LOW gaps between pulses are variable and ignored for bit decoding.
+Bit encoding (verified by rtl_433 `-A` pulse analyzer on our capture):
 
-## Packet layout (36 bits, MSB first as transmitted)
+| Symbol | HIGH duration | LOW duration |
+|---|---|---|
+| "0" bit | ~732 µs (short) | ~1136 µs (long) |
+| "1" bit | ~1100 µs (long) | ~756 µs (short) |
+| sync   | ~1476 µs        | ~1500 µs         |
+
+Pulse-pair sum is approximately constant (~1860 µs), so bit period =
+~1860 µs. Whichever half (HIGH or LOW) is longer determines the bit.
+
+## rtl_433 ground-truth verification
+
+Running rtl_433 (nightly Windows build) with `-A` on our capture:
+
+```
+rtl_433 -r cu8:fob-start-lg20-b1.bin -s 250000 -A -v
+```
+
+produces a pulse histogram matching the table above. `-R 302` (the
+Compustar 1WG3R decoder) does NOT produce JSON output, because our
+specific FOB transmits a structural sub-variant: **3-sync-triplet + 35
+bits per packet** vs the canonical **1 sync + 36 bits**. Same modulation
+and timing, different framing. Since we replay verbatim rather than
+decode, the divergence is cosmetic.
+
+## Packet layout — 1WG3R canonical (36 bits)
 _from rtl_433/src/devices/compustar_1wg3r.c — public domain knowledge_
 
 | Field          | Bits | Position | Notes |
 |----------------|------|----------|-------|
-| Remote ID      | 16   | 0..15    | Constant per FOB (= "serial" in HCS terminology) |
-| Always 111     | 3    | 16..18   | Sanity check bits, always 0b111 |
+| Remote ID      | 16   | 0..15    | Constant per FOB |
+| Always 111     | 3    | 16..18   | Sanity check bits |
 | ~button (inv)  | 8    | 19..26   | Bitwise NOT of button code |
 | button code    | 8    | 27..34   | Identifies which button(s) |
 | Always 0       | 1    | 35       | Sanity bit |
 
 Integrity check: `button_inverse XOR button_code == 0xFF`.
+
+## Packet layout — 1WSHR-PRO observed (35 bits between syncs)
+
+This FOB doesn't match the canonical 1WG3R layout. Observed structure:
+
+- First 16 bits = Remote ID (verified — matches across all four buttons)
+- Bits 16..23 = constant `0x08` across all buttons (some header / always-on field)
+- Bits 24..34 = per-button code (11 bits, including parity / inversion)
+
+We don't need to fully reverse-engineer the field meanings since the
+patterns are FIXED. For replay it's sufficient to store each button's
+35-bit pattern verbatim. The per-button patterns live in
+`framing.local.md`.
 
 ## Implications for the rest of the project
 

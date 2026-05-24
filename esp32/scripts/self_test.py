@@ -265,7 +265,10 @@ def phase_6_stopping_to_cooldown():
     uart = _ctx["uart"]; pi_power = _ctx["pi_power"]
     # First _stopping_step: sends shutdown_pi and sets the grace deadline.
     # Second one (after grace elapses): cuts the MOSFET and moves to COOLDOWN.
-    base_time = cfg.RUN_DURATION_S + 100
+    # Keep base_time + grace WITHIN the safety hard-cap window
+    # (RUN_DURATION_S + STOPPING_HARD_CAP_MULT * PI_SHUTDOWN_GRACE_S, default 2x)
+    # so this happy-path test doesn't trip the force-cleanup branch.
+    base_time = cfg.RUN_DURATION_S + 5
     times = iter([base_time, base_time + cfg.PI_SHUTDOWN_GRACE_S + 5])
     ctrl._now = lambda: next(times)
     ctrl._stopping_step()

@@ -49,10 +49,41 @@ subfolder, depending on which fork) to your PATH.
 Verify with PowerShell:
 
 ```powershell
-rtl_test -t
+rtl_test
 ```
 
-Expected output: model info + tuner type + supported sample rates. If you get "No supported devices found", redo the Zadig step.
+(Don't use `-t` — that's an E4000-tuner-specific test and always
+errors out with `No E4000 tuner found, aborting.` on R820T2 / R828D
+which is what's actually inside these dongles.)
+
+Expected output: model info + tuner type + supported sample rates, then it
+will start continuously sampling and print throughput stats. Press Ctrl-C
+to stop.
+
+If you get "No supported devices found", redo the Zadig step.
+
+If tuner detects but you get a flood of `rtlsdr_demod_read/write_reg failed
+with -9` (USB pipe stalls) and especially `r82xx_write: i2c wr failed=-9`,
+that's a USB-power / USB-signal-integrity symptom — **NOT a software
+issue**. Three things to try in order:
+
+1. Plug the dongle into a **USB 2.0 port** (black, usually on the back of
+   the PC). USB 3.x host controllers negotiate power differently and
+   R828D-tuner dongles are picky about it.
+2. Switch to the [RTL-SDR Blog fork](https://github.com/rtlsdrblog/rtl-sdr-blog/releases)
+   driver bundle if you grabbed the osmocom build first. The Blog fork
+   has R828D-specific tuning workarounds.
+3. Try a different USB cable (cheap ones drop bits on i2c traffic).
+
+### Tuner variants you might see
+
+The cheap "RTL-SDR" sticks ship with one of two tuners depending on year /
+batch / clone source:
+- **R820T2** — older, slightly less sensitive, very well supported
+- **R828D** — newer, the tuner on RTL-SDR Blog V4, more USB-power-sensitive
+
+Both work for our use case. `rtl_test` prints which one you have on the
+`Found Rafael Micro ... tuner` line.
 
 ### Install Universal Radio Hacker
 

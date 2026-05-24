@@ -9,14 +9,14 @@ An in-car ESP32 + Raspberry Pi Zero 2 W unit that:
 - Displays gauges + status on a 5" touchscreen
 - Exposes state to the home network via WiFi (web UI + MQTT)
 
-The Compustar trigger is performed by software synthesis of the KeeLoq rolling-code RF signal — the ESP32 plays the role of the FOB, allowing the in-car system to stay self-contained (FOB remains in the house).
+The Compustar trigger is performed by software synthesis of the FOB's RF signal — the ESP32 plays the role of the remote, allowing the in-car system to stay self-contained (the original FOB remains in the house). SDR analysis confirmed the specific 1WSHR-PRO model is a Compustar 1WG3R-family fixed-code FOB: same press = identical 35-bit packet on the wire, so the ESP32 just captures each button's pattern once and replays verbatim. No KeeLoq encryption or device-key recovery is required for this FOB. (The KeeLoq cipher module is retained for any HCS-KeeLoq Compustar variants other readers might be working with.)
 
 ## Build status
 
 **Bench-ready software, awaiting parts.** As of the most recent commit:
 
-- **85 unit + integration tests** passing across the project ([CI](.github/workflows/tests.yml) runs on every push across Py 3.10/3.11/3.12)
-- All hardware-independent firmware written: KeeLoq cipher, HCS packet builder, OBD-II PIDs, UART protocol, state machine, deep sleep, RTC-memory streak persistence, watchdog, drivers for CC1101 / ADS1115 / TWAI
+- **105 unit + integration tests** passing across the project ([CI](.github/workflows/tests.yml) runs on every push across Py 3.10/3.11/3.12) — 81 ESP32 + 24 Pi
+- All hardware-independent firmware written: Compustar 1WG3R-family packet replay, KeeLoq cipher (HCS variants only), OBD-II PIDs, UART protocol, state machine, deep sleep, RTC-memory streak persistence, watchdog, drivers for CC1101 / ADS1115 / TWAI
 - Pi-side daemon: thread-safe STATE, UART listener, MQTT publisher + command subscriber (Home Assistant ready), Flask dashboard with toast feedback + events panel, systemd unit, idempotent provision.sh
 - Phase 1 (SDR walkthrough) and Phase 2 (bench-prototype docs 08-12) complete and reproducible
 - Tooling: simulator (`esp32/scripts/simulate.py`), pre-flight check (`tools/preflight.py`), mpremote install scripts, helper scripts for SDR analysis

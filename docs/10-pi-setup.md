@@ -90,10 +90,13 @@ Fill in:
   — usually not, since you already set them during imaging)
 - MQTT broker / username / password / topic prefix (or leave `MQTT_BROKER
   = None` to disable MQTT)
-- COMPUSTAR_DEVICE_KEY / COMPUSTAR_SERIAL / COMPUSTAR_COUNTER — these
-  come from the SDR walkthrough (step 07). For initial dashboard testing
-  before the SDR phase is complete, set placeholder values; the actual
-  start path will refuse to transmit until real values are in place.
+
+The Pi-side `secrets.py` does NOT need any FOB values — the Compustar
+packet replay lives on the ESP32. The Pi just relays UART events to the
+dashboard. ESP32-side `secrets.py` (separate file, see
+[`sdr/06`](../sdr/06-framing-extraction.md) and
+[`12-bench-validation.md`](12-bench-validation.md)) is where the
+`COMPUSTAR_REMOTE_ID` + `COMPUSTAR_PACKETS` go.
 
 ## Step 6 — Start the daemon
 

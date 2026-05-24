@@ -142,20 +142,19 @@ Test transmit (visible on an SDR or another CC1101):
 ```python
 >>> radio.init_433mhz_ook()
 >>> from lib import compustar
->>> # Send a dummy packet (won't decode as a real Compustar packet but
->>> # the SDR will see the OOK burst at 433.92 MHz)
->>> packet = compustar.build_packet(
-...     serial=0x12345,
-...     function_code=0x4,
-...     counter=1,
-...     device_key=0xDEADBEEFCAFEBABE,
-... )
->>> pulses = compustar.packet_to_pulses(packet["bits"])
+>>> # Send a dummy 35-bit Compustar packet (synthetic bits — won't
+>>> # match any real FOB, but the SDR will see the OOK burst at
+>>> # 433.92 MHz so this confirms the radio is transmitting)
+>>> dummy_packets = {"START": "01" * 17 + "0"}  # 35 chars
+>>> pulses = compustar.build_pulses_for_button("START", dummy_packets)
 >>> radio.transmit_pulses(pulses)
 ```
 
 With your RTL-SDR tuned to 433.92 MHz (from the SDR walkthrough), you
 should see a brief OOK burst in the waterfall.
+
+(For the real bench-validation transmit using your captured FOB
+patterns, see [`12-bench-validation.md`](12-bench-validation.md).)
 
 ## Step 6 — SN65HVD230 CAN loopback (only if `machine.CAN` is available)
 

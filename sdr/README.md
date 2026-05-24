@@ -1,8 +1,20 @@
 # SDR phase — reverse-engineering the Compustar FOB
 
 This directory holds everything related to capturing, analyzing, and
-ultimately replicating the 1WSHR-PRO FOB's rolling-code transmissions
-so the ESP32 can play the role of the remote.
+ultimately replicating the 1WSHR-PRO FOB's RF transmissions so the
+ESP32 can play the role of the remote.
+
+The 1WSHR-PRO turns out to be a member of the **Compustar 1WG3R
+fixed-code family** (verified via rtl_433's `compustar_1wg3r.c`
+decoder + empirical bit-pattern stability across 10 presses). That
+means same press = identical bits on the wire — no rolling counter,
+no encryption, no device key. The walkthrough below captures the
+four button patterns once and stores them verbatim in
+`secrets.py`.
+
+If you're working with a different Compustar FOB that does use
+HCS-KeeLoq rolling-code, step 07 still walks the legacy device-key
+recovery path.
 
 If you're working through this for the first time, follow the numbered
 files **in order**. Each one is a self-contained step with prerequisites,
@@ -11,13 +23,13 @@ generate.
 
 ## Walkthrough
 
-1. [`01-software-setup.md`](01-software-setup.md) — install rtl-sdr drivers, URH, supporting tools
+1. [`01-software-setup.md`](01-software-setup.md) — install rtl-sdr drivers and supporting tools
 2. [`02-hardware-verification.md`](02-hardware-verification.md) — confirm the dongle is detected and receives signal
 3. [`03-frequency-confirmation.md`](03-frequency-confirmation.md) — verify the FOB transmits at 433.92 MHz
 4. [`04-recording-captures.md`](04-recording-captures.md) — record clean 1-second IQ samples of each button press
 5. [`05-demodulation.md`](05-demodulation.md) — demodulate captures to bit sequences with the project's Python demodulator (no URH dependency)
-6. [`06-framing-extraction.md`](06-framing-extraction.md) — identify preamble, FOB serial, function codes, hopping code position
-7. [`07-key-recovery.md`](07-key-recovery.md) — recover the FOB's KeeLoq device key so the ESP32 can synthesize new packets
+6. [`06-framing-extraction.md`](06-framing-extraction.md) — read the 16-bit Remote ID and capture each button's 35-bit pattern
+7. [`07-key-recovery.md`](07-key-recovery.md) — _(HCS-KeeLoq FOBs only — not needed for Compustar 1WG3R-family)_
 
 ## Directory layout
 
@@ -28,23 +40,27 @@ sdr/
 ├── 02-hardware-verification.md     │
 ├── 03-frequency-confirmation.md    │  step-by-step walkthrough
 ├── 04-recording-captures.md        │
-├── 05-urh-analysis.md              │
+├── 05-demodulation.md              │
 ├── 06-framing-extraction.md        │
-├── 07-key-recovery.md              ┘
+├── 07-key-recovery.md              ┘  (HCS-KeeLoq variants only)
 ├── captures/        (gitignored — raw IQ binary files, can be huge)
 ├── scripts/         (helper Python — see scripts/README.md)
 │   ├── plot-power-csv.py    (find frequency peaks in rtl_power output)
 │   ├── inspect-capture.py   (pre-demod sanity check on a .bin file)
 │   ├── trim-burst.py        (slice multi-press files into per-burst bins)
-│   ├── demod-ook.py         (headless OOK demodulator → .bits files)
+│   ├── demod-compustar.py   (Compustar 1WG3R-family decoder)
+│   ├── demod-ook.py         (generic OOK / HCS-PWM decoder — fallback)
+│   ├── scan-compustar.py    (brute-force packet alignment finder)
 │   ├── debug-envelope.py    (run-length / histogram diagnostics)
+│   ├── consensus-bits.py    (majority-vote across multiple .bits decodes)
+│   ├── analyze-framing.py   (classify bit positions HOP/FN/SER)
 │   ├── diff-bits.py         (compare two .bits files)
-│   ├── try-mfkeys.py        (brute-force a manufacturer-key database)
-│   └── validate-key.py      (confirm a candidate device key against captures)
+│   ├── try-mfkeys.py        (HCS-KeeLoq: brute-force manufacturer keys)
+│   └── validate-key.py      (HCS-KeeLoq: validate a candidate device key)
 └── analysis/
-    ├── framing.md              (committed — your final findings about the FOB protocol)
-    ├── screenshots/            (gitignored by default — selectively commit ones worth keeping)
-    └── press-logs/             (per-button capture session notes)
+    ├── framing.md              (committed — protocol-family findings; safe to share)
+    ├── framing.local.md        (gitignored — your per-FOB Remote ID + bit patterns)
+    └── framing.local.md.example  (committed — template for framing.local.md)
 ```
 
 ## What you need before starting
@@ -57,8 +73,8 @@ sdr/
 
 ## Important: this is for your own car
 
-The techniques in this walkthrough — extracting your FOB's device key,
-synthesizing valid Keeloq packets — work because **you legitimately own
-the FOB**. Doing this to a car you don't own or have permission to
-operate is theft, fraud, and a variety of criminal offences depending
-on jurisdiction. Don't.
+The techniques in this walkthrough — capturing your FOB's RF
+transmissions and replaying them from an ESP32 — work because **you
+legitimately own the FOB**. Doing this to a car you don't own or have
+permission to operate is theft, fraud, and a variety of criminal
+offences depending on jurisdiction. Don't.

@@ -72,6 +72,7 @@ class Config:
     OBD_POLL_INTERVAL_S = 1
     OBD_POLL_PIDS = ()
     PI_SHUTDOWN_GRACE_S = 30
+    STOPPING_HARD_CAP_MULT = 2.0
     # Captured 35-bit packets (synthetic for tests)
     COMPUSTAR_REMOTE_ID = 0xABCD
     COMPUSTAR_PACKETS = TEST_PACKETS
@@ -244,6 +245,56 @@ def test_stop_after_run_duration_powers_off_pi():
     ctrl._stopping_step()   # second call: grace elapsed, MOSFET off
     assert pi_power.value() == 1   # Pi off
     assert ctrl.state == State.COOLDOWN
+
+
+def test_stopping_normal_grace_completes_within_hard_cap():
+    """The normal grace path should complete before the hard cap fires
+    and should NOT emit a hard-cap warn LOG."""
+    ctrl, _, _, uart, pi_power = _make_ctrl()
+    ctrl.state = State.STOPPING
+    ctrl.run_start_ts = 0
+    # First _stopping_step at t = RUN_DURATION_S + 1 (just past the run window,
+    # well under the hard cap of RUN_DURATION_S + 2 * PI_SHUTDOWN_GRACE_S).
+    # Second _stopping_step at t = RUN_DURATION_S + PI_SHUTDOWN_GRACE_S + 2,
+    # which clears stop_grace_until cleanly.
+    grace = ctrl.cfg.PI_SHUTDOWN_GRACE_S
+    run_dur = ctrl.cfg.RUN_DURATION_S
+    times = iter([run_dur + 1, run_dur + grace + 2])
+    ctrl._now = lambda: next(times)
+    ctrl._stopping_step()   # sends shutdown_pi, sets stop_grace_until
+    ctrl._stopping_step()   # grace elapsed normally → COOLDOWN
+    assert ctrl.state == State.COOLDOWN
+    assert pi_power.value() == 1
+    hard_cap_warns = [m for m in uart.sent
+                      if m["type"] == "LOG"
+                      and m.get("level") == "warn"
+                      and "hard cap" in m.get("msg", "")]
+    assert hard_cap_warns == []
+
+
+def test_stopping_hard_cap_fires_when_grace_blocked():
+    """If time advances past the hard cap without the grace path completing
+    (Pi hung, UART dead, grace clock never ticked), the controller should
+    force-cut power, emit a warn LOG, and transition to COOLDOWN."""
+    ctrl, _, _, uart, pi_power = _make_ctrl()
+    ctrl.state = State.STOPPING
+    ctrl.run_start_ts = 0
+    grace = ctrl.cfg.PI_SHUTDOWN_GRACE_S
+    run_dur = ctrl.cfg.RUN_DURATION_S
+    mult = ctrl.cfg.STOPPING_HARD_CAP_MULT
+    # Jump straight past the hard cap (simulating a wedged grace path).
+    ctrl._now = lambda: int(run_dur + mult * grace + 5)
+    ctrl._stopping_step()
+    assert ctrl.state == State.COOLDOWN
+    assert pi_power.value() == 1
+    hard_cap_warns = [m for m in uart.sent
+                      if m["type"] == "LOG"
+                      and m.get("level") == "warn"
+                      and "hard cap" in m.get("msg", "")]
+    assert len(hard_cap_warns) == 1
+    stopped_events = [m for m in uart.sent
+                      if m["type"] == "EVENT" and m["event"] == "engine_stopped"]
+    assert len(stopped_events) == 1
 
 
 def test_wdt_is_none_in_cpython():

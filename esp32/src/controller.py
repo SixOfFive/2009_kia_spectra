@@ -245,6 +245,28 @@ class VroomController:
 
     def _stopping_step(self):
         now = self._now()
+        # Safety: hard cap on total time spent in the run+stopping cycle.
+        # If we got here normally the grace timer expires well before this.
+        # If the Pi hung or UART died, the grace clock might never tick;
+        # this catches that and force-cuts power so the state machine
+        # doesn't wedge in STOPPING forever.
+        if self.run_start_ts is not None:
+            grace = self.cfg.PI_SHUTDOWN_GRACE_S
+            mult = getattr(self.cfg, "STOPPING_HARD_CAP_MULT", 2.0)
+            hard_cap = self.cfg.RUN_DURATION_S + mult * grace
+            if now - self.run_start_ts >= hard_cap:
+                self.uart.send(pi_link.log(
+                    "warn",
+                    "stopping hard cap: forced power-off after %.0fs "
+                    "(grace=%ds mult=%.1f)" % (now - self.run_start_ts, grace, mult),
+                ))
+                self._power_off_pi()
+                self.stop_grace_until = None
+                self.state = State.COOLDOWN
+                self.last_trigger_ts = now
+                self.uart.send(pi_link.event(pi_link.EVENT_ENGINE_STOPPED))
+                return
+
         if self.stop_grace_until is None:
             self.uart.send(pi_link.command(pi_link.CMD_SHUTDOWN_PI))
             self.stop_grace_until = now + self.cfg.PI_SHUTDOWN_GRACE_S

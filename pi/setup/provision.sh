@@ -74,12 +74,16 @@ $PI_USER ALL=(ALL) NOPASSWD: /sbin/shutdown
 EOF
 chmod 0440 /etc/sudoers.d/vroom
 
-# ---------- 8. systemd service ----------
+# ---------- 8. systemd services ----------
 
-log "Installing systemd service..."
+log "Installing systemd services..."
 cp "$PROJECT_DIR/pi/systemd/vroom.service" /etc/systemd/system/
+cp "$PROJECT_DIR/pi/systemd/vroom-snmp.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable vroom.service
+# SNMP is opt-in: enable only if the operator wants it exposed.
+# Uncomment to enable by default:
+#   systemctl enable vroom-snmp.service
 
 # ---------- 9. Chromium kiosk autostart ----------
 

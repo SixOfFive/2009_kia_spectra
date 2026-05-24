@@ -1,0 +1,46 @@
+[Unit]
+Description=Vroom SNMPv2c read-only responder
+Documentation=https://github.com/SixOfFive/2009_kia_spectra
+Documentation=file:///opt/vroom/docs/20-snmp-integration.md
+After=vroom.service
+Wants=vroom.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/vroom
+Environment=PYTHONPATH=/opt/vroom
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m pi.app.snmp_responder
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Default port is 1161 (non-privileged) so no CAP_NET_BIND_SERVICE
+# is needed. If you change SNMP_PORT in secrets.py to 161 (standard
+# SNMP), uncomment the next two lines to grant the bind capability:
+#
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening — the responder only reads state, so it doesn't need
+# anything beyond a UDP socket.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/vroom
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

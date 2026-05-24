@@ -14,11 +14,28 @@
 | Map rendering (cached OSM tiles or live via WiFi) | **Pi** |
 | Web UI for home-network monitoring | **Pi** |
 | MQTT publisher to Home Assistant / Grafana | **Pi** (could also do this from ESP32) |
+| SNMPv2c responder for NMS polling (read-only) | **Pi** (see [docs/20-snmp-integration.md](20-snmp-integration.md)) |
 | Persistent logging to SD card | **Pi** |
 | Clean shutdown on power-down signal | **Pi** (systemd service) |
 | SSH for debugging | **Pi** |
 
 The principle: ESP32 is the always-on watchdog with real-time superpowers and microamp sleep. Pi is the smart brain that wakes up only when needed.
+
+## Pi-side daemon layout
+
+The Pi runs **one process** (`pi.app.daemon`) hosting three threads:
+the Flask dashboard (`pi/app/display/server.py`), the UART listener
+(`pi/app/uart_listener.py`), and the MQTT bridge (`pi/app/mqtt_subscriber.py`
++ MQTT publisher). All three share state through `pi/app/state.py`.
+
+A **second process** (`pi.app.snmp_responder`) runs alongside, also
+reading from `pi.app.state.snapshot()`. It binds UDP/1161 and serves a
+small read-only OID tree under `1.3.6.1.4.1.99999.7` for any LAN-side
+NMS that wants to graph vroom telemetry alongside other infrastructure.
+Separate systemd unit (`vroom-snmp.service`) so it can be enabled or
+disabled independently of the main daemon. See
+[docs/20-snmp-integration.md](20-snmp-integration.md) for the OID
+reference and integration examples.
 
 ## Communication between them
 

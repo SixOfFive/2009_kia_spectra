@@ -7,6 +7,7 @@ stays the single source of truth.
 | Script | Used in step | Purpose |
 |---|---|---|
 | `plot-power-csv.py` | [02](../02-hardware-verification.md), [03](../03-frequency-confirmation.md) | Find frequency peaks in an `rtl_power` CSV |
+| `inspect-capture.py` | [04](../04-recording-captures.md) | Pre-URH sanity check on a `.bin` capture — finds bursts above the noise floor and reports their timing |
 | `diff-bits.py` | [06](../06-framing-extraction.md) | Compare two `.bits` files, report positions where bits flip |
 | `try-mfkeys.py` | [07](../07-key-recovery.md) Path A | Brute-force a manufacturer-key database to derive a candidate device key |
 | `validate-key.py` | [07](../07-key-recovery.md) | Decrypt captured hopping codes with a candidate device key, check counter increments by 1 |

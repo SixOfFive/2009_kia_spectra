@@ -198,13 +198,14 @@ def run_lengths(binary):
 
 def find_packets_in_runs(runs, te_samples, n_bits=66, verbose=False):
     """
-    Scan run list for HCS packet starts. A packet starts with:
-      - Preamble: ~12 short on/off cycles (24 runs ~TE long, alternating)
-      - Header gap: a long low (>= 4*TE)
-      - Data: 66 PWM-encoded bit pairs
+    Scan run list for packet starts. A packet starts with a preamble
+    (>=8 consecutive short runs ~TE long), then either:
+      - A long LOW (>= 3.5*TE) acting as header gap (standard HCS), OR
+      - Direct transition into data (some Compustar variants omit the gap
+        or use a sync-burst of 2*TE pulses instead)
 
     Returns list of (preamble_start, data_start, header_gap_len_samples).
-    Forgiving on preamble count (accepts >=8) and TE tolerance (50-150%).
+    header_gap_len_samples is 0 if no gap was present.
     """
     short_lo = te_samples * 0.5
     short_hi = te_samples * 1.6
@@ -224,15 +225,25 @@ def find_packets_in_runs(runs, te_samples, n_bits=66, verbose=False):
                 break
         if preamble_runs >= 8 and j < len(runs):
             val, length = runs[j]
+            gap_len = 0
+            data_start = j
             if val == 0 and length >= long_gap_min:
+                gap_len = length
+                data_start = j + 1
                 if verbose:
                     print(f"    candidate packet: preamble runs {i}..{j-1} "
                           f"({preamble_runs} short alternations), header gap "
-                          f"{length} samples")
-                packets.append((i, j + 1, length))
-                # Skip past the data we'll consume so we don't re-detect inside it
-                i = min(j + 1 + n_bits * 2, len(runs))
-                continue
+                          f"{length} samples, data starts at run {data_start}")
+            else:
+                if verbose:
+                    print(f"    candidate packet: preamble runs {i}..{j-1} "
+                          f"({preamble_runs} short alternations), NO header gap "
+                          f"(next run is val={val} len={length}), "
+                          f"data starts at run {data_start}")
+            packets.append((i, data_start, gap_len))
+            # Skip past the data we'll consume so we don't re-detect inside it
+            i = min(data_start + n_bits * 2, len(runs))
+            continue
         i += 1
     return packets
 
@@ -413,8 +424,10 @@ def main():
                          "coupling, but might miss long bits; default 2000)")
     ap.add_argument("--n-bits", type=int, default=66,
                     help="packet length in bits (HCS66 default 66)")
-    ap.add_argument("--max-packets", type=int, default=1,
-                    help="stop after decoding this many packets (default 1)")
+    ap.add_argument("--max-packets", type=int, default=10,
+                    help="stop after decoding this many packets (default 10). "
+                         "Files contain multiple repeats; emit each as .pN.bits "
+                         "so step 06 can majority-vote across them.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 

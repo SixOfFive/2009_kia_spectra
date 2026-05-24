@@ -190,12 +190,21 @@ If Lock works but Start doesn't, the function code mapping may be off — re-che
 ## Where artifacts go
 
 - `esp32/src/secrets.py` (gitignored) — the recovered key + serial + counter
-- `sdr/analysis/key-recovery-session.md` — committed record of which path worked, when, and against what FOB
+- `sdr/analysis/framing.local.md` (gitignored) — serial, function-code
+  mapping, captured hopping codes per press, counter values
+- `sdr/analysis/key-recovery-session.local.md` (gitignored, *.local.md
+  pattern) — narrative record of which path worked, against what FOB,
+  any oddities encountered. Keep locally as your reference.
 
 ## Security and safety
 
 - **Never commit the device key.** `secrets.py` is in `.gitignore`. Verify with `git status` before any commit.
-- **Never put the device key in a public log file.** The auto-commit/push rule in this project pushes everything in `logs/` to GitHub.
+- **Never commit your serial, hopping codes, or counter either.** They go
+  in `framing.local.md` and `secrets.py`, both gitignored. Verify both
+  files do NOT appear in `git status` before committing anything from this
+  session.
+- **Never put any FOB-identifying value in a public log file** under
+  `logs/YYYY-MM-DD.md`. The auto-commit/push rule pushes those to GitHub.
 - **The recovered key is no less sensitive than the physical FOB itself.** Treat it the same way you treat your car keys.
 - **Disable the system before any in-car testing.** Compustar has a valet switch for exactly this reason.
 

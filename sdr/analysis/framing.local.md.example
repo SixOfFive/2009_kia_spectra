@@ -1,0 +1,51 @@
+# framing.local.md — per-FOB sensitive values (LOCAL ONLY)
+
+> **This file (when copied to `framing.local.md`) is gitignored.**
+> Do not commit it. Do not share its contents. Treat the values here
+> the same way you treat your physical FOB.
+
+Copy this file to `framing.local.md` (drop the `.example`) before
+working through SDR steps 06 and 07.
+
+## FOB-specific values
+_filled in after step 06_
+
+- **Serial** (28 bits): `0x_______`
+- **Function codes**:
+  - Start:  `0x_`
+  - Lock:   `0x_`
+  - Unlock: `0x_`
+  - Trunk:  `0x_`
+
+## Captured hopping codes
+_populate as you extract from URH; used as inputs to `validate-key.py`_
+
+| Capture file              | Button | Hopping (hex) | Counter (decrypted) | Function (decrypted) |
+|---------------------------|--------|---------------|---------------------|----------------------|
+| fob-start-001.bits        | Start  | 0x________    |                     |                      |
+| fob-start-002.bits        | Start  | 0x________    |                     |                      |
+| fob-start-003.bits        | Start  | 0x________    |                     |                      |
+| fob-lock-001.bits         | Lock   | 0x________    |                     |                      |
+| fob-unlock-001.bits       | Unlock | 0x________    |                     |                      |
+
+## Device key recovery
+_filled in after step 07; **NEVER put the actual key here either**_
+
+- Path used: A (Flipper DB) / B (PICkit) / C (cryptanalytic)
+- Date recovered: YYYY-MM-DD
+- Validation result: counter increments by 1 across N consecutive captures? yes / no
+- Device key lives in: `esp32/src/secrets.py` (gitignored)
+
+## Backup plan
+
+If you lose `framing.local.md` you can re-derive everything by re-running
+the SDR walkthrough. If you lose `esp32/src/secrets.py` (which has the
+recovered device key) the same applies. Consider a one-line note in a
+password manager like:
+
+    vroom-spectra-fob:
+      serial: 0x_______
+      key:    0x_______________
+      counter (as of YYYY-MM-DD): _____
+
+…stored encrypted at rest. Not in plain text.

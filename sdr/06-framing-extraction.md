@@ -69,44 +69,32 @@ If your fixed-code section contains the bits `0000 1010 1011 1100 1101 1110 1111
 
 ## Step 4 — Record findings
 
-Update `sdr/analysis/framing.md`:
+**Two files, two scopes:**
 
-```markdown
-## Framing extracted on YYYY-MM-DD
+- `sdr/analysis/framing.md` (committed, public) — only the generic /
+  universal stuff: packet layout (already filled in from the HCS
+  datasheet), timing (TE / preamble / gap — these are HCS-encoder
+  configuration values, not FOB-identifying), session-level observations.
+- `sdr/analysis/framing.local.md` (**gitignored, never commit**) —
+  everything FOB-identifying: your 28-bit serial, your function-code
+  mapping, captured hopping codes per press, counter values.
 
-### Packet layout (66 bits, MSB first as transmitted)
+If you don't have `framing.local.md` yet, copy the template:
 
-| Field          | Bits  | Position  | Notes                             |
-|----------------|-------|-----------|-----------------------------------|
-| Hopping code   | 32    | 0..31     | Encrypted, changes every press    |
-| FOB serial     | 28    | 32..59    | Constant for this FOB             |
-| Function code  | 4     | 60..63    | Identifies which button           |
-| V_LOW          | 1     | 64        | Low-battery indicator             |
-| Repeat         | 1     | 65        | 0 = first packet, 1 = repeat      |
-
-### Timing
-
-- TE (bit element time): _____ µs (measured from URH bit length / sample rate)
-- Preamble: _____ half-bit cycles
-- Header gap: _____ TE periods of silence
-- Inter-packet guard: _____ ms
-
-### FOB-specific values
-
-- **Serial**: 0x_______ (28 bits)
-- **Function codes** (compare button by button):
-  - Start: 0x_
-  - Lock: 0x_
-  - Unlock: 0x_
-  - Trunk: 0x_ (if applicable)
-
-### Hopping code observations
-
-- Across 10 Start presses, the 32-bit hopping value changed all 32 bits each time
-  (as expected — encryption with an incrementing counter scrambles the whole block)
-- The counter increment between consecutive presses (when we decrypt with the
-  recovered key in step 07) should be +1 per press
+```powershell
+copy sdr\analysis\framing.local.md.example sdr\analysis\framing.local.md
 ```
+
+Then fill in your discovered values in `framing.local.md`. Put the
+measured TE / preamble / gap into the committed `framing.md` — those
+are universal to your HCS chip variant, not your specific FOB.
+
+### Hopping code observation worth noting (in committed framing.md, fine)
+
+Across 10 Start presses, the 32-bit hopping value should change in all
+32 bit positions each time — encryption with an incrementing counter
+scrambles the whole block. The counter increment between consecutive
+presses (after decrypt in step 07) should be +1 per press.
 
 ## Step 5 — Update the code constants
 

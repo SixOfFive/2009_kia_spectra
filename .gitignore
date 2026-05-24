@@ -58,6 +58,18 @@ config.local.*
 *.key
 keeloq_device_key.txt
 
+# Per-FOB sensitive analysis: serial number, function-code mapping,
+# captured hopping codes, counter values. The general framing.md is
+# committed; *.local.md files in sdr/analysis are not.
+sdr/analysis/framing.local.md
+sdr/analysis/*.local.md
+sdr/analysis/*.secret.md
+
+# Runtime state written by the controller / simulator when COUNTER_FILE
+# defaults to cwd (tests redirect to tmp, but stray runs leave it here)
+compustar_counter.json
+**/compustar_counter.json
+
 # Local notes that shouldn't be public
 TODO.local.md
 notes.local.md

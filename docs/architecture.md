@@ -26,7 +26,7 @@ The principle: ESP32 is the always-on watchdog with real-time superpowers and mi
 - **Wake signal:** ESP32 GPIO → AO3401A P-MOSFET → gates 5V to Pi
 - **Shutdown coordination:** ESP32 sends `SHUTDOWN` over UART, Pi systemd service catches it and runs `shutdown -h now`, ESP32 waits 30s then cuts MOSFET
 
-UART protocol is simple line-based JSON or text commands. To be designed in the firmware phase.
+UART protocol: line-delimited JSON, one object per line at 115200 baud. Six message types (STATUS, OBD, EVENT, COMMAND, ACK, LOG) defined symmetrically in `esp32/src/lib/pi_link.py` and `pi/app/comms/esp32_link.py`. Cross-module constant parity is verified by `esp32/tests/test_integration.py`.
 
 ## Power architecture
 

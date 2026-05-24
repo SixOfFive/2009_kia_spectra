@@ -4,7 +4,8 @@ This is a context-preservation document written before conversation compaction.
 A future Claude (or future-me) should be able to read this file and pick up
 where we left off without having to reconstruct from chat history.
 
-Last updated: 2026-05-23 (single-day session, late evening).
+Last updated: 2026-05-24 (continued from prior session — substantial code +
+docs added; all hardware-independent work is complete).
 
 ---
 
@@ -344,19 +345,26 @@ After key recovery: drop values into `secrets.py`, validate by decrypting captur
 
 ## 11. What's deferred / TBD
 
-### Waiting on hardware
+### All written — bench-test on arrival
 
-- **CC1101 SPI driver** (`esp32/src/lib/cc1101.py`) — needs the actual module to test
-- **ADS1115 driver** (`esp32/src/lib/ads1115.py`) — same
-- **TWAI/CAN driver** (`esp32/src/lib/twai_can.py`) — needs ESP32 + transceiver
-- **Display driver** — needs Pi + display
-- **`main.py`** for ESP32 — full state machine wiring everything together
-- **UART listener thread on Pi** — bridges live data to dashboard STATE
-- **systemd services** for Pi (auto-start dashboard, listen for shutdown command)
-- **provision.sh** for fresh Pi setup
-- **MQTT publisher** integration
+These were "waiting on hardware" originally but the code now exists, with
+CPython unit tests, awaiting smoke-test on real hardware:
 
-### Waiting on SDR captures
+- `esp32/src/lib/cc1101.py` — SPI driver + async OOK transmit
+- `esp32/src/lib/ads1115.py` — I2C single-shot ADC
+- `esp32/src/lib/twai_can.py` — CAN wrapper with graceful no-CAN fallback
+- `esp32/src/lib/persistence.py` — RTC memory streak persistence for deep sleep
+- `esp32/src/controller.py` — full state machine (5 states, deep sleep, persisted counter)
+- `esp32/src/main.py` — boot entrypoint wiring drivers + controller
+- `pi/app/state.py` — thread-safe shared STATE
+- `pi/app/comms/uart_listener.py` — ESP32 message dispatcher (daemon thread)
+- `pi/app/comms/mqtt_publisher.py` — periodic MQTT snapshot publisher
+- `pi/app/daemon.py` — single-process Pi entrypoint (Flask + listener + MQTT)
+- `pi/app/display/server.py` — Flask routes wired through to ESP32 via the link
+- `pi/systemd/vroom.service` — systemd unit
+- `pi/setup/provision.sh` — idempotent fresh-Pi setup
+
+### Still waiting on SDR captures + real FOB
 
 - Compustar `Function` codes (placeholders in compustar.py until SDR confirms)
 - TE timing (RF_TE_US currently 400µs default — need to measure)
@@ -364,11 +372,26 @@ After key recovery: drop values into `secrets.py`, validate by decrypting captur
 - Device key, serial, counter (go into `secrets.py` after recovery)
 - Replace dummy obd2 test frames with real captures from the Veepeak (deferred per user)
 
-### Deferred phase docs (in docs/reproduce.md)
+### Hardware smoke tests (per `docs/09-bench-smoke-tests.md`)
 
-- Phase 2: bench prototype walkthrough (steps 08-12)
-- Phase 3: in-car install (steps 13-16)
-- Phase 4: polish — Home Assistant, long-term stability, optional cellular
+These are the actual remaining "code" work — really verification, not coding:
+- Flash MicroPython, copy `esp32/src/` to the chip
+- Confirm each driver responds to its hardware in isolation
+- Run the full controller through one MONITORING → STARTING → ... cycle on the bench
+- First live Lock test in the car (per docs/12)
+
+### Deferred phase docs
+
+- Phase 3 (in-car install: steps 13-16) — written as that phase happens
+- Phase 4 (polish: Home Assistant, long-term stability, optional cellular)
+
+### Nice-to-have optimizations
+
+- Resume-from-flash if state was RUNNING at boot (currently we always
+  start in MONITORING; a watchdog reset during RUNNING means engine keeps
+  running until receiver's own timeout — acceptable for v1)
+- BLE-wake from deep sleep (would let dashboard wake the ESP32 on demand
+  without breaking the deep-sleep current budget)
 
 ---
 
@@ -418,6 +441,15 @@ In order of priority:
 ## 14. Git commit history (relevant ones)
 
 ```
+76d791c  Add GitHub Actions CI + end-to-end integration tests (9 new)
+8b4d21c  Add Phase 2 reproduction docs: bench prototype (steps 08-12)
+8e174e1  Add deep-sleep + RTC-memory streak persistence for MONITORING
+340b909  Log: SDR scripts, ESP32 drivers + state machine, Pi daemon
+ad89a9a  Add Pi daemon (UART listener + MQTT publisher + Flask) + provisioning
+6057252  Add ESP32 state machine (controller.py + main.py boot entrypoint)
+77e45d5  Add ESP32 hardware drivers (cc1101, ads1115, twai_can) + tests
+2c21d5e  Add SDR helper scripts so the walkthrough is executable end-to-end
+5edb82e  Write braindump.md (pre-compaction context preservation)
 ca39466  Add detailed SDR reproduction walkthrough (7 numbered docs + top-level index)
 7360a21  Log evening code sprint — first 5 modules + tests + dashboard
 3cd569e  Add Flask dashboard skeleton (server + HTML + CSS + JS)
@@ -432,6 +464,17 @@ fbfe51c  Warn about AliExpress ESP32-WROOM-32U bait-variant scam
 7a8517c  Scope to single-unit; add daily log for 2026-05-23
 c630416  Initial scaffolding: docs, BOM, architecture, SDR plan
 ```
+
+## 14b. Test totals (as of last commit)
+
+**74 unit + integration tests passing**:
+- 4 keeloq + 6 compustar + 9 obd2
+- 8 ads1115 + 6 cc1101 + 5 persistence
+- 12 controller + 9 integration
+- 6 esp32_link + 9 uart_listener
+
+CI runs all of them on Python 3.10 / 3.11 / 3.12 via
+`.github/workflows/tests.yml` on every push to main.
 
 ---
 

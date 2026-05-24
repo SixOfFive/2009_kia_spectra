@@ -2,15 +2,28 @@
 
 An in-car ESP32 + Raspberry Pi Zero 2 W unit that:
 
-- Monitors battery voltage continuously at sub-mA average draw
-- Triggers the factory-installed Compustar remote start when voltage drops below a configurable threshold
+- Monitors battery voltage continuously at sub-mA average draw (deep sleep)
+- Triggers the factory-installed Compustar remote start when voltage drops below a configurable threshold for a sustained period
 - Runs the engine for 15 minutes, then shuts it off
 - Streams live OBD-II data (RPM, speed, coolant, fuel, voltage, etc.) over CAN
-- Displays gauges + a map on a 5" touchscreen
+- Displays gauges + status on a 5" touchscreen
 - Exposes state to the home network via WiFi (web UI + MQTT)
-- Optional Bluetooth proximity tricks via phone
 
-The Compustar trigger is performed by software synthesis of the Keeloq rolling-code RF signal — the ESP32 plays the role of the FOB, allowing the in-car system to stay self-contained (FOB remains in the house).
+The Compustar trigger is performed by software synthesis of the KeeLoq rolling-code RF signal — the ESP32 plays the role of the FOB, allowing the in-car system to stay self-contained (FOB remains in the house).
+
+## Build status
+
+**Bench-ready software, awaiting parts.** As of the most recent commit:
+
+- 74 unit + integration tests passing across the project ([CI](.github/workflows/tests.yml) runs on every push)
+- All hardware-independent firmware written (KeeLoq cipher, HCS packet builder, OBD-II, UART protocol, state machine, drivers for CC1101 / ADS1115 / TWAI)
+- Pi-side daemon, dashboard, MQTT publisher, systemd unit, and provisioning script all written
+- Phase 1 (SDR walkthrough) and Phase 2 (bench-prototype docs) complete and reproducible
+- Deep-sleep + RTC-memory streak persistence wired into the controller
+
+Remaining work is hardware-bound: smoke-test each module on a breadboard, follow the SDR walkthrough to recover the KeeLoq device key from the FOB, then do the in-car Lock test before any Start attempt.
+
+Track day-by-day progress in [`logs/`](logs/).
 
 ## Hardware architecture
 
@@ -31,10 +44,10 @@ The Compustar trigger is performed by software synthesis of the Keeloq rolling-c
 
    ┌────────────────────────┐         ┌─────────────────────────┐
    │ ESP32-WROOM-32U        │ UART    │ Raspberry Pi Zero 2 W   │
-   │ - ADC voltage monitor  │◄───────►│ - 5" HDMI touch display │
-   │ - CC1101 RF transmit   │         │ - Web UI + maps         │
-   │ - SN65HVD230 CAN ↔ OBD │         │ - MQTT to home network  │
-   │ - WiFi + BT + deep slp │         │ - Logging to SD card    │
+   │ - ADS1115 voltage mon  │◄───────►│ - 5" HDMI touch display │
+   │ - CC1101 RF transmit   │  3-wire │ - Web UI + MQTT         │
+   │ - SN65HVD230 CAN ↔ OBD │  JSON   │ - Persistent logging    │
+   │ - Deep sleep <10 µA    │  115200 │ - chromium kiosk        │
    └────────────────────────┘         └─────────────────────────┘
               ▲                                  ▲
               │ CAN-H, CAN-L, GND, +12V         │ HDMI, USB (touch)
@@ -46,28 +59,39 @@ The Compustar trigger is performed by software synthesis of the Keeloq rolling-c
 
 | Directory | Contents |
 |---|---|
-| `docs/` | BOM, wiring diagrams, architecture notes, Compustar research |
-| `esp32/` | MicroPython firmware — voltage monitor, RF, CAN, comms |
-| `pi/` | Raspberry Pi Python application — UI, logging, MQTT, web |
-| `sdr/` | Tools and notes for SDR capture + Keeloq analysis |
+| `docs/` | BOM, architecture, Compustar research, reproduction walkthroughs (steps 08-12) |
+| `esp32/src/` | MicroPython firmware: controller state machine, drivers, KeeLoq + HCS, UART protocol |
+| `esp32/tests/` | CPython unit tests for all of the above (run without hardware) |
+| `pi/app/` | Pi daemon: shared STATE, UART listener, MQTT publisher, Flask dashboard |
+| `pi/systemd/` + `pi/setup/` | systemd service unit + `provision.sh` for fresh Pi setup |
+| `pi/tests/` | Pi-side unit tests |
+| `sdr/` | RTL-SDR capture walkthrough (steps 01-07), helper scripts, framing template |
 | `logs/` | Day-by-day build journal |
-
-## Build status
-
-Pre-prototype. Parts on order. Follow [`logs/`](logs/) for day-by-day progress.
+| `braindump.md` | Compaction-safe context dump for picking up where the last session left off |
 
 ## Reproducing this build
 
-This documentation describes a **single** unit. Parts list, wiring, and code are all single-unit. Build one and learn from it; scale to multiple if you have more vehicles.
+This documentation describes a **single** unit. The full path from "nothing" to "engine running on a voltage trigger":
 
-Start here:
+1. [`docs/BOM.md`](docs/BOM.md) — what to order (~$260 CAD per unit)
+2. [`docs/architecture.md`](docs/architecture.md) — how the pieces fit together
+3. [`docs/reproduce.md`](docs/reproduce.md) — the master walkthrough index
+4. Phase 1: [`sdr/README.md`](sdr/README.md) — capture and reverse-engineer the FOB
+5. Phase 2: [`docs/08-flash-micropython.md`](docs/08-flash-micropython.md) → [`docs/12-keeloq-bench-validation.md`](docs/12-keeloq-bench-validation.md) — bench prototype + first car test
+6. Phase 3-4: in-car install + polish (written as those phases happen)
 
-1. Read [`docs/BOM.md`](docs/BOM.md) — what to order
-2. Read [`docs/architecture.md`](docs/architecture.md) — how the pieces fit together
-3. Read [`docs/compustar-research.md`](docs/compustar-research.md) — what was learned about the installed remote start
-4. Follow [`sdr/README.md`](sdr/README.md) — the SDR capture + Keeloq reverse-engineering workflow
-5. Build out `esp32/` and `pi/` per their READMEs
+## Running the tests
+
+```powershell
+# ESP32 (firmware) tests — pure CPython, no hardware required
+for ($t = 0; $t -lt 1; $t++) { foreach ($f in Get-ChildItem esp32/tests/test_*.py) { python $f.FullName } }
+
+# Pi tests
+foreach ($f in Get-ChildItem pi/tests/test_*.py) { python $f.FullName }
+```
+
+Or just push — CI runs them across Python 3.10/3.11/3.12.
 
 ## License
 
-Personal project. Not licensed for redistribution yet — to be decided once it works.
+Personal project. Not licensed for redistribution yet — to be decided once it ships.

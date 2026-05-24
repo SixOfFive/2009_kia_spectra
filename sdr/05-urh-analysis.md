@@ -21,7 +21,7 @@ In the URH main window:
 1. **File → Import → Complex Signal**
 2. Select `sdr/captures/fob-start-001.bin`
 3. URH will ask about format:
-   - **Sample rate**: 2000000
+   - **Sample rate**: 2000000 (or 250000 if you fell back to that in step 04 — match whatever `rtl_sdr` was actually running at)
    - **Bandwidth**: leave default
    - **Data type**: select **"unsigned 8 bit"** (this is what `rtl_sdr` writes)
    - Carrier frequency: 433920000 (or your measured value)

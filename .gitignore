@@ -75,5 +75,9 @@ TODO.local.md
 notes.local.md
 .scratch/
 
+# History-scrub working directory — its replacements.txt and README
+# contain the leaked values literally. Must never be committed.
+tools/scrub-history/
+
 # Claude Code local settings (not shared)
 .claude/settings.local.json

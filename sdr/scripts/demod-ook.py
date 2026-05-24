@@ -250,8 +250,15 @@ def find_packets_in_runs(runs, te_samples, n_bits=66, verbose=False):
 
 def decode_bits_from_runs(runs, start_idx, n_bits=66):
     """
-    Starting at run index `start_idx`, decode `n_bits` PWM bits.
-    Each bit is a (high, low) pair: short+long = 0, long+short = 1.
+    Starting at run index `start_idx`, decode `n_bits` PWM bits via the
+    pair-ratio method. Each bit is a (high, low) pair: short+long = 0,
+    long+short = 1.
+
+    This is the simple/fast decoder. For FOBs whose encoding produces
+    near-equal (S,S) and (L,L) pulse pairs (Compustar 1WSHR-PRO observed),
+    it gives ~80% per-bit accuracy because the close ratios coin-flip on
+    noise. For those, prefer `decode_bits_from_envelope()` which uses
+    bit-clock recovery.
     """
     bits = []
     i = start_idx
@@ -267,6 +274,41 @@ def decode_bits_from_runs(runs, start_idx, n_bits=66):
         i += 2
     if len(bits) < n_bits:
         return bits, f"short: got {len(bits)} of {n_bits}"
+    return bits, None
+
+
+def decode_bits_from_envelope(ac_envelope, data_start_sample, te_samples, n_bits=66):
+    """
+    Decode `n_bits` PWM bits from the AC-coupled envelope using bit-clock
+    recovery. Each bit occupies 3*TE; we sample the envelope level at
+    offset 1.5*TE within each bit period:
+
+      - "0" bit: HIGH(TE) + LOW(2*TE)
+        At offset 1.5*TE we're 0.5*TE into the LOW portion → level LOW → bit 0
+      - "1" bit: HIGH(2*TE) + LOW(TE)
+        At offset 1.5*TE we're 0.5*TE-before-end into HIGH → level HIGH → bit 1
+
+    This is robust to small pulse-length variation since it samples the
+    signal level rather than measuring pulse widths.
+
+    :param ac_envelope: AC-coupled envelope (zero-centered, after LP filter)
+    :param data_start_sample: envelope-sample index where data begins
+    :param te_samples: TE in envelope samples (float ok)
+    :param n_bits: bits to decode
+    :return: (bits_list, error_or_None)
+    """
+    bit_period = 3 * te_samples
+    bits = []
+    # Average a small window around each sample point to reduce noise
+    window = max(1, int(te_samples * 0.3))
+    for i in range(n_bits):
+        center = data_start_sample + int(round(i * bit_period + 1.5 * te_samples))
+        lo = max(0, center - window // 2)
+        hi = min(len(ac_envelope), center + window // 2 + 1)
+        if lo >= len(ac_envelope):
+            return bits, f"short: got {len(bits)} of {n_bits} (ran past envelope)"
+        avg = sum(ac_envelope[lo:hi]) / max(1, hi - lo)
+        bits.append(1 if avg > 0 else 0)
     return bits, None
 
 
@@ -379,12 +421,26 @@ def demodulate(path, sample_rate=250_000, te_us=400, decimate_to=50_000,
         if verbose:
             print(f"  Packet candidates: {len(candidates)}")
 
+        # Build a cumulative-sum array of run lengths so we can convert
+        # a run-index into an envelope-sample-offset within `ac`.
+        run_offsets = [0]
+        for _, length in runs:
+            run_offsets.append(run_offsets[-1] + length)
+
         for pre_idx, data_idx, gap_len in candidates:
-            bits, err = decode_bits_from_runs(runs, data_idx, n_bits=n_bits)
+            data_start_sample = run_offsets[data_idx]
+            bits, err = decode_bits_from_envelope(
+                ac, data_start_sample, measured_te, n_bits=n_bits,
+            )
             if err and len(bits) < n_bits:
                 if verbose:
-                    print(f"    decode error: {err}")
-                continue
+                    print(f"    decode error (envelope): {err}")
+                # Fall back to pair-method decoder
+                bits, err2 = decode_bits_from_runs(runs, data_idx, n_bits=n_bits)
+                if err2 and len(bits) < n_bits:
+                    if verbose:
+                        print(f"    fallback also failed: {err2}")
+                    continue
             packets.append((bits, {
                 "burst_index": r_idx + 1,
                 "header_gap_samples": gap_len,

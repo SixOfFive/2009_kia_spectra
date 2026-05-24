@@ -21,7 +21,7 @@ Single unit. Prices in CAD as of 2026-05. Sourced from Amazon.ca where shipping 
 | 13 | 12V→5V buck converter, 5A | $10 | Main power conversion |
 | 14 | AO3401A P-MOSFET (logic-level) | $1 | Pi power gating (ESP32-controlled) |
 | 15 | Voltage divider parts + TVS SMBJ24CA + 10µF tantalum | $7 | ADC scaling + load-dump protection |
-| 16 | 1A blade fuse + inline fuse holder | $3 | Device-side overcurrent protection |
+| 16 | 2A ATM mini blade fuse + inline fuse holder | $3 | Device-side overcurrent protection (sized for ~700 mA peak + margin; see docs/13) |
 | 17 | OBD-II passive Y-splitter cable (dual-female) | $20 | Pass-through so scan tools still work |
 | 18 | OBD-II to bare-wire pigtail | $8 | Case-side connector with bare leads |
 | 19 | Hammond 1591ESBK ABS case, 150×80×50mm | $18 | Project enclosure |

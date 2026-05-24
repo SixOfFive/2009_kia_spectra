@@ -34,7 +34,7 @@ After your first month, you should expect roughly:
 | Auto-triggers per week (mild weather) | 0 - 1 | 2+ |
 | Auto-triggers per week (-20 °C cold snap) | 1 - 3 | 5+ |
 | False triggers (engine starts but no real low-V condition) | 0 | any |
-| MQTT publishes per day | ~2800 (state every 30s) + few events | 10x baseline |
+| MQTT publishes per day | ~8640 (state every 10s) + few events | 10x baseline |
 | `/var/log/vroom/*.log` daily growth | 2-10 MB | >50 MB |
 | Pi unscheduled reboots per month | 0 | 1+ |
 | ESP32 watchdog reboots per month | 0 - 3 | 5+ |
@@ -121,7 +121,7 @@ Then count:
 Expected:
 - 60 * 60 * 24 / `MQTT_PUBLISH_INTERVAL_S` state messages
 - Plus a handful of event messages per actual trigger cycle
-- For default `MQTT_PUBLISH_INTERVAL_S` = 30 s, that's ~2880 state
+- For default `MQTT_PUBLISH_INTERVAL_S` = 10 s, that's ~8640 state
   + ~5-10 events per cycle
 
 If the count is dramatically higher (10x+), something is publishing

@@ -1,78 +1,85 @@
 # Compustar system research notes
 
-What we've established about the factory-installed aftermarket remote start in the car.
+What we've established about the factory-installed aftermarket remote
+start in the car. This file is a snapshot of facts about the
+1WSHR-PRO FOB and its receiver brain. The protocol-level decisions
+that turn those facts into the firmware design live in
+[`sdr/analysis/framing.md`](../sdr/analysis/framing.md) (committed,
+public) and [`sdr/06-framing-extraction.md`](../sdr/06-framing-extraction.md).
 
 ## What's installed
 
 - **FOB:** Compustar 1WSHR-PRO (4-button, 1-way) — FCC ID **7087A-R762A433**
-- **RF frequency:** 433.92 MHz (inferred from FCC ID, to be confirmed by SDR sweep)
-- **Brain:** Unknown Compustar / Firstech CM-series module, tucked behind the dash near the driver-side ECU. Visible in install photo but label not readable without disassembly.
-- **Antenna:** Small black 3-LED windshield-mounted unit, top center of windshield. Cable runs back to the brain.
-- **Bypass cartridge:** Likely an iDatalink/Compustar BLADE-AL or similar — handles the Kia immobilizer challenge using a sacrificed chipped key inside the module.
+- **RF frequency:** 433.92 MHz nominal (per FCC filing). This specific FOB
+  measured at 433.886 MHz via `rtl_433 -A`; receivers tolerate hundreds of
+  kHz of offset so the nominal 433.92 figure works for transmit configuration.
+- **Brain:** Unknown Compustar / Firstech CM-series module, tucked behind
+  the dash near the driver-side ECU. Visible in install photo but label
+  not readable without disassembly.
+- **Antenna:** Small black 3-LED windshield-mounted unit, top center of
+  windshield. Cable runs back to the brain.
+- **Bypass cartridge:** Likely an iDatalink/Compustar BLADE-AL or similar —
+  handles the Kia immobilizer challenge using a sacrificed chipped key
+  inside the module.
 
 ## Why we don't need to identify the brain
 
-The original plan was to find the brain's hardwire start input. But since we can't safely access the brain without dash disassembly, we pivoted to RF synthesis — generate the Keeloq packet ourselves.
+The original plan was to find the brain's hardwire start input. We
+can't safely access the brain without dash disassembly, so we pivoted
+to RF synthesis — render the genuine FOB's packets ourselves and let
+the brain treat us as the remote.
 
-## Keeloq cipher status
+## Protocol discovery summary
 
-- Original Microchip HCS-family cipher, ~32-bit block, 64-bit key
-- **Academically broken** (Eisenträger et al., Eurocrypt 2008): practical key recovery in ~65 minutes data collection + 7.8 days on 64 cores
-- For owner-access scenarios (we have the FOB), the attack is dramatically easier — possibly direct EEPROM read of the HCS encoder chip in the FOB
+The original plan assumed the FOB used the standard Microchip
+HCS300/301 KeeLoq rolling-code protocol. **That turned out to be
+wrong.** SDR analysis cross-referenced against the rtl_433 project's
+`compustar_1wg3r.c` decoder confirmed:
 
-## Likely encoder chip in the 1WSHR-PRO
+- The 1WSHR-PRO belongs to the **Compustar 1WG3R fixed-code family**
+  (same family as 1WG3R-SH, 1WAMR-1900).
+- Modulation: OOK with symmetric PWM. Each bit is a `(HIGH_us, LOW_us)`
+  pulse pair where HIGH and LOW both vary per bit.
+- Per-bit timing (rtl_433 `-A` measured):
+  - "0" bit = HIGH ~732 µs + LOW ~1136 µs
+  - "1" bit = HIGH ~1100 µs + LOW ~756 µs
+  - sync = HIGH ~1476 µs + LOW ~1500 µs
+- Packet shape (this specific 1WSHR-PRO sub-variant): 3-sync-triplet
+  followed by 35 data bits, repeated ~8 times per button press.
+- **FIXED CODE.** Every press of a given button transmits the same
+  35-bit pattern on the wire. No rolling counter, no encryption, no
+  device key.
 
-- Microchip HCS300, HCS301, HCS361, or HCS362 (TBD — visual inspection of FOB internals will tell)
-- All are 8-pin SOIC, OOK modulation, PWM bit encoding
-- Standard transmission format:
-  - ~12 cycles preamble at TE rate
-  - Header gap (~10×TE)
-  - 32-bit encrypted hopping code
-  - 28-bit serial (fixed per FOB)
-  - 4-bit function code (which button)
-  - 2-bit status (V-low, repeat)
+So the firmware does not need a KeeLoq cipher, a device-key recovery
+path, or counter management. Capture each button's 35-bit pattern
+once via SDR, store it verbatim in `secrets.py`, and replay through
+the CC1101. See [`docs/12-bench-validation.md`](12-bench-validation.md)
+for the on-bench validation procedure.
 
-## Attack approach (in priority order)
+`keeloq.py` is retained in the firmware tree as a fallback for readers
+working with a Compustar variant that does use HCS-KeeLoq. See
+[`sdr/07-key-recovery.md`](../sdr/07-key-recovery.md) for that path.
 
-1. **SDR capture + framing analysis** (project-built `demod-ook.py`, no third-party deps)
-   - Confirm 433.92 MHz, confirm OOK, identify TE bit timing
-   - Capture multiple presses of each button — identify which bits are fixed (serial) vs hopping (encrypted) vs function code
-   - Stop here for documentation purposes if Step 2 not needed
+## RF transmission plan
 
-2. **Manufacturer-key database lookup** (no extra hardware)
-   - Flipper Zero "Unleashed" firmware has a published database of extracted manufacturer keys for many vendors
-   - If Compustar's manufacturer key is known: device_key = derive(manufacturer_key, FOB_serial)
-   - Quick win if it works
-
-3. **Direct EEPROM read of FOB encoder chip** (PICkit ~$30 — deferred)
-   - Open FOB, identify HCS300/301/361/362
-   - Connect PIC programmer, read EEPROM
-   - Extract device key, counter, serial directly
-   - Most reliable fallback
-
-## RF transmission plan (once we have the key)
-
-- CC1101 module configured for 433.92 MHz, OOK, baudrate matching the FOB's TE
-- ESP32 SPI master driving CC1101
-- MicroPython encoder runs Keeloq forward with stored device key + incrementing counter
-- Constructs full HCS packet, hands to CC1101 FIFO for transmission
-
-## Things to verify with SDR captures
-
-- [ ] Confirm exact frequency (sweep 433-434 MHz)
-- [ ] Confirm modulation (OOK expected)
-- [ ] Measure TE (bit period, expected ~400 µs)
-- [ ] Count bits in a single packet (expected 66)
-- [ ] Identify preamble length and pattern
-- [ ] Identify header gap length
-- [ ] Identify guard time between packets in a repeat burst
-- [ ] Extract 28-bit serial from constant bits across presses
-- [ ] Extract 4-bit function codes by comparing Start vs Lock vs Unlock captures
-- [ ] Confirm 32 bits of hopping code change every press
+- CC1101 module configured for 433.92 MHz OOK in async serial mode
+  (`init_433mhz_ook()` in `esp32/src/lib/cc1101.py`)
+- ESP32 SPI master + bit-bangs the GDO0 pin per the rendered
+  pulse train from `compustar.build_pulses_for_button()`
+- No FIFO, no packet engine — direct OOK pulse train control gives
+  microsecond-precise timing across the 700–1500 µs pulse range
 
 ## Why a thief can't exploit this
 
-- The brain validates Keeloq codes, but the car still requires the **mechanical key in the cylinder** to release the steering column lock
-- Without the steering lock released, the car can idle but cannot be driven
-- This is the same security model as factory remote start on modern cars
-- The system is no less secure than the existing FOB
+- The brain validates the on-air packet, but the car still requires
+  the **mechanical key in the cylinder** to release the steering
+  column lock
+- Without the steering lock released, the car can idle but cannot be
+  driven
+- This is the same security model as factory remote start on modern
+  cars — the system is no less secure than the existing FOB
+
+The captured 35-bit patterns are FOB-identifying values and live in
+`sdr/analysis/framing.local.md` (gitignored) — not the committed
+`framing.md`. They have the same security weight as the physical FOB:
+treat them as you'd treat your car keys.

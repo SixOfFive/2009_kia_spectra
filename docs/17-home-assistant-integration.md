@@ -32,7 +32,7 @@ The Pi's `vroom.service` publishes and subscribes on these topics
 
 | Topic | Direction | Payload | Cadence |
 |---|---|---|---|
-| `vroom/spectra/state` | Pi → broker | JSON snapshot of full state (battery V, RPM, run state, last-event, etc.) | every `MQTT_PUBLISH_INTERVAL_S` (default 30s), retained |
+| `vroom/spectra/state` | Pi → broker | JSON snapshot of full state (battery V, RPM, run state, last-event, etc.) | every `MQTT_PUBLISH_INTERVAL_S` (default 10s, see `pi/app/config.py`), retained |
 | `vroom/spectra/event` | Pi → broker | JSON of a discrete event (`low_voltage_trigger`, `engine_started`, `engine_stopped`, `shutdown_ack`, etc.) | on event, **not** retained |
 | `vroom/spectra/cmd` | broker → Pi | JSON command — see whitelist in [10 — Pi setup](10-pi-setup.md) step 6 | on demand |
 

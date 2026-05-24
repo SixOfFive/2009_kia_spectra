@@ -24,14 +24,14 @@ The principle: ESP32 is the always-on watchdog with real-time superpowers and mi
 
 - **Primary:** UART at 115200 baud, 3 wires (TX, RX, GND)
 - **Wake signal:** ESP32 GPIO → AO3401A P-MOSFET → gates 5V to Pi
-- **Shutdown coordination:** ESP32 sends `SHUTDOWN` over UART, Pi systemd service catches it and runs `shutdown -h now`, ESP32 waits 30s then cuts MOSFET
+- **Shutdown coordination:** ESP32 sends a `shutdown_pi` COMMAND over UART (constant `CMD_SHUTDOWN_PI` in both `pi_link.py` ends), Pi systemd service catches it and runs `shutdown -h now`, ESP32 waits `PI_SHUTDOWN_GRACE_S` (default 30s) then cuts MOSFET. Safety hard-cap at `RUN_DURATION_S + STOPPING_HARD_CAP_MULT * PI_SHUTDOWN_GRACE_S` force-cuts power if the Pi never acks.
 
 UART protocol: line-delimited JSON, one object per line at 115200 baud. Six message types (STATUS, OBD, EVENT, COMMAND, ACK, LOG) defined symmetrically in `esp32/src/lib/pi_link.py` and `pi/app/comms/esp32_link.py`. Cross-module constant parity is verified by `esp32/tests/test_integration.py`.
 
 ## Power architecture
 
 ```
-OBD-II Pin 16 (+12V, always-hot) ─── 1A fuse ─── TVS clamp ─── 5A buck ─── 5V rail
+OBD-II Pin 16 (+12V, always-hot) ─── 2A fuse ─── TVS clamp ─── 5A buck ─── 5V rail
                                                                             │
                                                   ┌─────────────────────────┼─────────────────────────┐
                                                   ▼                         ▼                         ▼
@@ -60,14 +60,14 @@ Average over a typical parked day with one trigger event: roughly 5-10 mAh from 
 
 ```
 t=0:00   Voltage hit threshold (e.g., 12.2V sustained 5 minutes)
-t=0:00   ESP32 fires Keeloq START packet via CC1101
+t=0:00   ESP32 fires Compustar START packet via CC1101 (captured fixed-code; see sdr/analysis/framing.md)
 t=0:00   ESP32 turns on MOSFET → Pi power on
 t=0:05   ESP32 sees alternator voltage rise on Pin 16 → start confirmed
 t=0:25   Pi finishes boot, opens UART to ESP32
 t=0:30   Pi posts "started, V was X.X" via MQTT
-t=15:00  ESP32 fires Keeloq STOP packet via CC1101
+t=15:00  ESP32 re-fires Compustar START packet via CC1101 (1WSHR-PRO uses same button to stop)
 t=15:05  ESP32 confirms engine off via voltage drop + CAN silence
-t=15:05  ESP32 sends SHUTDOWN over UART to Pi
+t=15:05  ESP32 sends shutdown_pi COMMAND over UART to Pi
 t=15:15  Pi halts cleanly
 t=15:45  ESP32 cuts MOSFET → Pi powerless
 t=15:45  ESP32 back to deep-sleep / 60-second polling cadence

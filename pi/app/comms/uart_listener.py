@@ -74,7 +74,7 @@ def dispatch(msg):
     elif mtype == esp32_link.TYPE_OBD:
         name = msg.get("name")
         if name is not None:
-            state.update_obd(name, msg.get("value"))
+            state.update_obd(name, msg.get("value"), ts_ms=msg.get("ts"))
             # Track peak values for the currently-open trip (if any).
             trip_log.update_peak(name, msg.get("value"))
 

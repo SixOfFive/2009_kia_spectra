@@ -22,31 +22,43 @@
     <div class="gauge gauge-large" id="gauge-voltage">
       <div class="label">Battery</div>
       <div class="value"><span id="v-battery">--</span><span class="units">V</span></div>
+      <svg class="sparkline" data-spark="control_module_voltage"
+           viewBox="0 0 60 18" preserveAspectRatio="none"></svg>
     </div>
 
     <div class="gauge" id="gauge-rpm">
       <div class="label">RPM</div>
       <div class="value"><span id="v-rpm">--</span></div>
+      <svg class="sparkline" data-spark="rpm"
+           viewBox="0 0 60 14" preserveAspectRatio="none"></svg>
     </div>
 
     <div class="gauge" id="gauge-speed">
       <div class="label">Speed</div>
       <div class="value"><span id="v-speed">--</span><span class="units">km/h</span></div>
+      <svg class="sparkline" data-spark="speed"
+           viewBox="0 0 60 14" preserveAspectRatio="none"></svg>
     </div>
 
     <div class="gauge" id="gauge-coolant">
       <div class="label">Coolant</div>
       <div class="value"><span id="v-coolant">--</span><span class="units">&deg;C</span></div>
+      <svg class="sparkline" data-spark="coolant_temp"
+           viewBox="0 0 60 14" preserveAspectRatio="none"></svg>
     </div>
 
     <div class="gauge" id="gauge-throttle">
       <div class="label">Throttle</div>
       <div class="value"><span id="v-throttle">--</span><span class="units">%</span></div>
+      <svg class="sparkline" data-spark="throttle_position"
+           viewBox="0 0 60 14" preserveAspectRatio="none"></svg>
     </div>
 
     <div class="gauge" id="gauge-fuel">
       <div class="label">Fuel</div>
       <div class="value"><span id="v-fuel">--</span><span class="units">%</span></div>
+      <svg class="sparkline" data-spark="fuel_level"
+           viewBox="0 0 60 14" preserveAspectRatio="none"></svg>
     </div>
   </section>
 

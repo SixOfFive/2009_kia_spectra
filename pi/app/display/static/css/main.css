@@ -118,6 +118,39 @@ main {
   font-size: 28px;
 }
 
+/* Inline 60-sample sparkline at the bottom of each gauge tile.
+ * Pure SVG with vector-effect non-scaling-stroke so the line stays
+ * crisp regardless of how preserveAspectRatio scales it. */
+.sparkline {
+  width: 100%;
+  height: 18px;
+  margin-top: 4px;
+  display: block;
+}
+
+.gauge-large .sparkline { height: 28px; }
+
+.sparkline .spark-line {
+  fill: none;
+  stroke: #4ade80;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.sparkline .spark-dot {
+  fill: #4ade80;
+}
+
+.sparkline .spark-empty {
+  fill: none;
+  stroke: #2d3640;
+  stroke-width: 1;
+  stroke-dasharray: 2 2;
+  vector-effect: non-scaling-stroke;
+}
+
 .controls {
   display: flex;
   gap: 8px;

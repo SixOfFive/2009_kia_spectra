@@ -80,6 +80,59 @@ function render(state) {
   els.uptime.textContent     = `Uptime: ${fmtUptime(state.uptime_s)}`;
 
   renderEvents(state.events || []);
+  renderSparklines(state.obd_history || {});
+}
+
+// ----- Sparklines (pure SVG, no library) -----
+
+// Cache the SVG elements once; the dashboard layout is static.
+const _sparkEls = Array.from(document.querySelectorAll('svg[data-spark]'));
+
+function renderSparklines(history) {
+  for (const svg of _sparkEls) {
+    const pid = svg.dataset.spark;
+    const samples = history[pid] || [];
+    svg.innerHTML = sparkSvgInner(samples, svg);
+  }
+}
+
+function sparkSvgInner(samples, svg) {
+  // viewBox is "0 0 W H"; pull width/height from the attribute so each
+  // tile can size independently (gauge-large has a taller sparkline).
+  const vb = (svg.getAttribute('viewBox') || '0 0 60 14').split(/\s+/).map(Number);
+  const W = vb[2] || 60;
+  const H = vb[3] || 14;
+
+  if (!samples.length) {
+    // Dotted baseline placeholder so the tile doesn't visually collapse.
+    return `<line class="spark-empty" x1="0" y1="${H/2}" x2="${W}" y2="${H/2}"/>`;
+  }
+
+  const values = samples.map(s => s[1]);
+  let lo = Math.min(...values);
+  let hi = Math.max(...values);
+  // Flat data: pad the range so the line draws mid-tile rather than
+  // jumping to an edge after the first divide-by-zero would otherwise.
+  if (hi - lo < 1e-9) {
+    const pad = Math.abs(hi) > 1 ? Math.abs(hi) * 0.05 : 1;
+    lo -= pad;
+    hi += pad;
+  }
+  const n = samples.length;
+  const xStep = n > 1 ? W / (n - 1) : 0;
+  const pts = samples.map((s, i) => {
+    const x = i * xStep;
+    // Invert Y because SVG (0,0) is top-left.
+    const y = H - ((s[1] - lo) / (hi - lo)) * H;
+    return `${x.toFixed(1)},${y.toFixed(2)}`;
+  });
+  const lastX = (n - 1) * xStep;
+  const lastY = H - ((values[n - 1] - lo) / (hi - lo)) * H;
+
+  return (
+    `<polyline class="spark-line" points="${pts.join(' ')}"/>` +
+    `<circle class="spark-dot" cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(2)}" r="1.4"/>`
+  );
 }
 
 function renderEvents(events) {

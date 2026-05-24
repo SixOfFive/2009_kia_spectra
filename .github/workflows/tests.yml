@@ -1,0 +1,56 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Flask (needed for server smoke test)
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask
+
+      - name: Run ESP32 unit tests
+        run: |
+          for t in esp32/tests/test_*.py; do
+            echo "::group::$t"
+            python "$t"
+            echo "::endgroup::"
+          done
+
+      - name: Run Pi unit tests
+        run: |
+          for t in pi/tests/test_*.py; do
+            echo "::group::$t"
+            python "$t"
+            echo "::endgroup::"
+          done
+
+      - name: Smoke-test Flask routes
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from pi.app.display import server
+          c = server.app.test_client()
+          assert c.get('/api/state').status_code == 200
+          assert c.post('/api/command', json={'cmd':'ping'}).status_code == 503
+          assert c.post('/api/command', json={'cmd':'bogus'}).status_code == 400
+          print('Flask routes OK')
+          "

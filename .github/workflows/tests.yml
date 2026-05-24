@@ -42,6 +42,14 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Run SDR unit tests (synth + round-trip)
+        run: |
+          for t in sdr/tests/test_*.py; do
+            echo "::group::$t"
+            python "$t"
+            echo "::endgroup::"
+          done
+
       - name: Smoke-test Flask routes
         run: |
           python -c "

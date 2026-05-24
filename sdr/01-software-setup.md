@@ -27,12 +27,24 @@ Windows ships with a default USB driver that **does not** let userspace tools co
 
 ### Install rtl-sdr command-line tools
 
-```powershell
-# Using the prebuilt Windows binaries from the original osmocom build
-# Download from:
-#   https://github.com/osmocom/rtl-sdr/releases  (release ZIPs include the binaries)
-# Extract to e.g. C:\rtl-sdr\ and add C:\rtl-sdr\x64\ to your PATH
-```
+Pre-built Windows binaries (NOT on the osmocom GitHub mirror — that
+repo has no Releases. Use one of these instead):
+
+- **Official osmocom builds** (fresh, weekly updates):
+  https://ftp.osmocom.org/binaries/windows/rtl-sdr/
+
+  Download `rtl-sdr-64bit-YYYYMMDD.zip` (most recent date). The 32-bit
+  variant is also there if you're on a 32-bit Windows install (rare).
+
+- **RTL-SDR Blog fork releases on GitHub** (signed Windows release,
+  includes Zadig, slightly older but well-tested):
+  https://github.com/rtlsdrblog/rtl-sdr-blog/releases
+
+  Pick the latest `Release.zip`. Works fine with generic R820T2 dongles
+  (Vomeko, NESDR, etc.) — not just the Blog V4 hardware.
+
+Either way: extract to e.g. `C:\rtl-sdr\` and add the bin path (or `x64\`
+subfolder, depending on which fork) to your PATH.
 
 Verify with PowerShell:
 

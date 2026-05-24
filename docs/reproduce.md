@@ -39,15 +39,15 @@ the build. The repo grows along with the project.
 - [ ] [11 — Wire ESP32 ↔ Pi UART link](11-uart-link.md)
 - [ ] [12 — Compustar bench validation + first car Lock test](12-bench-validation.md)
 
-## Phase 3 — In-car install — WIP
+## Phase 3 — In-car install
 
-- [ ] 13 — Wire to the OBD-II port (Y-splitter + pigtail)
-- [ ] 14 — Mount the case and run the display ribbon to the dash
-- [ ] 15 — First live trigger (manual, parked, hood open)
-- [ ] 16 — First voltage-triggered auto-start
+- [ ] [13 — Wire to the OBD-II port (Y-splitter + pigtail)](13-obd2-install.md)
+- [ ] [14 — Mount the case and run the display ribbon to the dash](14-case-mounting.md)
+- [ ] [15 — First live trigger (manual, parked, hood open)](15-first-trigger.md)
+- [ ] [16 — First voltage-triggered auto-start](16-first-auto-start.md)
 
-## Phase 4 — Polish — WIP
+## Phase 4 — Polish
 
-- [ ] 17 — Home network monitoring (MQTT to Home Assistant)
-- [ ] 18 — Long-term stability tests
-- [ ] 19 — Cellular alerting (optional)
+- [ ] [17 — Home Assistant integration (MQTT entities + Lovelace + alerts)](17-home-assistant-integration.md)
+- [ ] [18 — Long-term stability tests](18-long-term-stability.md)
+- [ ] [19 — Cellular alerting (optional sketch)](19-cellular-alerting.md)

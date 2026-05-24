@@ -108,14 +108,33 @@ you already use):
 
    ```powershell
    py -3.13 -m pip install --user urh
-   py -3.13 -m urh
    ```
 
    This grabs the prebuilt `urh-2.10.0-cp313-cp313-win_amd64.whl` —
    no compilation needed.
 
+3. Launch URH. `pip install --user` puts script wrappers in your per-user
+   Scripts directory which is NOT on PATH by default. Either run by
+   full path:
+
+   ```powershell
+   C:\Users\<you>\AppData\Roaming\Python\Python313\Scripts\urh.exe
+   ```
+
+   …or add that Scripts directory to PATH once (admin PowerShell):
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Users\$env:USERNAME\AppData\Roaming\Python\Python313\Scripts", "User")
+   ```
+
+   Then in a new terminal, plain `urh` works.
+
+   **Note:** `py -3.13 -m urh` does NOT work — URH is a setuptools script
+   entry point, not a runnable module. Trying it fails with
+   `'urh' is a package and cannot be directly executed`.
+
 (Linux ships wheels for Python 3.10-3.14 — no Python-version juggling
-required.)
+required; just `pip install --user urh` then `urh` will be on `~/.local/bin`.)
 
 Launch URH once to confirm — a GUI window should open. Close it; we'll
 come back to it in step 05.

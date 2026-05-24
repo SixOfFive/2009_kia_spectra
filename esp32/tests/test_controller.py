@@ -101,29 +101,63 @@ def test_normal_voltage_does_not_trigger():
     ctrl, _, radio, _, _ = _make_ctrl(voltage=13.0 / 4.0)  # 13V battery / 4:1 divider
     ctrl._monitor_step()
     assert ctrl.state == State.MONITORING
-    assert ctrl.low_v_streak_start is None
+    assert ctrl.low_v_count == 0
     assert len(radio.bursts) == 0
 
 
+def test_normal_voltage_resets_streak():
+    ctrl, adc, _, _, _ = _make_ctrl(voltage=12.0 / 4.0)
+    # Accumulate a partial streak
+    for _ in range(3):
+        ctrl._monitor_step()
+    assert ctrl.low_v_count == 3
+    # Now voltage recovers
+    adc.voltage = 13.5 / 4.0
+    ctrl._monitor_step()
+    assert ctrl.low_v_count == 0
+    assert ctrl.state == State.MONITORING
+
+
 def test_sustained_low_voltage_triggers_start():
+    # LOW_V_SUSTAIN_S / WAKE_INTERVAL_S = 300 / 60 = 5 samples needed
     ctrl, _, radio, uart, pi_power = _make_ctrl(voltage=12.0 / 4.0)
-    # Force monotonic time to advance by mocking _now
-    times = iter([0, 60, 120, 180, 240, 300, 360, 420, 480, 540])
-    ctrl._now = lambda: next(times)
-    # Drive multiple monitor cycles: needs WAKE_INTERVAL_S between samples
-    for _ in range(8):
+    samples_needed = ctrl._samples_needed()
+    assert samples_needed == 5
+    for i in range(samples_needed):
         ctrl._monitor_step()
         if ctrl.state == State.STARTING:
             break
     assert ctrl.state == State.STARTING
     assert pi_power.value() == 0       # Pi powered on
-    assert len(radio.bursts) == 1      # one RF burst
+    assert len(radio.bursts) == 1
     assert radio.bursts[0]["repeats"] == 4
-    # An EVENT_LOW_VOLTAGE_TRIGGER and an EVENT_KEELOQ_TX should be in sent
+    # Streak reset after trigger (otherwise we'd immediately re-trigger after cooldown)
+    assert ctrl.low_v_count == 0
     events = [m for m in uart.sent if m["type"] == "EVENT"]
     event_names = [m["event"] for m in events]
     assert "low_voltage_trigger" in event_names
     assert "keeloq_tx" in event_names
+
+
+def test_one_short_low_then_recovery_does_not_trigger():
+    ctrl, adc, radio, _, _ = _make_ctrl(voltage=12.0 / 4.0)
+    ctrl._monitor_step()                   # 1 low sample
+    adc.voltage = 13.0 / 4.0
+    for _ in range(10):                    # 10 high samples — streak stays 0
+        ctrl._monitor_step()
+    assert ctrl.state == State.MONITORING
+    assert ctrl.low_v_count == 0
+    assert len(radio.bursts) == 0
+
+
+def test_cooldown_clears_streak_and_returns_to_monitoring():
+    ctrl, _, _, _, _ = _make_ctrl()
+    ctrl.state = State.COOLDOWN
+    ctrl.last_trigger_ts = -ctrl.cfg.START_COOLDOWN_S - 1   # cooldown already elapsed
+    ctrl.low_v_count = 99   # stale
+    ctrl._cooldown_step()
+    assert ctrl.state == State.MONITORING
+    assert ctrl.low_v_count == 0
 
 
 def test_counter_increments_and_persists():

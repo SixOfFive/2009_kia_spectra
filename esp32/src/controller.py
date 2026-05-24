@@ -10,15 +10,27 @@ State transitions:
         │                                                          ▼
     COOLDOWN ◀────Pi shutdown grace, MOSFET off──── STOPPING ◀──RF stop sent
 
-  - MONITORING: Pi off, ESP32 samples battery V every WAKE_INTERVAL_S
+  - MONITORING: Pi off, ESP32 deep-sleeps WAKE_INTERVAL_S between samples
   - STARTING:   Pi powered on, Start RF packet transmitted
   - RUNNING:    OBD polling, status broadcast to Pi via UART
   - STOPPING:   Stop RF packet, shutdown command sent to Pi
   - COOLDOWN:   no new triggers for START_COOLDOWN_S after a run
 
-Persistent state in flash (counter). Volatile state (low-V streak, run
-duration timers) is in RAM — fine since we don't deep-sleep during the
-critical phases. Deep-sleep optimization for MONITORING is a future TODO.
+Persistence:
+  - Compustar rolling counter in a flash JSON file (survives power loss)
+  - Consecutive-low-voltage sample count in RTC memory via lib.persistence
+    (survives deep sleep, NOT power loss — fresh boot starts at 0)
+
+Deep sleep behavior:
+  - In MONITORING, after each sample the controller calls machine.deepsleep
+    for WAKE_INTERVAL_S * 1000 ms. The board resets on wake and the
+    streak is reloaded from RTC. Average current drops from ~80 mA awake
+    to <10 µA between samples.
+  - In all other states the Pi is on and we need UART comms, so we just
+    sleep_ms in a tight loop (no deep sleep).
+  - Trade-off: manual remote-start from the dashboard requires the ESP32
+    to be awake, which it only is briefly between deep-sleep cycles or
+    once a trigger has fired. By design — primary mode is voltage-trigger.
 
 Pi-side commands accepted via UART:
   - start_engine: manual trigger from dashboard
@@ -33,10 +45,10 @@ mocked hardware.
 
 import json
 
-from lib import pi_link
+from lib import pi_link, persistence
 
 try:
-    from machine import Pin, UART  # noqa: F401
+    from machine import Pin, UART, deepsleep  # noqa: F401
     import time
     _MICROPYTHON = True
 except ImportError:
@@ -50,6 +62,9 @@ except ImportError:
         def value(self, v=None):
             if v is None: return self._v
             self._v = int(v)
+
+    def deepsleep(ms):  # noqa
+        pass
 
     class _Time:
         def time(self): return 0
@@ -96,13 +111,18 @@ class VroomController:
         self.counter = self._load_counter()
         self.last_trigger_ts = 0
         self.state = State.MONITORING
-        self.low_v_streak_start = None
+        # Sample-based streak counter survives deep sleep via RTC memory.
+        # Each MONITORING tick samples once; if V is low we increment, else reset.
+        # Trigger fires when low_v_count * WAKE_INTERVAL_S >= LOW_V_SUSTAIN_S.
+        self.low_v_count = persistence.load_streak()
         self.run_start_ts = None
         self.stop_grace_until = None
         self.last_voltage = None
-        self.last_voltage_sample_ts = 0
         self.last_obd_poll_ts = 0
         self.obd_values = {}
+        # Whether the most recent _monitor_step just sampled (used by run()
+        # to decide whether to deep-sleep before the next tick).
+        self._just_sampled = False
 
     # ----- Persistent counter (Compustar rolling code) -----
 
@@ -176,26 +196,32 @@ class VroomController:
         adc_v = self.adc.read_voltage()
         battery_v = adc_v * self.cfg.ADC_DIVIDER_RATIO + self.cfg.ADC_CALIBRATION_OFFSET
         self.last_voltage = battery_v
-        self.last_voltage_sample_ts = self._now()
         return battery_v
+
+    def _samples_needed(self):
+        """How many consecutive low samples constitute a sustained low-V condition."""
+        wake = max(1, int(self.cfg.WAKE_INTERVAL_S))
+        return max(1, int(self.cfg.LOW_V_SUSTAIN_S // wake))
 
     # ----- State machine steps -----
 
     def _monitor_step(self):
-        now = self._now()
-        if now - self.last_voltage_sample_ts < self.cfg.WAKE_INTERVAL_S:
-            return
         v = self._read_battery_v()
-        self._log("V=%0.2f streak=%s" % (v, self.low_v_streak_start))
-        self.uart.send(pi_link.status(v, self.state, counter=self.counter))
+        self._just_sampled = True
+        self._log("V=%0.2f count=%d/%d" % (v, self.low_v_count, self._samples_needed()))
 
         if v < self.cfg.LOW_V_TRIGGER:
-            if self.low_v_streak_start is None:
-                self.low_v_streak_start = now
-            elif now - self.low_v_streak_start >= self.cfg.LOW_V_SUSTAIN_S:
-                self._trigger_start("low_voltage")
+            self.low_v_count += 1
         else:
-            self.low_v_streak_start = None
+            self.low_v_count = 0
+        persistence.save_streak(self.low_v_count)
+
+        # Pi is off in MONITORING, so this status message goes nowhere on hardware.
+        # Still emit for log visibility when debugging via the dev dashboard.
+        self.uart.send(pi_link.status(v, self.state, counter=self.counter))
+
+        if self.low_v_count >= self._samples_needed():
+            self._trigger_start("low_voltage")
 
     def _starting_step(self):
         # transmit already happened during _trigger_start; just advance state.
@@ -231,7 +257,8 @@ class VroomController:
     def _cooldown_step(self):
         if self._now() - self.last_trigger_ts >= self.cfg.START_COOLDOWN_S:
             self.state = State.MONITORING
-            self.low_v_streak_start = None
+            self.low_v_count = 0
+            persistence.clear_streak()
 
     # ----- High-level transitions -----
 
@@ -242,6 +269,9 @@ class VroomController:
             pi_link.EVENT_LOW_VOLTAGE_TRIGGER,
             reason=reason, voltage=self.last_voltage,
         ))
+        # Clear the streak so we don't immediately re-trigger after the run.
+        self.low_v_count = 0
+        persistence.clear_streak()
         self.state = State.STARTING
         self._power_on_pi()
         from lib import compustar
@@ -310,6 +340,7 @@ class VroomController:
 
     def tick(self):
         """One pass through the state machine. Call repeatedly from run()."""
+        self._just_sampled = False
         if self.state == State.MONITORING:
             self._monitor_step()
         elif self.state == State.STARTING:
@@ -324,16 +355,29 @@ class VroomController:
 
     def run(self, tick_ms=100):
         """Main loop. Returns only on unhandled exception or in CPython mode."""
-        self._log("controller starting in state=%s" % self.state)
+        self._log("controller starting in state=%s (low_v_count=%d, wake_reason=%s)" % (
+            self.state, self.low_v_count,
+            "deep_sleep" if persistence.was_deep_sleep_wake() else "cold_boot",
+        ))
         while True:
             try:
                 self.tick()
             except Exception as e:
                 self._log("ERROR in tick: %s" % e)
-            if _MICROPYTHON:
-                time.sleep_ms(tick_ms)
-            else:
+
+            if not _MICROPYTHON:
                 return
+
+            # If we just took a MONITORING sample and didn't trigger, deep-sleep
+            # until the next sample interval. Board resets on wake; we'll
+            # reload low_v_count from RTC memory at the top of run().
+            if self.state == State.MONITORING and self._just_sampled:
+                wake_ms = max(1, int(self.cfg.WAKE_INTERVAL_S * 1000))
+                self._log("deep sleep %d ms" % wake_ms)
+                deepsleep(wake_ms)
+                # deepsleep does not return; the line below is unreachable on real hardware.
+
+            time.sleep_ms(tick_ms)
 
     # ----- Helpers -----
 

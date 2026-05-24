@@ -5,7 +5,6 @@ Tests for the Flask dashboard endpoints — specifically the new
 We use Flask's test_client so no socket gets bound. The ESP32 link is
 swapped out for a recording fake via state.set_link().
 """
-import json
 import os
 import sys
 

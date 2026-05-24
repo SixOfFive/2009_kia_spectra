@@ -144,7 +144,7 @@ def main():
             print(f"  Most common button codes: "
                   f"{[(f'0x{b:02X}', c) for b, c in buttons.most_common(3)]}")
         else:
-            print(f"  No valid packets at any offset")
+            print("  No valid packets at any offset")
 
 
 if __name__ == "__main__":

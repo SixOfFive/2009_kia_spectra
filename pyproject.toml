@@ -1,0 +1,62 @@
+# Project metadata + tool configuration for the vroom repo.
+#
+# This project doesn't ship as an installable Python package — the
+# ESP32 firmware runs on MicroPython on-device, the Pi-side app runs
+# as a systemd service, and the SDR helpers are standalone scripts. So
+# this file mostly exists to give linting and tooling a home.
+#
+# Run the linter locally:
+#
+#     python -m pip install ruff
+#     python -m ruff check .
+#
+# CI runs ruff on every push (see .github/workflows/tests.yml).
+
+[project]
+name = "vroom"
+version = "0.1.0"
+description = "Voltage-triggered remote start for a 2009 Kia Spectra (ESP32 + Pi)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "SixOfFive" },
+]
+
+[tool.ruff]
+# Match the codebase's existing soft line-length convention. Many lines
+# exceed 88 in places that are deliberate (long URL comments, etc.) —
+# ruff's E501 ruleset is opt-in below and we exclude it from CI.
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    ".claude",                      # agent worktrees + local settings
+    "sdr/captures",                 # raw IQ binary files (gitignored anyway)
+    "esp32/src/secrets.py",         # user-created, gitignored
+    "esp32/src/secrets.py.example", # template with placeholder values
+]
+
+[tool.ruff.lint]
+# Conservative ruleset: catch real bugs (F) without imposing style on a
+# personal-scale project.
+#
+#   F  = pyflakes (undefined names, unused imports, etc. — bugs)
+#   E9 = pycodestyle SYNTAX errors only (not stylistic E1xx-E8xx)
+#   W6 = deprecated invalid-escape-sequence warnings
+#
+# To opt into stricter checks (style, sorting, complexity) someday:
+#
+#   select = ["E", "W", "F", "I", "B", "UP"]
+select = ["F", "E9", "W6"]
+
+# These files use `sys.path.insert(0, ...)` before importing — the
+# resulting "import not at top of file" warning (E402) is intentional
+# and is already annotated `# noqa: E402` in the source where needed.
+# F401 (unused import) is sometimes legitimate inside the
+# CPython-fallback try/except blocks in the MicroPython libs.
+[tool.ruff.lint.per-file-ignores]
+"esp32/src/lib/cc1101.py" = ["F401"]
+"esp32/src/controller.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pi", "esp32", "sdr"]

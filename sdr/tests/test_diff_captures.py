@@ -55,7 +55,7 @@ def test_single_bit_flip_fails():
         a = os.path.join(tmp, "a.bin"); _write(a_bits, a)
         b = os.path.join(tmp, "b.bin"); _write(b_bits, b)
         out, rc = _diff(a, b)
-        assert rc != 0, f"expected FAIL, got rc=0"
+        assert rc != 0, "expected FAIL, got rc=0"
         assert "FAIL" in out
         # The differing bit is at position 34 (zero-indexed) — last bit
         assert "34" in out, f"expected mismatch position in output:\n{out}"

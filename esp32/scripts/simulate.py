@@ -194,7 +194,7 @@ def scenario_long_idle(args):
         if ctrl.state != State.MONITORING:
             print(f"\n>>> UNEXPECTED TRIGGER after {i+1} samples")
             return
-    print(f"\n>>> good: stayed in MONITORING for 20 alternating samples")
+    print("\n>>> good: stayed in MONITORING for 20 alternating samples")
     print(f">>> low_v_count = {ctrl.low_v_count}")
     print(f">>> RF bursts: {len(radio.bursts)} (expected 0)")
 

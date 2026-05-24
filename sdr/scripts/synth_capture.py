@@ -42,7 +42,6 @@ Library
 """
 
 import argparse
-import os
 import random
 import sys
 

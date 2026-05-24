@@ -62,7 +62,7 @@ def main():
 
     runs = runs_from_positions(diffs)
     print(f"Differing positions: {diffs}")
-    print(f"Contiguous runs:")
+    print("Contiguous runs:")
     for start, end in runs:
         width = end - start + 1
         print(f"  {start:3d}..{end:3d}  ({width} bit{'s' if width > 1 else ''})")

@@ -32,7 +32,6 @@ the conclusions in framing.local.md (gitignored).
 """
 import argparse
 import glob
-import os
 import re
 import sys
 from collections import defaultdict

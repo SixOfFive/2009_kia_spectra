@@ -42,7 +42,6 @@ Usage:
     python sdr/scripts/demod-compustar.py path.bin --short-us 708 --long-us 1076
 """
 import argparse
-import math
 import os
 import sys
 

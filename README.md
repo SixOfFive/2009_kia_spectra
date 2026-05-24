@@ -81,17 +81,26 @@ This documentation describes a **single** unit. The full path from "nothing" to 
 5. Phase 2: [`docs/08-flash-micropython.md`](docs/08-flash-micropython.md) → [`docs/12-bench-validation.md`](docs/12-bench-validation.md) — bench prototype + first car test
 6. Phase 3-4: in-car install + polish (written as those phases happen)
 
-## Running the tests
+## Running the tests + linter
 
 ```powershell
 # ESP32 (firmware) tests — pure CPython, no hardware required
-for ($t = 0; $t -lt 1; $t++) { foreach ($f in Get-ChildItem esp32/tests/test_*.py) { python $f.FullName } }
+foreach ($f in Get-ChildItem esp32/tests/test_*.py) { python $f.FullName }
 
 # Pi tests
 foreach ($f in Get-ChildItem pi/tests/test_*.py) { python $f.FullName }
+
+# SDR tests — synth-driven round-trips through the demod pipeline
+foreach ($f in Get-ChildItem sdr/tests/test_*.py) { python $f.FullName }
+
+# Lint (catches real bugs — unused imports, undefined names, etc.)
+python -m pip install ruff
+python -m ruff check .
 ```
 
-Or just push — CI runs them across Python 3.10/3.11/3.12.
+Or just push — CI runs tests + lint across Python 3.10/3.11/3.12. See
+[`pyproject.toml`](pyproject.toml) for the ruff config (conservative
+ruleset: `F`, `E9`, `W6`).
 
 ## License
 

@@ -115,7 +115,7 @@ def main():
 
     print()
     if pat_a == pat_b:
-        print(f"PASS  captures match — 35 bits identical")
+        print("PASS  captures match — 35 bits identical")
         return 0
     else:
         n_diff = sum(1 for x, y in zip(pat_a, pat_b) if x != y)

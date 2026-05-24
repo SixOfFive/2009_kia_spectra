@@ -85,59 +85,28 @@ batch / clone source:
 Both work for our use case. `rtl_test` prints which one you have on the
 `Found Rafael Micro ... tuner` line.
 
-### Install Universal Radio Hacker
+### Universal Radio Hacker (optional)
+
+URH is a GUI for SDR signal analysis. **You don't need it** — this
+project's own `sdr/scripts/demod-ook.py` (Python stdlib, no dependencies)
+does the same demodulation step headlessly. URH is useful for visual
+inspection if you want it but is no longer required.
+
+If you want URH anyway, the Windows install is annoying because URH 2.10
+publishes prebuilt wheels for cp313-win_amd64 only — meaning Python 3.13
+specifically. Install Python 3.13 alongside whatever else you have, then:
 
 ```powershell
-pip install --user urh
+py -3.13 -m pip install --user urh
+C:\Users\<you>\AppData\Roaming\Python\Python313\Scripts\urh.exe
 ```
 
-**Python version gotcha (Windows)**: as of URH 2.10.0, the ONLY Windows
-wheel on PyPI is `cp313-win_amd64` — i.e. Python **3.13** only. Trying
-to install URH on Windows under Python 3.10, 3.11, 3.12, or 3.14 falls
-back to a source build that requires both Cython and MSVC Build Tools;
-even with both installed it often still fails.
+(`py -3.13 -m urh` does NOT work — URH is a setuptools entry point script,
+not a runnable module.)
 
-The clean fix is to install Python 3.13 alongside your existing Python
-(other tooling — Thonny, our test suite — can stay on whatever version
-you already use):
+For our walkthrough you can skip this entirely.
 
-1. Install [Python 3.13](https://www.python.org/downloads/release/python-3137/).
-   **Uncheck** "Add to PATH" during install so it doesn't shadow your
-   default Python.
-2. Use the Python launcher to target 3.13 explicitly:
-
-   ```powershell
-   py -3.13 -m pip install --user urh
-   ```
-
-   This grabs the prebuilt `urh-2.10.0-cp313-cp313-win_amd64.whl` —
-   no compilation needed.
-
-3. Launch URH. `pip install --user` puts script wrappers in your per-user
-   Scripts directory which is NOT on PATH by default. Either run by
-   full path:
-
-   ```powershell
-   C:\Users\<you>\AppData\Roaming\Python\Python313\Scripts\urh.exe
-   ```
-
-   …or add that Scripts directory to PATH once (admin PowerShell):
-
-   ```powershell
-   [Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Users\$env:USERNAME\AppData\Roaming\Python\Python313\Scripts", "User")
-   ```
-
-   Then in a new terminal, plain `urh` works.
-
-   **Note:** `py -3.13 -m urh` does NOT work — URH is a setuptools script
-   entry point, not a runnable module. Trying it fails with
-   `'urh' is a package and cannot be directly executed`.
-
-(Linux ships wheels for Python 3.10-3.14 — no Python-version juggling
-required; just `pip install --user urh` then `urh` will be on `~/.local/bin`.)
-
-Launch URH once to confirm — a GUI window should open. Close it; we'll
-come back to it in step 05.
+No GUI to launch — the demodulation in step 05 is a Python CLI tool.
 
 ## Linux (Debian / Ubuntu / Raspberry Pi OS)
 
@@ -166,24 +135,25 @@ rtl_test -t
 
 ```bash
 brew install librtlsdr
-pip3 install --user urh
 ```
 
 `brew` handles the driver situation transparently — no equivalent of Zadig needed.
+URH (optional GUI) is `pip3 install --user urh` on macOS but again, our walkthrough
+uses the Python CLI demodulator and doesn't need URH.
 
 ## What you should have when done
 
 - `rtl_test`, `rtl_sdr`, `rtl_power`, `rtl_fm` commands available in your shell
-- `urh` command available, opens a GUI window
 - Dongle blinks an LED (if it has one) when plugged in
+- Python 3.x available for the demodulator script
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
 | `rtl_test`: "No supported devices found" | Windows: redo Zadig. Linux: blacklist DVB drivers + replug. |
-| `rtl_test`: "usb_claim_interface error -6" | Another process owns the dongle. Close GQRX/URH/SDR# and retry. |
-| URH won't install with pip | Try `pip install urh --no-build-isolation`. On Linux you may need `sudo apt install python3-pyqt5 python3-numpy python3-psutil` first. |
+| `rtl_test`: "usb_claim_interface error -6" | Another process owns the dongle. Close GQRX/SDR# and retry. |
+| `rtl_test`: `rtlsdr_demod_read_reg failed with -9` floods | USB power / signal-integrity problem. Put a USB 2.0 hub between dongle and PC. R828D dongles especially dislike USB 3.x host controllers. |
 | Dongle randomly disconnects after 30s | Cheap USB extension cable causing voltage droop. Plug direct or use a quality powered hub. |
 
 ## Where artifacts go

@@ -42,7 +42,7 @@ Standard capture settings for this project:
 |---|---|---|
 | Center frequency | Your measured frequency (~433.92 MHz) | From step 03 |
 | Sample rate | 2,000,000 Hz (2 MS/s) preferred, 250,000 Hz fallback | Plenty of bandwidth for OOK; clean edges in URH. See "If your dongle can't sustain 2 MS/s" below. |
-| Gain | 40 dB | High enough for clear capture without clipping when FOB is close |
+| Gain | 20 dB | Low enough that AGC doesn't compress the OOK modulation (see "AGC compression" below). Use 40 only if the FOB is far / weak signal. |
 | Duration | 1 second per capture | One button press = ~80ms packet × 3-5 repeats ≈ 250-400ms of activity. 1 second comfortably contains a full burst with headroom. |
 | Format | unsigned 8-bit I/Q (rtl_sdr default) | URH and inspectrum both read this natively |
 
@@ -54,8 +54,27 @@ integrity-marginal. If `rtl_test` at the default 2 MS/s drops out with
 project. The FOB signal is only ~50 kHz wide so 250 kSps (125 kHz Nyquist)
 has 2.5× margin and works just as well — captures are 8× smaller too.
 
-Substitute `-s 250000` in every `rtl_sdr` command below. When you import
-the capture in URH (step 05), set sample rate to 250000 instead of 2000000.
+Substitute `-s 250000` in every `rtl_sdr` command below. The Python
+demodulator in step 05 auto-detects sample rate from a CLI flag.
+
+### AGC compression — why gain matters
+
+The R820T2 / R828D tuners have automatic gain control on by default. With
+`-g 40` (high gain) and a close FOB:
+
+- AGC kicks in hard during the burst, pumping noise up to "match" the signal
+- The OOK on/off contrast gets compressed from real ~30 dB down to <1 dB
+  modulation depth in the recorded envelope
+- The Python demodulator can usually recover this with `--baseline-us 5000`
+  but it's painful and error-prone
+
+With `-g 20` (or `-g 0` for auto), the AGC stays mostly out of the way and
+OOK contrast comes through at 10-30 dB modulation depth — trivially
+demodulatable.
+
+**Recommendation: start at `-g 20`**. If `inspect-capture.py` reports
+`peak/floor` ratios above 15× you're golden. If below 5× you might need
+to bump to `-g 30` or move closer to the dongle.
 
 ## Step 2 — Record Start button × 10
 
@@ -64,7 +83,7 @@ For each of the 10 captures:
 1. Hold the FOB ~30cm from the dongle's antenna
 2. In one terminal, start recording:
    ```powershell
-   rtl_sdr -f 433920000 -s 2000000 -g 40 sdr/captures/fob-start-001.bin
+   rtl_sdr -f 433920000 -s 2000000 -g 20 sdr/captures/fob-start-001.bin
    ```
    (substitute your measured frequency from step 03)
 3. Within 200ms of starting, press the FOB Start button once and release
@@ -87,14 +106,14 @@ ls sdr/captures/fob-start-*.bin
 Same procedure, different button:
 
 ```powershell
-rtl_sdr -f 433920000 -s 2000000 -g 40 sdr/captures/fob-lock-001.bin
-rtl_sdr -f 433920000 -s 2000000 -g 40 sdr/captures/fob-lock-002.bin
-rtl_sdr -f 433920000 -s 2000000 -g 40 sdr/captures/fob-lock-003.bin
+rtl_sdr -f 433920000 -s 2000000 -g 20 sdr/captures/fob-lock-001.bin
+rtl_sdr -f 433920000 -s 2000000 -g 20 sdr/captures/fob-lock-002.bin
+rtl_sdr -f 433920000 -s 2000000 -g 20 sdr/captures/fob-lock-003.bin
 
-rtl_sdr -f 433920000 -s 2000000 -g 40 sdr/captures/fob-unlock-001.bin
+rtl_sdr -f 433920000 -s 2000000 -g 20 sdr/captures/fob-unlock-001.bin
 # ... etc
 
-rtl_sdr -f 433920000 -s 2000000 -g 40 sdr/captures/fob-trunk-001.bin
+rtl_sdr -f 433920000 -s 2000000 -g 20 sdr/captures/fob-trunk-001.bin
 # ... etc
 ```
 
@@ -103,7 +122,7 @@ rtl_sdr -f 433920000 -s 2000000 -g 40 sdr/captures/fob-trunk-001.bin
 Record one capture where you don't press anything — useful as a noise-floor reference when you compare in URH.
 
 ```powershell
-rtl_sdr -f 433920000 -s 2000000 -g 40 sdr/captures/fob-baseline-noaction.bin
+rtl_sdr -f 433920000 -s 2000000 -g 20 sdr/captures/fob-baseline-noaction.bin
 ```
 
 ## Step 5 — Document the session
@@ -125,7 +144,7 @@ Template:
 - FOB: Compustar 1WSHR-PRO, FCC ID 7087A-R762A433
 - Dongle: Vomeko RTL-SDR (R820T2 + RTL2832U)
 - Center frequency: 433.____ MHz (measured per step 03)
-- Sample rate: 2 MS/s, gain 40 dB
+- Sample rate: 2 MS/s (or 250 kSps if dongle can't sustain), gain 20 dB
 - Distance: ~30 cm
 - Environment: <your room, what else was running>
 
@@ -156,7 +175,7 @@ Template:
 | File is 4 MB but only contains noise | You missed the press window — re-record with better timing |
 | File is much larger than 4 MB | You let it run too long — Ctrl-C sooner (size = sample_rate × bytes_per_sample × seconds) |
 | All captures look identical (same hopping code bits) | FOB is broken (counter not incrementing) — replace battery, try a different FOB or hardware-reset the encoder |
-| URH in step 05 won't open the file | Verify file size: should be exact multiple of 2 (I + Q bytes per sample). Truncation can happen if disk fills. |
+| demod-ook.py in step 05 reports "AGC compression" or `Bursts: 1, packets decoded: 0` | Re-record with `-g 20` (or `-g 0`/auto). High gain compresses the OOK modulation. |
 
 ## Why the specific quantities?
 

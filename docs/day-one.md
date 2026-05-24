@@ -91,7 +91,7 @@ Something is genuinely broken. Fix before continuing.
 
 Suspect that module. Don't proceed to the next test until the failing one is resolved — debugging "module 3 doesn't work" with three other module changes in play is much harder than debugging it in isolation.
 
-### URH demodulates to nonsense bits
+### demod-ook.py produces nonsense bits or no packets
 
 Re-do the frequency sweep (`sdr/03`). FOB might be at 313.5 MHz instead of 433.92 MHz (some Compustar 1-way kits are).
 
@@ -104,7 +104,8 @@ Fall back to Path B (PICkit EEPROM dump). The chip-in-FOB has the device key in 
 Three usual suspects:
 - Counter too far behind/ahead (FOB has been used recently → ESP32 counter is stale)
 - Function code mapping wrong (re-verify via `diff-bits.py` between Lock and Unlock captures)
-- TE timing off (measure preamble cycle width precisely in URH)
+- TE timing off (try `--te-us 200 / 600 / 800` until diffs are clean)
+- AGC compression — re-record with `-g 20`
 
 ### Start works but engine cuts out after a few seconds
 

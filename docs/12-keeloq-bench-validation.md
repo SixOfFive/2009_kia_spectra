@@ -153,7 +153,19 @@ In Thonny on the ESP32, transmit one Lock packet:
 >>> radio.transmit_burst(pulses, repeats=4, guard_ms=39)
 ```
 
-Stop the recording (Ctrl-C). Open the resulting `.bin` in URH:
+Stop the recording (Ctrl-C). Inspect + trim + demodulate:
+
+```
+python sdr\scripts\inspect-capture.py sdr\captures\synth-lock-001.bin
+python sdr\scripts\trim-burst.py sdr\captures\synth-lock-001.bin
+python sdr\scripts\demod-ook.py sdr\captures\synth-lock-001-b1.bin --verbose
+```
+
+The decoded `.bits` should be identical (or very nearly so) to the
+synthesized `packet["bits"]` from step 2.
+
+Optionally open in URH if you want a visual waveform side-by-side with
+a real FOB Lock capture:
 
 - Should look identical in structure to your real Lock captures from
   step 04 (same preamble, gap, packet length)
@@ -190,7 +202,8 @@ replicated the FOB**. The hardest part of the project is done.
   measured) by capturing your FOB pressing Lock and comparing to
   what the ESP32 actually emitted.
 - TE timing is off — receivers tolerate ±20% on TE; outside that they
-  reject. Measure preamble cycle width in URH precisely.
+  reject. Run `demod-ook.py --verbose` against a real FOB capture and
+  compare the "measured TE" header against the synthesized packet's TE.
 
 **If something else cycles** (e.g. trunk opens, hazards flash):
 - Function code mapping is wrong — swap the values per your captures

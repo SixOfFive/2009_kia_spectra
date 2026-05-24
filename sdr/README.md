@@ -15,7 +15,7 @@ generate.
 2. [`02-hardware-verification.md`](02-hardware-verification.md) — confirm the dongle is detected and receives signal
 3. [`03-frequency-confirmation.md`](03-frequency-confirmation.md) — verify the FOB transmits at 433.92 MHz
 4. [`04-recording-captures.md`](04-recording-captures.md) — record clean 1-second IQ samples of each button press
-5. [`05-urh-analysis.md`](05-urh-analysis.md) — open captures in Universal Radio Hacker, demodulate to bits
+5. [`05-demodulation.md`](05-demodulation.md) — demodulate captures to bit sequences with the project's Python demodulator (no URH dependency)
 6. [`06-framing-extraction.md`](06-framing-extraction.md) — identify preamble, FOB serial, function codes, hopping code position
 7. [`07-key-recovery.md`](07-key-recovery.md) — recover the FOB's KeeLoq device key so the ESP32 can synthesize new packets
 
@@ -33,10 +33,14 @@ sdr/
 ├── 07-key-recovery.md              ┘
 ├── captures/        (gitignored — raw IQ binary files, can be huge)
 ├── scripts/         (helper Python — see scripts/README.md)
-│   ├── plot-power-csv.py   (find frequency peaks in rtl_power output)
-│   ├── diff-bits.py        (compare two .bits files)
-│   ├── try-mfkeys.py       (brute-force a manufacturer-key database)
-│   └── validate-key.py     (confirm a candidate device key against captures)
+│   ├── plot-power-csv.py    (find frequency peaks in rtl_power output)
+│   ├── inspect-capture.py   (pre-demod sanity check on a .bin file)
+│   ├── trim-burst.py        (slice multi-press files into per-burst bins)
+│   ├── demod-ook.py         (headless OOK demodulator → .bits files)
+│   ├── debug-envelope.py    (run-length / histogram diagnostics)
+│   ├── diff-bits.py         (compare two .bits files)
+│   ├── try-mfkeys.py        (brute-force a manufacturer-key database)
+│   └── validate-key.py      (confirm a candidate device key against captures)
 └── analysis/
     ├── framing.md              (committed — your final findings about the FOB protocol)
     ├── screenshots/            (gitignored by default — selectively commit ones worth keeping)

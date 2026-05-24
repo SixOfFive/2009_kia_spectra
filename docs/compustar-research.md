@@ -34,7 +34,7 @@ The original plan was to find the brain's hardwire start input. But since we can
 
 ## Attack approach (in priority order)
 
-1. **SDR capture + framing analysis** (URH, free)
+1. **SDR capture + framing analysis** (project-built `demod-ook.py`, no third-party deps)
    - Confirm 433.92 MHz, confirm OOK, identify TE bit timing
    - Capture multiple presses of each button — identify which bits are fixed (serial) vs hopping (encrypted) vs function code
    - Stop here for documentation purposes if Step 2 not needed

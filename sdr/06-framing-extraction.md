@@ -8,13 +8,13 @@ Take the `.bits` files from step 05 and identify:
 2. **Function codes** — 4 bits that differ between Start, Lock, Unlock, Trunk
 3. **Hopping code position** — 32 bits that change between every press (because the counter incremented and got re-encrypted)
 4. **Status bits** — 2 bits (V_LOW and repeat flag)
-5. **TE (bit element time)** — measured from URH
+5. **TE (bit element time)** — measured by `demod-ook.py` (printed as "measured TE" in the `.bits` file header)
 
 These are the values you'll plug into `secrets.py` and `config.py` so the ESP32 can synthesize valid packets matching your FOB.
 
 ## Prerequisites
 
-- [05 — URH analysis](05-urh-analysis.md) complete
+- [05 — demodulation](05-demodulation.md) complete
 - At least 3 Start captures and 1 each of Lock / Unlock decoded to `.bits` files
 
 ## Step 1 — Diff Start vs Start to find hopping bits
@@ -121,7 +121,7 @@ Commit these updates with a message like `Update Compustar function codes from S
 ## Helper script: diff-bits.py
 
 The helper at [`sdr/scripts/diff-bits.py`](scripts/diff-bits.py) loads both
-`.bits` files (skipping `#` comments and `[label]` markers from URH),
+`.bits` files (skipping `#` comments produced by `demod-ook.py`),
 reports how many bits differ, and groups contiguous runs of differing
 positions — which is exactly what makes the hopping-code region visually
 obvious.

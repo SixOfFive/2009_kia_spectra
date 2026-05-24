@@ -15,13 +15,14 @@ The Compustar trigger is performed by software synthesis of the KeeLoq rolling-c
 
 **Bench-ready software, awaiting parts.** As of the most recent commit:
 
-- 74 unit + integration tests passing across the project ([CI](.github/workflows/tests.yml) runs on every push)
-- All hardware-independent firmware written (KeeLoq cipher, HCS packet builder, OBD-II, UART protocol, state machine, drivers for CC1101 / ADS1115 / TWAI)
-- Pi-side daemon, dashboard, MQTT publisher, systemd unit, and provisioning script all written
-- Phase 1 (SDR walkthrough) and Phase 2 (bench-prototype docs) complete and reproducible
-- Deep-sleep + RTC-memory streak persistence wired into the controller
+- **85 unit + integration tests** passing across the project ([CI](.github/workflows/tests.yml) runs on every push across Py 3.10/3.11/3.12)
+- All hardware-independent firmware written: KeeLoq cipher, HCS packet builder, OBD-II PIDs, UART protocol, state machine, deep sleep, RTC-memory streak persistence, watchdog, drivers for CC1101 / ADS1115 / TWAI
+- Pi-side daemon: thread-safe STATE, UART listener, MQTT publisher + command subscriber (Home Assistant ready), Flask dashboard with toast feedback + events panel, systemd unit, idempotent provision.sh
+- Phase 1 (SDR walkthrough) and Phase 2 (bench-prototype docs 08-12) complete and reproducible
+- Tooling: simulator (`esp32/scripts/simulate.py`), pre-flight check (`tools/preflight.py`), mpremote install scripts, helper scripts for SDR analysis
+- Docs: power-budget analysis, security threat model, day-one cheat sheet
 
-Remaining work is hardware-bound: smoke-test each module on a breadboard, follow the SDR walkthrough to recover the KeeLoq device key from the FOB, then do the in-car Lock test before any Start attempt.
+Remaining work is hardware-bound: see [`docs/day-one.md`](docs/day-one.md) for the take-to-the-bench checklist.
 
 Track day-by-day progress in [`logs/`](logs/).
 

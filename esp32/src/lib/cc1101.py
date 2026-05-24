@@ -3,11 +3,11 @@ CC1101 sub-GHz transceiver driver — minimal subset for 433.92 MHz OOK transmit
 
 The CC1101 has its own modulator but we use **async serial mode**: the chip
 acts as a transparent OOK modulator and we bit-bang the GDO0 pin with the
-exact PWM-encoded HCS pulses that ``compustar.packet_to_pulses`` emits.
+exact OOK pulse pairs that ``compustar.packet_to_pulses`` emits.
 
 That gives us microsecond-precise control over the on-air waveform without
 having to fight the chip's packet engine, which doesn't natively understand
-HCS's PWM bit encoding.
+the Compustar 1WG3R family's symmetric-PWM bit encoding.
 
 Wiring (CC1101 → ESP32):
 
@@ -22,18 +22,28 @@ Wiring (CC1101 → ESP32):
 Usage:
 
     from lib.cc1101 import CC1101
+    from lib import compustar
     radio = CC1101(spi_id=2, cs_pin=5, gdo0_pin=22)
     radio.init_433mhz_ook()
-    radio.transmit_pulses(pulses, te_us=400)   # pulses from compustar.packet_to_pulses
+    pulses = compustar.build_pulses_for_button(
+        compustar.Button.LOCK, secrets.COMPUSTAR_PACKETS)
+    radio.transmit_burst(pulses, repeats=8, guard_ms=39)
 
 Notes:
 
 - Runs under MicroPython on ESP32. CPython smoke-test mode is provided for
   development on a desktop (no hardware required).
 - Bit-bang timing precision depends on disabling GC during transmit and
-  using ``time.sleep_us``. At TE=400µs the per-bit window is enormous in
-  MicroPython terms (~2000+ cycles of overhead headroom), so this works
-  reliably. For TE < 50µs you'd need ``esp32.RMT`` hardware timing instead.
+  using ``time.sleep_us``. The pulses we transmit are in the 700–1500 µs
+  range (Compustar 1WG3R family); MicroPython's ``time.sleep_us`` has
+  ~10–50 µs jitter on ESP32 which is well inside the receiver's ±10–15%
+  tolerance window for those pulse widths. For shorter pulses (sub-100 µs,
+  e.g. high-baud-rate protocols), you'd need ``esp32.RMT`` hardware timing
+  instead — but our use case doesn't need it.
+- ``init_433mhz_ook`` configures the chip for 433.92 MHz nominal. Compustar
+  receivers tolerate several hundred kHz of frequency offset, so this works
+  for FOBs that transmit a bit off-center (e.g. the project's measured FOB
+  transmits at ~433.886 MHz).
 """
 
 try:
@@ -257,12 +267,18 @@ class CC1101:
         Transmit a list of (high_us, low_us) pulse pairs via async OOK.
 
         Drives GDO0 high for ``high_us`` then low for ``low_us`` per pulse.
-        The CC1101 must already be in TX mode (init_433mhz_ook + STX).
+        Strobes STX before transmit and SIDLE after. Pulse widths are
+        whatever's in the tuple list — works for Compustar 1WG3R family
+        (~700–1500 µs pulses) and HCS PWM variants (~400–800 µs) alike.
 
-        :param pulses: list of (high_us, low_us) tuples
-        :param te_us:  unused (kept for API symmetry with compustar module)
+        :param pulses: list of (high_us, low_us) tuples. Each pulse
+            with ``high_us == 0`` emits a low-only period; with
+            ``low_us == 0`` it emits a high-only period.
+        :param te_us:  legacy parameter — unused. Kept for compatibility
+            with callers that previously passed the HCS bit-element
+            time. Safe to omit.
         """
-        del te_us  # consumed at packet_to_pulses time
+        del te_us  # consumed at packet_to_pulses time (legacy)
         self._strobe(STX)
 
         gdo0 = self.gdo0
@@ -289,7 +305,13 @@ class CC1101:
     def transmit_burst(self, pulses, repeats, guard_ms):
         """
         Transmit ``pulses`` ``repeats`` times with ``guard_ms`` of silence
-        between each (HCS-style multi-press burst).
+        between each repeat. Mimics how the genuine FOB transmits a packet
+        multiple times per button press for receiver robustness.
+
+        Each repeat invokes ``transmit_pulses`` which strobes STX before
+        and SIDLE after, so the CC1101 re-calibrates between repeats
+        (auto-cal IDLE→TX adds ~735 µs per repeat per the datasheet —
+        negligible compared to typical ``guard_ms`` values of ~39 ms).
         """
         for i in range(repeats):
             self.transmit_pulses(pulses)

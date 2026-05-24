@@ -106,6 +106,37 @@ def test_transmit_pulses_toggles_gdo0_per_pulse():
     assert len(offs) >= 3  # at least one per pulse with low_us > 0, plus final off
 
 
+def test_transmit_pulses_with_compustar_widths():
+    """Exercise transmit_pulses against the actual Compustar 1WG3R family
+    pulse widths the production path uses."""
+    from lib import compustar
+    radio = _make_radio()
+    # Render a synthetic Compustar packet (3 sync + 35 data bits = 38 pulses)
+    synthetic = compustar.packet_to_pulses([0, 1] * 17 + [0])
+    radio.transmit_pulses(synthetic)
+
+    # Should have toggled gdo0 once per pulse (each pulse has both high_us
+    # and low_us > 0 in Compustar PWM).
+    ons = [h for h in radio.gdo0.history if h == "on"]
+    offs = [h for h in radio.gdo0.history if h == "off"]
+    assert len(ons) == 38       # one on-edge per pulse
+    assert len(offs) >= 38      # one off-edge per pulse, plus a final off
+
+
+def test_transmit_burst_calls_transmit_pulses_n_times():
+    """transmit_burst should invoke transmit_pulses once per repeat."""
+    radio = _make_radio()
+    call_count = {"n": 0}
+    original = radio.transmit_pulses
+    def counting_transmit(pulses, te_us=None):
+        call_count["n"] += 1
+        return original(pulses, te_us=te_us)
+    radio.transmit_pulses = counting_transmit
+    pulses = [(732, 1136), (1100, 756)]
+    radio.transmit_burst(pulses, repeats=5, guard_ms=39)
+    assert call_count["n"] == 5
+
+
 def test_init_writes_all_expected_registers():
     radio = _make_radio()
     # Pre-load read values for the reset path (sleep_ms is a no-op in CPython)

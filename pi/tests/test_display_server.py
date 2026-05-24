@@ -55,28 +55,37 @@ def test_transmit_start_forwards_start_engine_command():
         _reset_link()
 
 
-def test_transmit_lock_returns_501_with_protocol_extension_detail():
-    client, _link = _make_client_with_link()
+def test_transmit_lock_forwards_transmit_button_command():
+    client, link = _make_client_with_link()
     try:
         res = client.post("/api/transmit/lock")
-        assert res.status_code == 501
         body = res.get_json()
-        assert body["ok"] is False
+        assert res.status_code == 200, body
+        assert body["ok"] is True
         assert body["button"] == "lock"
-        assert "CMD_TRANSMIT_BUTTON" in body["detail"]
+        assert len(link.sent) == 1
+        msg = link.sent[0]
+        assert msg["type"] == "COMMAND"
+        assert msg["cmd"] == "transmit_button"
+        assert msg["button"] == "lock"
+        assert msg["trigger_source"] == "manual"
     finally:
         _reset_link()
 
 
-def test_transmit_unlock_and_trunk_also_501():
-    client, _link = _make_client_with_link()
+def test_transmit_unlock_and_trunk_use_transmit_button():
+    client, link = _make_client_with_link()
     try:
         for button in ("unlock", "trunk"):
+            link.sent.clear()
             res = client.post(f"/api/transmit/{button}")
-            assert res.status_code == 501, button
+            assert res.status_code == 200, button
             body = res.get_json()
-            assert body["ok"] is False
+            assert body["ok"] is True
             assert body["button"] == button
+            assert len(link.sent) == 1
+            assert link.sent[0]["cmd"] == "transmit_button"
+            assert link.sent[0]["button"] == button
     finally:
         _reset_link()
 

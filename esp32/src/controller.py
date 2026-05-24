@@ -352,6 +352,27 @@ class VroomController:
             self.uart.send(pi_link.ack(cmd, detail="threshold=%.2f" % new))
         elif cmd == pi_link.CMD_PING:
             self.uart.send(pi_link.ack(cmd, detail=self.state))
+        elif cmd == pi_link.CMD_TRANSMIT_BUTTON:
+            # Manual fob-button transmit from the Pi dashboard. The "button"
+            # payload field is case-insensitive; map to the uppercase key used
+            # in COMPUSTAR_PACKETS.
+            from lib import compustar
+            raw = msg.get("button", "")
+            button = str(raw).upper()
+            if button == compustar.Button.START:
+                self._trigger_start("manual")
+                self.uart.send(pi_link.ack(cmd, detail="button=START"))
+            elif button in compustar.Button.ALL:
+                ok = self._transmit_button(button)
+                self.uart.send(pi_link.ack(
+                    cmd, ok=bool(ok),
+                    detail="button=%s" % button if ok else "tx_failed",
+                ))
+            else:
+                self.uart.send(pi_link.ack(
+                    cmd, ok=False,
+                    detail="unknown button %r" % raw,
+                ))
         elif cmd == pi_link.CMD_SHUTDOWN_PI:
             if self.state == State.RUNNING:
                 self._trigger_stop("pi_shutdown")

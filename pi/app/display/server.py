@@ -82,9 +82,11 @@ def api_command():
 
 
 # Manual-transmit buttons on the dashboard. "start" reuses the existing
-# CMD_START_ENGINE plumbing; the other three are stubbed at 501 until the
-# wire protocol gains a generic CMD_TRANSMIT_BUTTON (see the JSON detail
-# returned below for the follow-on work).
+# CMD_START_ENGINE plumbing (which goes through _trigger_start + power-on
+# sequencing); the other three go through CMD_TRANSMIT_BUTTON which just
+# transmits the stored 35-bit packet for that button without touching
+# the state machine. Both paths require COMPUSTAR_PACKETS to be populated
+# in the ESP32-side secrets.py.
 _TRANSMIT_BUTTONS = ("start", "lock", "unlock", "trunk")
 
 
@@ -93,41 +95,40 @@ def api_transmit(button):
     """
     Trigger a manual RF transmit for one of the fob buttons.
 
-    "start" reuses CMD_START_ENGINE end-to-end. The other three buttons
-    require a wire-protocol extension (CMD_TRANSMIT_BUTTON) which lands in
-    a follow-on commit on the ESP32 side; for now they return HTTP 501
-    with a structured detail blob so the dashboard can show a useful
-    toast.
+    "start" goes through CMD_START_ENGINE which runs the full
+    voltage-trigger handshake (power-on Pi, transition to STARTING,
+    etc.) — useful when you actually want the engine to start AND
+    the dashboard to come up.
+
+    "lock" / "unlock" / "trunk" go through CMD_TRANSMIT_BUTTON which
+    just renders the stored packet for that button and toggles GDO0
+    on the CC1101 — no state-machine transition, no Pi power-on
+    side-effects. Useful for routine lock/unlock from the dashboard.
     """
     if button not in _TRANSMIT_BUTTONS:
         return jsonify({"ok": False, "detail": f"unknown button {button!r}"}), 400
 
     if button == "start":
-        try:
-            sent = state.send_to_esp32(
-                esp32_link.command(
-                    esp32_link.CMD_START_ENGINE, trigger_source="manual",
-                )
-            )
-        except Exception as e:
-            return jsonify({"ok": False, "button": button, "error": str(e)}), 502
-        if not sent:
-            return jsonify({
-                "ok": False, "button": button,
-                "error": "esp32 link not initialized",
-            }), 503
-        return jsonify({"ok": True, "button": button, "queued": True})
+        cmd = esp32_link.command(
+            esp32_link.CMD_START_ENGINE, trigger_source="manual",
+        )
+    else:
+        cmd = esp32_link.command(
+            esp32_link.CMD_TRANSMIT_BUTTON,
+            button=button,
+            trigger_source="manual",
+        )
 
-    # lock / unlock / trunk: wire protocol extension required.
-    return jsonify({
-        "ok": False,
-        "button": button,
-        "detail": (
-            "wire protocol extension required: add CMD_TRANSMIT_BUTTON to "
-            "esp32/src/lib/pi_link.py and pi/app/comms/esp32_link.py + new "
-            "handler in controller.py"
-        ),
-    }), 501
+    try:
+        sent = state.send_to_esp32(cmd)
+    except Exception as e:
+        return jsonify({"ok": False, "button": button, "error": str(e)}), 502
+    if not sent:
+        return jsonify({
+            "ok": False, "button": button,
+            "error": "esp32 link not initialized",
+        }), 503
+    return jsonify({"ok": True, "button": button, "queued": True})
 
 
 @app.route("/api/trips")

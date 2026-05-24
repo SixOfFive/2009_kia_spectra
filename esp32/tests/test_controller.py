@@ -363,6 +363,56 @@ def test_adc_drift_first_sample_after_boot_does_not_warn():
     assert drift_warns == []
 
 
+def test_transmit_button_command_dispatches_lock():
+    """CMD_TRANSMIT_BUTTON with button=lock should call _transmit_button(LOCK)
+    without affecting the state machine (no power-on, no STARTING transition)."""
+    ctrl, _, radio, uart, pi_power = _make_ctrl()
+    uart.inbox.append({"type": "COMMAND", "cmd": "transmit_button", "button": "lock"})
+    ctrl._handle_uart()
+    assert ctrl.state == State.MONITORING   # no state-machine change
+    assert pi_power.value() == 1            # Pi stays off
+    assert len(radio.bursts) == 1           # RF burst happened
+    acks = [m for m in uart.sent if m["type"] == "ACK"]
+    assert len(acks) == 1
+    assert acks[0]["in_reply_to"] == "transmit_button"
+    assert acks[0]["ok"] is True
+    assert "LOCK" in acks[0]["detail"]
+
+
+def test_transmit_button_command_case_insensitive():
+    """Button name should match case-insensitively."""
+    ctrl, _, radio, _, _ = _make_ctrl()
+    for raw in ("UNLOCK", "unlock", "Unlock"):
+        radio.bursts.clear()
+        ctrl.uart.inbox.append(
+            {"type": "COMMAND", "cmd": "transmit_button", "button": raw}
+        )
+        ctrl._handle_uart()
+        assert len(radio.bursts) == 1, raw
+
+
+def test_transmit_button_start_goes_through_trigger_start():
+    """button=start should run the full trigger path (power-on Pi, STARTING)
+    so the dashboard's Start button gets engine-running side effects."""
+    ctrl, _, radio, uart, pi_power = _make_ctrl()
+    uart.inbox.append({"type": "COMMAND", "cmd": "transmit_button", "button": "start"})
+    ctrl._handle_uart()
+    assert ctrl.state == State.STARTING
+    assert pi_power.value() == 0   # Pi powered on
+    assert len(radio.bursts) == 1
+
+
+def test_transmit_button_unknown_button_acks_failure():
+    ctrl, _, radio, uart, _ = _make_ctrl()
+    uart.inbox.append({"type": "COMMAND", "cmd": "transmit_button", "button": "fake"})
+    ctrl._handle_uart()
+    assert len(radio.bursts) == 0
+    acks = [m for m in uart.sent if m["type"] == "ACK"]
+    assert len(acks) == 1
+    assert acks[0]["ok"] is False
+    assert "fake" in acks[0]["detail"]
+
+
 def test_unknown_command_acks_failure():
     ctrl, _, _, uart, _ = _make_ctrl()
     uart.inbox.append({"type": "COMMAND", "cmd": "fake_command"})

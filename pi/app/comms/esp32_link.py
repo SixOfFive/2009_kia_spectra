@@ -40,6 +40,11 @@ CMD_STOP_ENGINE = "stop_engine"
 CMD_SET_THRESHOLD = "set_threshold"
 CMD_SHUTDOWN_PI = "shutdown_pi"
 CMD_PING = "ping"
+# Manual transmit of any captured Compustar button. Payload field
+# `button` is the button name (case-insensitive: "start"/"lock"/
+# "unlock"/"trunk") which maps to a key in cfg.COMPUSTAR_PACKETS
+# on the ESP32 side.
+CMD_TRANSMIT_BUTTON = "transmit_button"
 
 EVENT_ENGINE_STARTED = "engine_started"
 EVENT_ENGINE_STOPPED = "engine_stopped"

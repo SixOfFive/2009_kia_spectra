@@ -84,5 +84,10 @@ tools/scrub-history/
 # be public. Always lives locally only.
 braindump.md
 
-# Claude Code local settings (not shared)
+# Claude Code local settings + agent worktrees (not shared)
 .claude/settings.local.json
+.claude/worktrees/
+
+# Auto-generated vault-context file (per-project Obsidian links); regenerated
+# from the vault and shouldn't be tracked.
+CLAUDE.md

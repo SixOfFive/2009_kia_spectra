@@ -206,6 +206,33 @@ def test_compustar_tx_event_has_button_in_detail():
     assert detail["button"] == "START"
 
 
+def test_pi_transmit_button_lock_round_trip():
+    """End-to-end: Pi sends CMD_TRANSMIT_BUTTON with button=lock, ESP32 decodes,
+    transmits, and ACKs with the right detail. No state-machine transition."""
+    ctrl, esp_link, pi_link, _, radio, pi_power = _build()
+    pi_link.send(pi_side.command(pi_side.CMD_TRANSMIT_BUTTON, button="lock"))
+    ctrl._handle_uart()
+
+    # ESP32 should have transmitted exactly one burst and stayed in MONITORING.
+    from controller import State
+    assert ctrl.state == State.MONITORING
+    assert pi_power.value() == 1   # Pi never powered up
+    assert len(radio.bursts) == 1
+
+    # Pi side should see an ACK with ok=True and the button name reflected.
+    received = []
+    while True:
+        m = pi_link.recv()
+        if m is None:
+            break
+        received.append(m)
+    acks = [m for m in received if m["type"] == "ACK"]
+    assert len(acks) == 1
+    assert acks[0]["in_reply_to"] == "transmit_button"
+    assert acks[0]["ok"] is True
+    assert "LOCK" in acks[0]["detail"]
+
+
 def test_obd_message_round_trips_with_correct_fields():
     ctrl, esp_link, pi_link, _, _, _ = _build()
     # Manually send an OBD message from the ESP32 side
@@ -234,7 +261,8 @@ def test_message_type_constants_match_between_sides():
 def test_command_constants_match_between_sides():
     from lib import pi_link as esp_side
     for name in ("CMD_START_ENGINE", "CMD_STOP_ENGINE",
-                 "CMD_SET_THRESHOLD", "CMD_SHUTDOWN_PI", "CMD_PING"):
+                 "CMD_SET_THRESHOLD", "CMD_SHUTDOWN_PI", "CMD_PING",
+                 "CMD_TRANSMIT_BUTTON"):
         assert getattr(esp_side, name) == getattr(pi_side, name), \
             f"{name} differs between esp32 and pi pi_link/esp32_link modules"
 

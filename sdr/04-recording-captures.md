@@ -41,10 +41,21 @@ Standard capture settings for this project:
 | Parameter | Value | Why |
 |---|---|---|
 | Center frequency | Your measured frequency (~433.92 MHz) | From step 03 |
-| Sample rate | 2,000,000 Hz (2 MS/s) | Plenty of bandwidth for OOK; clean edges in URH |
+| Sample rate | 2,000,000 Hz (2 MS/s) preferred, 250,000 Hz fallback | Plenty of bandwidth for OOK; clean edges in URH. See "If your dongle can't sustain 2 MS/s" below. |
 | Gain | 40 dB | High enough for clear capture without clipping when FOB is close |
 | Duration | 1 second per capture | One button press = ~80ms packet × 3-5 repeats ≈ 250-400ms of activity. 1 second comfortably contains a full burst with headroom. |
 | Format | unsigned 8-bit I/Q (rtl_sdr default) | URH and inspectrum both read this natively |
+
+### If your dongle can't sustain 2 MS/s
+
+R828D-tuner dongles on USB 3.x-only PCs are frequently power/signal-
+integrity-marginal. If `rtl_test` at the default 2 MS/s drops out with
+`cb transfer status: 4/5` errors, **drop to 250 kSps** for the rest of the
+project. The FOB signal is only ~50 kHz wide so 250 kSps (125 kHz Nyquist)
+has 2.5× margin and works just as well — captures are 8× smaller too.
+
+Substitute `-s 250000` in every `rtl_sdr` command below. When you import
+the capture in URH (step 05), set sample rate to 250000 instead of 2000000.
 
 ## Step 2 — Record Start button × 10
 

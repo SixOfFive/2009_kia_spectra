@@ -122,6 +122,20 @@ poll();  // initial fire
 
 // ----- Buttons -----
 
+function showToast(msg, kind) {
+  // kind = 'good' | 'bad' | 'info'
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + (kind || 'info');
+  t.textContent = msg;
+  document.body.appendChild(t);
+  // Trigger CSS fade-in
+  requestAnimationFrame(() => t.classList.add('toast-show'));
+  setTimeout(() => {
+    t.classList.remove('toast-show');
+    setTimeout(() => t.remove(), 300);
+  }, 2500);
+}
+
 async function sendCommand(cmd) {
   try {
     const res = await fetch('/api/command', {
@@ -129,11 +143,16 @@ async function sendCommand(cmd) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({cmd}),
     });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    // Force an immediate refresh
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const reason = body.error || ('HTTP ' + res.status);
+      showToast(`${cmd}: ${reason}`, 'bad');
+      return;
+    }
+    showToast(`${cmd} sent`, 'good');
     poll();
   } catch (err) {
-    alert(`Command ${cmd} failed: ${err.message}`);
+    showToast(`${cmd} failed: ${err.message}`, 'bad');
   }
 }
 

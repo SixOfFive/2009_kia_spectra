@@ -202,3 +202,29 @@ main {
   color: #6e7681;
   font-style: italic;
 }
+
+/* Toast notifications for /api/command feedback */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%) translateY(20px);
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  opacity: 0;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+  z-index: 100;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.toast-show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.toast-good { background: #1b4332; color: #4ade80; border: 1px solid #2d6a4f; }
+.toast-bad  { background: #3a1e1e; color: #f87171; border: 1px solid #6a2d2d; }
+.toast-info { background: #1f2733; color: #e6edf3; border: 1px solid #2d3640; }

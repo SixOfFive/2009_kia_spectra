@@ -13,7 +13,7 @@ for the process layout.
 
 from flask import Flask, jsonify, render_template, request, abort
 
-from pi.app import config, state
+from pi.app import config, state, trip_log
 from pi.app.comms import esp32_link
 
 
@@ -79,6 +79,70 @@ def api_command():
         return jsonify({"ok": False, "cmd": cmd, "error": "esp32 link not initialized"}), 503
 
     return jsonify({"ok": True, "cmd": cmd, "queued": True})
+
+
+# Manual-transmit buttons on the dashboard. "start" reuses the existing
+# CMD_START_ENGINE plumbing; the other three are stubbed at 501 until the
+# wire protocol gains a generic CMD_TRANSMIT_BUTTON (see the JSON detail
+# returned below for the follow-on work).
+_TRANSMIT_BUTTONS = ("start", "lock", "unlock", "trunk")
+
+
+@app.route("/api/transmit/<button>", methods=["POST"])
+def api_transmit(button):
+    """
+    Trigger a manual RF transmit for one of the fob buttons.
+
+    "start" reuses CMD_START_ENGINE end-to-end. The other three buttons
+    require a wire-protocol extension (CMD_TRANSMIT_BUTTON) which lands in
+    a follow-on commit on the ESP32 side; for now they return HTTP 501
+    with a structured detail blob so the dashboard can show a useful
+    toast.
+    """
+    if button not in _TRANSMIT_BUTTONS:
+        return jsonify({"ok": False, "detail": f"unknown button {button!r}"}), 400
+
+    if button == "start":
+        try:
+            sent = state.send_to_esp32(
+                esp32_link.command(
+                    esp32_link.CMD_START_ENGINE, trigger_source="manual",
+                )
+            )
+        except Exception as e:
+            return jsonify({"ok": False, "button": button, "error": str(e)}), 502
+        if not sent:
+            return jsonify({
+                "ok": False, "button": button,
+                "error": "esp32 link not initialized",
+            }), 503
+        return jsonify({"ok": True, "button": button, "queued": True})
+
+    # lock / unlock / trunk: wire protocol extension required.
+    return jsonify({
+        "ok": False,
+        "button": button,
+        "detail": (
+            "wire protocol extension required: add CMD_TRANSMIT_BUTTON to "
+            "esp32/src/lib/pi_link.py and pi/app/comms/esp32_link.py + new "
+            "handler in controller.py"
+        ),
+    }), 501
+
+
+@app.route("/api/trips")
+def api_trips():
+    """Return the last N persisted trips, newest first."""
+    try:
+        limit = int(request.args.get("limit", config.TRIP_LOG_DEFAULT_LIMIT))
+    except (TypeError, ValueError):
+        limit = config.TRIP_LOG_DEFAULT_LIMIT
+    limit = max(1, min(limit, 200))
+    try:
+        trips = trip_log.read_recent(config.TRIP_LOG_PATH, limit=limit)
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "trips": trips, "open": trip_log.open_trip_snapshot()})
 
 
 # Backwards-compatible aliases — kept for any code that previously did

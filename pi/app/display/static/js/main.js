@@ -18,6 +18,7 @@ const els = {
   uptime:     document.getElementById('uptime'),
 
   eventsList: document.getElementById('events-list'),
+  tripsBody:  document.getElementById('trips-body'),
 
   btnStart: document.getElementById('btn-start'),
   btnStop:  document.getElementById('btn-stop'),
@@ -79,6 +80,59 @@ function render(state) {
   els.uptime.textContent     = `Uptime: ${fmtUptime(state.uptime_s)}`;
 
   renderEvents(state.events || []);
+  renderSparklines(state.obd_history || {});
+}
+
+// ----- Sparklines (pure SVG, no library) -----
+
+// Cache the SVG elements once; the dashboard layout is static.
+const _sparkEls = Array.from(document.querySelectorAll('svg[data-spark]'));
+
+function renderSparklines(history) {
+  for (const svg of _sparkEls) {
+    const pid = svg.dataset.spark;
+    const samples = history[pid] || [];
+    svg.innerHTML = sparkSvgInner(samples, svg);
+  }
+}
+
+function sparkSvgInner(samples, svg) {
+  // viewBox is "0 0 W H"; pull width/height from the attribute so each
+  // tile can size independently (gauge-large has a taller sparkline).
+  const vb = (svg.getAttribute('viewBox') || '0 0 60 14').split(/\s+/).map(Number);
+  const W = vb[2] || 60;
+  const H = vb[3] || 14;
+
+  if (!samples.length) {
+    // Dotted baseline placeholder so the tile doesn't visually collapse.
+    return `<line class="spark-empty" x1="0" y1="${H/2}" x2="${W}" y2="${H/2}"/>`;
+  }
+
+  const values = samples.map(s => s[1]);
+  let lo = Math.min(...values);
+  let hi = Math.max(...values);
+  // Flat data: pad the range so the line draws mid-tile rather than
+  // jumping to an edge after the first divide-by-zero would otherwise.
+  if (hi - lo < 1e-9) {
+    const pad = Math.abs(hi) > 1 ? Math.abs(hi) * 0.05 : 1;
+    lo -= pad;
+    hi += pad;
+  }
+  const n = samples.length;
+  const xStep = n > 1 ? W / (n - 1) : 0;
+  const pts = samples.map((s, i) => {
+    const x = i * xStep;
+    // Invert Y because SVG (0,0) is top-left.
+    const y = H - ((s[1] - lo) / (hi - lo)) * H;
+    return `${x.toFixed(1)},${y.toFixed(2)}`;
+  });
+  const lastX = (n - 1) * xStep;
+  const lastY = H - ((values[n - 1] - lo) / (hi - lo)) * H;
+
+  return (
+    `<polyline class="spark-line" points="${pts.join(' ')}"/>` +
+    `<circle class="spark-dot" cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(2)}" r="1.4"/>`
+  );
 }
 
 function renderEvents(events) {
@@ -119,6 +173,62 @@ async function poll() {
 
 setInterval(poll, POLL_MS);
 poll();  // initial fire
+
+// ----- Trips panel (polled less often — append-only file) -----
+
+function fmtDuration(s) {
+  if (s === null || s === undefined) return '--';
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}m${String(r).padStart(2, '0')}`;
+}
+
+function fmtIso(iso) {
+  if (!iso) return '--';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+  } catch (e) {
+    return iso;
+  }
+}
+
+function renderTrips(payload) {
+  const trips = payload.trips || [];
+  if (!els.tripsBody) return;
+  if (!trips.length) {
+    els.tripsBody.innerHTML = '<tr><td class="trips-empty" colspan="7">No trips yet</td></tr>';
+    return;
+  }
+  els.tripsBody.innerHTML = trips.slice(0, 10).map(t => {
+    const peak = t.peak_obd || {};
+    return `<tr>
+      <td>${fmtIso(t.ts_start)}</td>
+      <td>${fmtDuration(t.duration_s)}</td>
+      <td>${t.trigger_source || '--'}</td>
+      <td>${fmt(t.v_start, 1)}</td>
+      <td>${fmt(t.v_end, 1)}</td>
+      <td>${fmt(peak.rpm, 0)}</td>
+      <td>${fmt(peak.coolant_temp, 0)}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function pollTrips() {
+  try {
+    const res = await fetch('/api/trips?limit=10');
+    if (!res.ok) return;
+    const body = await res.json();
+    renderTrips(body);
+  } catch (err) {
+    // Silent — the panel just stays stale.
+  }
+}
+
+// Trips don't update every second; once a minute is plenty since rows
+// only land at engine_stopped.
+setInterval(pollTrips, 30_000);
+pollTrips();
 
 // ----- Buttons -----
 
@@ -163,3 +273,34 @@ els.btnStop.addEventListener('click', () => {
   if (confirm('Stop the engine?')) sendCommand('stop_engine');
 });
 els.btnPing.addEventListener('click', () => sendCommand('ping'));
+
+// ----- Manual transmit buttons (start/lock/unlock/trunk) -----
+
+async function sendTransmit(button) {
+  try {
+    const res = await fetch(`/api/transmit/${button}`, {method: 'POST'});
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 501) {
+      showToast(`${button}: not yet wired on ESP32`, 'info');
+      return;
+    }
+    if (!res.ok) {
+      const reason = body.error || body.detail || ('HTTP ' + res.status);
+      showToast(`${button}: ${reason}`, 'bad');
+      return;
+    }
+    showToast(`${button} sent`, 'good');
+    poll();
+  } catch (err) {
+    showToast(`${button} failed: ${err.message}`, 'bad');
+  }
+}
+
+document.querySelectorAll('button[data-tx]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const which = btn.dataset.tx;
+    // Start has destructive potential; the other buttons are quick taps.
+    if (which === 'start' && !confirm('Transmit start?')) return;
+    sendTransmit(which);
+  });
+});

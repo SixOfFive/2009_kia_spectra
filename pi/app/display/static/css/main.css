@@ -118,6 +118,39 @@ main {
   font-size: 28px;
 }
 
+/* Inline 60-sample sparkline at the bottom of each gauge tile.
+ * Pure SVG with vector-effect non-scaling-stroke so the line stays
+ * crisp regardless of how preserveAspectRatio scales it. */
+.sparkline {
+  width: 100%;
+  height: 18px;
+  margin-top: 4px;
+  display: block;
+}
+
+.gauge-large .sparkline { height: 28px; }
+
+.sparkline .spark-line {
+  fill: none;
+  stroke: #4ade80;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.sparkline .spark-dot {
+  fill: #4ade80;
+}
+
+.sparkline .spark-empty {
+  fill: none;
+  stroke: #2d3640;
+  stroke-width: 1;
+  stroke-dasharray: 2 2;
+  vector-effect: non-scaling-stroke;
+}
+
 .controls {
   display: flex;
   gap: 8px;
@@ -145,6 +178,91 @@ main {
 .btn-stop:active  { background: #6a2d2d; }
 
 .btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+
+/* Manual-transmit panel — four small fob-style buttons under the main
+ * controls. Only the "Start" tile is fully wired today; the other three
+ * return HTTP 501 until the wire-protocol CMD_TRANSMIT_BUTTON lands. */
+.manual-tx {
+  margin-top: 8px;
+  background: #0f1419;
+  border: 1px solid #1f2733;
+  border-radius: 8px;
+  padding: 6px 10px 8px;
+}
+
+.manual-tx-header {
+  font-size: 11px;
+  color: #6e7681;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+
+.manual-tx-buttons {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.btn-tx {
+  padding: 10px 6px;
+  font-size: 13px;
+}
+
+.btn-tx-start  { background: #1b4332; color: #4ade80; border-color: #2d6a4f; }
+.btn-tx-lock   { background: #1f2733; color: #c9d1d9; }
+.btn-tx-unlock { background: #1f2733; color: #c9d1d9; }
+.btn-tx-trunk  { background: #1f2733; color: #c9d1d9; }
+
+/* Trips panel — small read-only table of the last few engine-run cycles. */
+.trips {
+  margin-top: 8px;
+  background: #0f1419;
+  border: 1px solid #1f2733;
+  border-radius: 8px;
+  padding: 6px 10px 8px;
+}
+
+.trips-header {
+  font-size: 11px;
+  color: #6e7681;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+
+.trips-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.trips-table th {
+  text-align: left;
+  font-weight: 500;
+  color: #6e7681;
+  padding: 2px 4px;
+  border-bottom: 1px solid #1f2733;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+}
+
+.trips-table td {
+  padding: 3px 4px;
+  color: #c9d1d9;
+}
+
+.trips-table tr + tr td {
+  border-top: 1px solid #161b22;
+}
+
+.trips-empty {
+  color: #6e7681;
+  font-style: italic;
+  text-align: center;
+}
 
 .status-bar {
   display: flex;

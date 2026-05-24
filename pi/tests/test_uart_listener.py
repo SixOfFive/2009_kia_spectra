@@ -17,6 +17,7 @@ def _reset_state():
             "engine_running": False,
             "esp32_state": "unknown",
             "last_obd": {},
+            "obd_history": {},
             "events": [],
         })
 

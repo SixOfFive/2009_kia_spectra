@@ -84,6 +84,13 @@ tools/scrub-history/
 # be public. Always lives locally only.
 braindump.md
 
+# Raw chat transcripts written out for local reference. Conversation
+# content (operational details, half-decided tradeoffs, etc.) — never
+# committed.
+chat.txt
+chat-*.txt
+CHAT.txt
+
 # Claude Code local settings + agent worktrees (not shared)
 .claude/settings.local.json
 .claude/worktrees/

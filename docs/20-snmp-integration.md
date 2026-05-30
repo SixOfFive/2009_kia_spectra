@@ -132,6 +132,38 @@ The cleanest pattern, lifted from
 3. A single Cacti host bound to the Pi's IP with the custom
    `snmpget`-based data inputs
 
+## Known limitation — cross-process state staleness
+
+⚠️ **The current responder runs as its own process and does NOT see
+live ESP32 telemetry.** All OIDs return their boot-time defaults
+(`v_battery` → 0 mV, `esp32_state` → "unknown", every counter → 0)
+forever, regardless of what the dashboard or MQTT publisher shows.
+
+Why: `snmp_responder.py` imports `pi.app.state` and serves from
+`state.snapshot()`. Same in `pi.app.daemon` (the dashboard process).
+But module-level dicts are **per-process** — two Python processes that
+both `import pi.app.state` get two independent `STATE` dicts. The
+UART listener writes to the dashboard process's dict; the SNMP
+responder sees only its own untouched dict.
+
+The fix is one of:
+
+1. **Run the SNMP responder as a thread inside the daemon** (sibling
+   to `uart_listener` and `mqtt_publisher`). Same process → shared
+   `STATE`. ~30 LoC: add `snmp_responder.start_thread()` and call it
+   from `daemon.main()`. Drop `vroom-snmp.service`.
+2. **Query the dashboard over HTTP** from the SNMP responder. Easy,
+   but adds an HTTP roundtrip per SNMP request and couples the two
+   services in a way that defeats the "SNMP works even if dashboard
+   is down" intuition.
+3. **Share state via a file or mmap**. Works, but overkill for the
+   data volume.
+
+Option (1) is the right answer — committed as a TODO for the next
+session. Until then, the responder is useful for **wire-format
+testing** (snmpwalk works, returns valid PDUs, exercises the BER
+stack) but not for **operational monitoring**.
+
 ## Security note
 
 The responder is **read-only** — no SET requests are honored, so

@@ -2,8 +2,14 @@
 Description=Vroom SNMPv2c read-only responder
 Documentation=https://github.com/SixOfFive/2009_kia_spectra
 Documentation=file:///opt/vroom/docs/20-snmp-integration.md
-After=vroom.service
-Wants=vroom.service
+
+# NOTE — no After/Wants= on vroom.service. The two units run as
+# separate processes and therefore do NOT share the in-process state
+# dict imported from pi.app.state — the SNMP responder serves boot-
+# time defaults until the architecture is refactored (planned). See
+# the "Known limitation" section of docs/20-snmp-integration.md.
+# Until then, listing vroom.service as a dependency would imply
+# state-sharing that doesn't exist.
 
 [Service]
 Type=simple

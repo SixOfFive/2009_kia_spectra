@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import threading
 import time
 from typing import Callable, Optional, Tuple
 
@@ -539,10 +540,36 @@ def serve_forever(bind_host: str, port: int, community: str,
         sock.close()
 
 
+def start_thread(bind_host: str, port: int, community: str,
+                 snapshot_fn: Callable[[], dict]) -> threading.Thread:
+    """Start the SNMP responder in a background daemon thread.
+
+    This is the production entry point — daemon.py calls this so the
+    responder shares the same in-process STATE dict as the UART
+    listener and Flask handlers. Running as a separate process (via
+    ``main()`` below) is supported for back-compat but serves boot-
+    time defaults forever because module-level dicts are per-process
+    in CPython.
+    """
+    t = threading.Thread(
+        target=serve_forever,
+        args=(bind_host, port, community, snapshot_fn),
+        daemon=True,
+        name="vroom-snmp",
+    )
+    t.start()
+    return t
+
+
 def main() -> None:
-    """Entry point for `python -m pi.app.snmp_responder` (standalone) and
-    for the systemd unit. Reads config from pi.app.secrets and pulls the
-    state snapshot from pi.app.state."""
+    """Standalone entry point — kept for ad-hoc debugging only.
+
+    For production use, the daemon (`python -m pi.app.daemon`) calls
+    ``start_thread()`` to run the responder in-process. Running this
+    main() spawns a separate process that imports its own copy of
+    pi.app.state and therefore returns boot-time defaults forever;
+    useful only for wire-format sanity-checking.
+    """
     import logging as _logging
     _logging.basicConfig(level=_logging.INFO,
                          format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -557,6 +584,9 @@ def main() -> None:
     port = getattr(secrets, "SNMP_PORT", 1161)
     bind_host = getattr(secrets, "SNMP_BIND_HOST", "0.0.0.0")
 
+    log.warning("running as standalone process — SNMP responder will serve "
+                "boot-time state defaults; use `python -m pi.app.daemon` for "
+                "the production thread-in-daemon mode")
     serve_forever(bind_host, port, community, state.snapshot)
 
 

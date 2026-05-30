@@ -6,10 +6,13 @@ ad-hoc `snmpwalk` from your laptop) can pull vroom-specific telemetry
 and graph it next to whatever else you monitor.
 
 The responder is pure stdlib Python (~250 LoC of BER + PDU handling)
-and lives at `pi/app/snmp_responder.py`. It serves a small custom OID
-tree and intentionally **does not implement standard host MIBs** like
-sysUptime, ifTable, or hrStorageTable — the host where the Pi runs
-should already be polled by your NMS for those.
+and lives at `pi/app/snmp_responder.py`. It runs as a **thread inside
+the main `vroom.service` daemon** (sibling to the UART listener and
+MQTT publisher) so it shares the in-process `STATE` dict and returns
+live telemetry, not snapshot-on-startup defaults. It serves a small
+custom OID tree and intentionally **does not implement standard host
+MIBs** like sysUptime, ifTable, or hrStorageTable — the host where the
+Pi runs should already be polled by your NMS for those.
 
 ## Why a custom responder instead of `snmpd`
 
@@ -17,17 +20,23 @@ Three reasons, all aligned with the rest of this project's stack:
 
 1. **Footprint** — not actually the bottleneck (snmpd RSS is ~10 MB on
    ARM Debian, well within the Pi Zero 2 W's 512 MB), but the custom
-   responder is ~6 MB resident vs. snmpd's ~10 MB.
+   responder slot of the unified `vroom.service` adds essentially zero
+   RSS (no second process — same `python3` interpreter, same imports,
+   one extra background thread).
 2. **Single source of truth** — the responder reads
-   `pi.app.state.snapshot()` directly. No `snmpd.conf` to keep in sync
-   with the OID layout.
-3. **Pattern consistency** — same Python-daemon shape as
-   `display_server`, `mqtt_subscriber`, `uart_listener`. One config
-   surface (`pi/app/secrets.py`), one log destination (journal).
+   `pi.app.state.snapshot()` from the same in-process dict the UART
+   listener writes to. No IPC, no `snmpd.conf` to keep in sync with
+   the OID layout.
+3. **Pattern consistency** — same thread-in-daemon shape as
+   `uart_listener`, `mqtt_publisher`, and `mqtt_subscriber`. One
+   config surface (`pi/app/config.py` + `pi/app/secrets.py`), one log
+   destination (journal under `vroom.service`).
 
-The OID layout, port, and community string live in `pi/app/secrets.py`
-(copy `secrets.py.example` first). The systemd unit is
-`pi/systemd/vroom-snmp.service`.
+The port, community string, and bind host live in `pi/app/secrets.py`
+(copy `secrets.py.example` first). The on/off toggle lives in
+`pi/app/config.py` (`SNMP_ENABLED = True` by default). No separate
+systemd unit — the responder thread is started by `pi.app.daemon`
+at boot.
 
 ## OID reference
 
@@ -132,37 +141,16 @@ The cleanest pattern, lifted from
 3. A single Cacti host bound to the Pi's IP with the custom
    `snmpget`-based data inputs
 
-## Known limitation — cross-process state staleness
+## Standalone process mode (debugging only)
 
-⚠️ **The current responder runs as its own process and does NOT see
-live ESP32 telemetry.** All OIDs return their boot-time defaults
-(`v_battery` → 0 mV, `esp32_state` → "unknown", every counter → 0)
-forever, regardless of what the dashboard or MQTT publisher shows.
-
-Why: `snmp_responder.py` imports `pi.app.state` and serves from
-`state.snapshot()`. Same in `pi.app.daemon` (the dashboard process).
-But module-level dicts are **per-process** — two Python processes that
-both `import pi.app.state` get two independent `STATE` dicts. The
-UART listener writes to the dashboard process's dict; the SNMP
-responder sees only its own untouched dict.
-
-The fix is one of:
-
-1. **Run the SNMP responder as a thread inside the daemon** (sibling
-   to `uart_listener` and `mqtt_publisher`). Same process → shared
-   `STATE`. ~30 LoC: add `snmp_responder.start_thread()` and call it
-   from `daemon.main()`. Drop `vroom-snmp.service`.
-2. **Query the dashboard over HTTP** from the SNMP responder. Easy,
-   but adds an HTTP roundtrip per SNMP request and couples the two
-   services in a way that defeats the "SNMP works even if dashboard
-   is down" intuition.
-3. **Share state via a file or mmap**. Works, but overkill for the
-   data volume.
-
-Option (1) is the right answer — committed as a TODO for the next
-session. Until then, the responder is useful for **wire-format
-testing** (snmpwalk works, returns valid PDUs, exercises the BER
-stack) but not for **operational monitoring**.
+`python -m pi.app.snmp_responder` will spawn the responder as its own
+process for ad-hoc wire-format sanity-checking. It works at the
+protocol level (BER round-trips, GET/GETNEXT/walk all do the right
+thing) but serves **boot-time defaults forever** for every OID,
+because module-level dicts are per-process in CPython: the standalone
+process imports its own `pi.app.state` that no UART listener ever
+updates. The standalone main() logs a WARNING at startup as a
+reminder. For production, always run via `pi.app.daemon`.
 
 ## Security note
 
@@ -187,19 +175,27 @@ fine.
 
 ## Operations
 
+The responder is a thread inside `vroom.service` — no separate unit
+to start/stop. To check its state, look at the parent service:
+
 ```bash
-# Status
-sudo systemctl status vroom-snmp
+# Service status (covers dashboard + UART + MQTT + SNMP threads)
+sudo systemctl status vroom
 
-# Logs (the responder logs each malformed request at DEBUG, each
-# config error at INFO)
-sudo journalctl -u vroom-snmp -f
+# Logs — the responder logs malformed requests at DEBUG and binding
+# errors at WARNING. Thread name "vroom-snmp" makes them grep-friendly.
+sudo journalctl -u vroom -f | grep -E 'vroom\.snmp|vroom-snmp'
 
-# Disable temporarily (e.g. if you want port 1161 for something else)
-sudo systemctl stop vroom-snmp
-sudo systemctl disable vroom-snmp
+# Disable SNMP without touching the dashboard
+sudoedit /opt/vroom/pi/app/config.py        # set SNMP_ENABLED = False
+sudo systemctl restart vroom
+
+# Restart on a different port
+sudoedit /opt/vroom/pi/app/secrets.py       # change SNMP_PORT
+sudo systemctl restart vroom
 ```
 
-The responder has the same `Restart=on-failure` directive as the main
-`vroom.service`, so a transient error (e.g. port-already-bound on a
-restart race) will retry every 5 s until it succeeds.
+If SNMP fails to bind (port already in use, etc.), the responder
+thread logs the failure and dies; the rest of `vroom.service`
+(dashboard + UART + MQTT) keeps running. There is no auto-retry —
+restart the service after fixing the conflict.

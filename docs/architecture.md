@@ -23,19 +23,28 @@ The principle: ESP32 is the always-on watchdog with real-time superpowers and mi
 
 ## Pi-side daemon layout
 
-The Pi runs **one process** (`pi.app.daemon`) hosting three threads:
-the Flask dashboard (`pi/app/display/server.py`), the UART listener
-(`pi/app/uart_listener.py`), and the MQTT bridge (`pi/app/mqtt_subscriber.py`
-+ MQTT publisher). All three share state through `pi/app/state.py`.
+The Pi runs **one process** (`pi.app.daemon`, systemd unit
+`vroom.service`) hosting four background threads plus the Flask
+request handlers in the main thread. All threads share state through
+`pi/app/state.py`:
 
-A **second process** (`pi.app.snmp_responder`) runs alongside, also
-reading from `pi.app.state.snapshot()`. It binds UDP/1161 and serves a
-small read-only OID tree under `1.3.6.1.4.1.99999.7` for any LAN-side
-NMS that wants to graph vroom telemetry alongside other infrastructure.
-Separate systemd unit (`vroom-snmp.service`) so it can be enabled or
-disabled independently of the main daemon. See
-[docs/20-snmp-integration.md](20-snmp-integration.md) for the OID
-reference and integration examples.
+| Thread | Module | Job |
+|---|---|---|
+| (main) | `pi/app/display/server.py` | Flask request handlers (dashboard + `/api/*`) |
+| `uart-listener` | `pi/app/comms/uart_listener.py` | Reads ESP32 messages over UART, mutates STATE |
+| `mqtt-publisher` | `pi/app/comms/mqtt_publisher.py` | Periodic STATE snapshot → broker |
+| `mqtt-subscriber` | `pi/app/comms/mqtt_subscriber.py` | Subscribes to command topics from broker |
+| `vroom-snmp` | `pi/app/snmp_responder.py` | Read-only SNMPv2c responder on UDP/1161, OIDs under `1.3.6.1.4.1.99999.7` |
+
+The SNMP thread shares the same in-process `STATE` dict the UART
+listener writes to, so `snmpwalk` returns live telemetry, not stale
+defaults. See [docs/20-snmp-integration.md](20-snmp-integration.md)
+for the OID reference and integration examples.
+
+(There used to be a separate `vroom-snmp.service` running the
+responder as its own process — refactored 2026-05-30 to a thread
+because module-level dicts are per-process in CPython, so the
+separate-process responder served boot-time defaults forever.)
 
 ## Communication between them
 

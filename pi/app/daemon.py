@@ -11,7 +11,7 @@ gunicorn — but for an in-cab single-user dashboard the dev server is fine
 and gives us easy reload-on-file-change during bench debugging.
 """
 
-from pi.app import config, state
+from pi.app import config, snmp_responder, state
 from pi.app.comms import esp32_link, mqtt_publisher, mqtt_subscriber, uart_listener
 from pi.app.display import server
 
@@ -35,6 +35,18 @@ def main():
     )
     mqtt_publisher.start_thread()
     mqtt_subscriber.start_thread()
+
+    # SNMP responder runs as a thread (not a separate process) so it
+    # sees the same STATE dict the UART listener writes to. See
+    # docs/20-snmp-integration.md.
+    if config.snmp_ready():
+        snmp_responder.start_thread(
+            config.SNMP_BIND_HOST, config.SNMP_PORT, config.SNMP_COMMUNITY,
+            state.snapshot,
+        )
+        print(f"[daemon] SNMP responder on udp://{config.SNMP_BIND_HOST}:{config.SNMP_PORT}")
+    else:
+        print("[daemon] SNMP disabled (config.SNMP_ENABLED is False)")
 
     print(f"[daemon] dashboard on http://{config.DISPLAY_BIND_HOST}:{config.DISPLAY_BIND_PORT}")
     server.app.run(

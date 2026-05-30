@@ -415,6 +415,69 @@ def test_live_udp_server_responds():
         assert not t.is_alive(), "server thread didn't shut down"
 
 
+# ----- start_thread() (production entry from daemon.py) -----
+
+def test_start_thread_shares_in_process_state():
+    """The production entry point — verifies the responder thread sees
+    the SAME state dict the caller writes to (the whole point of the
+    thread-in-daemon refactor)."""
+    # Mutable dict the responder reads via snapshot()
+    shared_state = {"v_battery": 11.111}
+
+    def snapshot():
+        # Return a copy reflecting whatever the caller has put in shared_state
+        snap = dict(DEFAULT_SNAPSHOT)
+        snap.update(shared_state)
+        return snap
+
+    # Find a free port
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    t = r.start_thread("127.0.0.1", port, "public", snapshot)
+    try:
+        time.sleep(0.2)  # let the thread bind
+        assert t.is_alive(), "start_thread must return a running thread"
+        assert t.daemon, "responder thread must be daemon=True"
+        assert t.name == "vroom-snmp"
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(2.0)
+
+        # First query — should see 11.111 V = 11111 mV
+        req = build_request(1, "public",
+                            [(1, 3, 6, 1, 4, 1, 99999, 7, 2, 0)])
+        client.sendto(req, ("127.0.0.1", port))
+        data, _ = client.recvfrom(8192)
+        oid, tag, val = parse_response(data)[0]
+        assert tag == r.TAG_GAUGE32
+        assert r.dec_integer(val) == 11111, (
+            f"expected 11111 mV from snapshot of shared_state, got "
+            f"{r.dec_integer(val)}"
+        )
+
+        # Now mutate shared_state and re-query — responder MUST see the
+        # update (this is the bug the refactor fixed)
+        shared_state["v_battery"] = 13.456
+        req = build_request(2, "public",
+                            [(1, 3, 6, 1, 4, 1, 99999, 7, 2, 0)])
+        client.sendto(req, ("127.0.0.1", port))
+        data, _ = client.recvfrom(8192)
+        oid, tag, val = parse_response(data)[0]
+        assert r.dec_integer(val) == 13456, (
+            f"responder didn't see the mutation — got {r.dec_integer(val)}, "
+            f"expected 13456. If this fails, the responder is reading from a "
+            f"stale snapshot or detached state dict (the cross-process bug)."
+        )
+        client.close()
+    finally:
+        # Daemon threads die with the process; no explicit stop_event here.
+        # The thread will hang on recvfrom until socket close at exit.
+        pass
+
+
 # ----- Test harness -----
 
 def run():

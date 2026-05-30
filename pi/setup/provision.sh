@@ -74,16 +74,16 @@ $PI_USER ALL=(ALL) NOPASSWD: /sbin/shutdown
 EOF
 chmod 0440 /etc/sudoers.d/vroom
 
-# ---------- 8. systemd services ----------
+# ---------- 8. systemd service ----------
 
-log "Installing systemd services..."
+log "Installing systemd service..."
 cp "$PROJECT_DIR/pi/systemd/vroom.service" /etc/systemd/system/
-cp "$PROJECT_DIR/pi/systemd/vroom-snmp.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable vroom.service
-# SNMP is opt-in: enable only if the operator wants it exposed.
-# Uncomment to enable by default:
-#   systemctl enable vroom-snmp.service
+# The SNMP responder runs as a thread inside vroom.service (so it
+# shares the in-process state dict). No separate unit needed. To
+# disable SNMP entirely, set SNMP_ENABLED = False in pi/app/config.py
+# and restart vroom.service.
 
 # ---------- 9. Chromium kiosk autostart ----------
 

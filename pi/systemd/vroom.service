@@ -20,5 +20,37 @@ StandardError=journal
 # The daemon needs sudo to shutdown the Pi when the ESP32 requests it.
 # Configure passwordless shutdown via /etc/sudoers.d/vroom (provision.sh does this).
 
+# Filesystem access — the daemon needs to read /opt/vroom, write to
+# /var/log/vroom (trip log) and /var/lib/vroom (future state),
+# read /dev/serial0 (UART), and bind TCP/8000 + UDP/1161.
+# Everything else is denied or hidden.
+ReadWritePaths=/var/log/vroom /var/lib/vroom
+DeviceAllow=/dev/serial0 rw
+DeviceAllow=/dev/ttyAMA0 rw
+DeviceAllow=/dev/ttyS0 rw
+
+# Hardening — defense in depth against a Python-RCE-in-Flask or similar.
+#
+# NOT SET (intentionally): NoNewPrivileges. The daemon shells out to
+# `sudo shutdown` when the ESP32 requests power-down, and the setuid
+# bit on sudo would be blocked by NoNewPrivileges. The corresponding
+# attack-surface tradeoff (compromised Flask → can shutdown the Pi)
+# is accepted; that's annoying but not catastrophic, and the shutdown
+# path is wanted for the legitimate ESP32 flow.
+#
+# All other directives below are safe to set — they don't block the
+# legitimate sudo-shutdown path.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
 [Install]
 WantedBy=multi-user.target

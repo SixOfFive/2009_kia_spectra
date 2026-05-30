@@ -21,25 +21,77 @@ from pi.app.comms import esp32_link
 
 LOG_TAG = "[uart-listener]"
 
+# Repeated-error suppression window. The first identical error logs
+# immediately; further identical errors are suppressed for this many
+# seconds, then a single summary line lands ("[N occurrences in last Ms]").
+# Bumped to 60 s because the most common cause of a steady-state error
+# stream is "no ESP32 on the other end of the cable yet" (pre-deploy or
+# after a cable yank) — once-a-minute is enough to know it's still
+# happening without spamming the journal.
+ERROR_SUPPRESSION_WINDOW_S = 60.0
 
-def listen_forever(link, poll_interval_s=0.05, on_message=None):
+
+def listen_forever(link, poll_interval_s=0.05, on_message=None,
+                   error_suppression_window_s=ERROR_SUPPRESSION_WINDOW_S,
+                   _time_fn=time.monotonic, _sleep_fn=time.sleep):
     """
     Read messages from ``link`` forever, dispatching each into STATE.
 
     :param link:             pi.app.comms.esp32_link.Esp32Link (or compatible)
     :param poll_interval_s:  sleep between empty recv() calls
     :param on_message:       optional callback invoked after dispatch with the raw msg
+    :param error_suppression_window_s:
+        After the first instance of an identical recv() error, further
+        identical errors are suppressed for this many seconds. A summary
+        line lands when the window elapses or when recv() recovers.
+        Pass 0 to disable suppression (every error logs — original behavior).
+    :param _time_fn, _sleep_fn:
+        Injectable for tests (so suppression behavior can be exercised
+        without wall-clock waits).
     """
     print(f"{LOG_TAG} starting")
+    # Suppression state — see ERROR_SUPPRESSION_WINDOW_S above.
+    last_err_str = None
+    err_repeat_count = 0
+    last_err_log_ts = 0.0
+
     while True:
         try:
             msg = link.recv()
         except Exception as e:
-            print(f"{LOG_TAG} ERROR recv: {e}")
-            time.sleep(1.0)
+            err_str = f"{type(e).__name__}: {e}"
+            now = _time_fn()
+            if err_str == last_err_str and error_suppression_window_s > 0:
+                err_repeat_count += 1
+                elapsed = now - last_err_log_ts
+                if elapsed < error_suppression_window_s:
+                    _sleep_fn(1.0)
+                    continue
+                # Window elapsed — log a summary and reset the window
+                print(f"{LOG_TAG} ERROR recv (still failing): {err_str} "
+                      f"[{err_repeat_count} occurrences in last "
+                      f"{int(elapsed)}s]")
+                err_repeat_count = 0
+            else:
+                # New / different error — log it and start a new window
+                print(f"{LOG_TAG} ERROR recv: {err_str}")
+                err_repeat_count = 0
+            last_err_str = err_str
+            last_err_log_ts = now
+            _sleep_fn(1.0)
             continue
+        # Successful recv() (msg may be None for "no data yet"). If we
+        # were in an error window, announce recovery.
+        if last_err_str is not None:
+            if err_repeat_count > 0:
+                print(f"{LOG_TAG} recv() recovered "
+                      f"({err_repeat_count} additional errors suppressed)")
+            else:
+                print(f"{LOG_TAG} recv() recovered")
+            last_err_str = None
+            err_repeat_count = 0
         if msg is None:
-            time.sleep(poll_interval_s)
+            _sleep_fn(poll_interval_s)
             continue
         try:
             dispatch(msg)

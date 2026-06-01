@@ -1,27 +1,61 @@
 # Architecture
 
-## Division of labor between ESP32 and Pi
+This project ships in two scope tiers:
+
+- **v1 — ESP32-only.** The shipped build. Voltage trigger, RF replay,
+  done. Sub-mA average current, no Pi, no display, no Wi-Fi.
+- **v2 — optional telematics.** Add-on Pi side with touchscreen, web
+  dashboard, MQTT, SNMP, OBD-II logging. Fully built and tested; not
+  required for the trigger function. See "v2 — optional telematics
+  add-on" further down.
+
+Scope-decision context: 2026-06-01 — the original goal was "battery
+never dies in winter," and v1 alone delivers that. v2 grew organically
+during the hardware wait and lives in the repo as a documented add-on.
+
+## v1 — division of responsibilities
+
+There's only one box. Everything lives on the ESP32:
 
 | Job | Runs on |
 |---|---|
 | Always-on voltage monitoring (sub-mA deep sleep) | **ESP32** |
-| Wake-up trigger when V drops below threshold | **ESP32** (signals Pi via MOSFET gate + UART) |
-| Keeloq RF transmit via CC1101 (real-time bit timing) | **ESP32** |
-| OBD-II via native CAN (TWAI peripheral) | **ESP32** |
-| Engine-running confirmation (CAN frame parsing) | **ESP32** |
-| Stop transmission after 15-minute timer | **ESP32** |
+| Wake-up trigger when V drops below threshold | **ESP32** |
+| Compustar RF transmit via CC1101 (real-time bit timing) | **ESP32** |
+| 15-minute run timer + engine-stop packet | **ESP32** |
+| Cooldown gate before re-arm | **ESP32** |
+| RTC-memory streak persistence across deep sleeps | **ESP32** |
+
+No coordination, no UART listener, no MOSFET gating, no Pi shutdown
+choreography in v1 — those exist in the firmware but are inert when
+no Pi is wired up. (The Pi-power MOSFET GPIO toggles harmlessly into
+an unconnected pin; the `shutdown_pi` UART writes go nowhere; the
+STOPPING-state hard-cap timeout fires cleanly either way.)
+
+## v2 — optional telematics add-on
+
+If the Pi-side hardware from the deferred BOM is connected, the
+firmware's UART writes start being consumed and the Pi's
+`vroom.service` daemon comes alive. v2 adds:
+
+| Job | Runs on |
+|---|---|
 | 5" touch display UI | **Pi** |
-| Map rendering (cached OSM tiles or live via WiFi) | **Pi** |
+| Map rendering (cached OSM tiles or live via Wi-Fi) | **Pi** |
 | Web UI for home-network monitoring | **Pi** |
-| MQTT publisher to Home Assistant / Grafana | **Pi** (could also do this from ESP32) |
+| MQTT publisher to Home Assistant / Grafana | **Pi** (the ESP32 could do this too — left to v2 for clean separation) |
 | SNMPv2c responder for NMS polling (read-only) | **Pi** (see [docs/20-snmp-integration.md](20-snmp-integration.md)) |
-| Persistent logging to SD card | **Pi** |
+| OBD-II via native CAN (live RPM / speed / coolant logging) | **ESP32** (TWAI peripheral) → publishes to Pi via UART |
+| Engine-running confirmation (CAN frame parsing) | **ESP32** → Pi as event |
+| Persistent trip log to SD card | **Pi** |
 | Clean shutdown on power-down signal | **Pi** (systemd service) |
 | SSH for debugging | **Pi** |
 
-The principle: ESP32 is the always-on watchdog with real-time superpowers and microamp sleep. Pi is the smart brain that wakes up only when needed.
+Principle: ESP32 stays the always-on watchdog with real-time
+superpowers and microamp sleep. Pi is the smart brain that wakes up
+only when triggered.
 
-## Pi-side daemon layout
+## Pi-side daemon layout (v2)
 
 The Pi runs **one process** (`pi.app.daemon`, systemd unit
 `vroom.service`) hosting four background threads plus the Flask
@@ -54,7 +88,21 @@ separate-process responder served boot-time defaults forever.)
 
 UART protocol: line-delimited JSON, one object per line at 115200 baud. Six message types (STATUS, OBD, EVENT, COMMAND, ACK, LOG) defined symmetrically in `esp32/src/lib/pi_link.py` and `pi/app/comms/esp32_link.py`. Cross-module constant parity is verified by `esp32/tests/test_integration.py`.
 
-## Power architecture
+## Power architecture — v1 (ESP32-only)
+
+```
+OBD-II Pin 16 (+12V, always-hot) ─── 2A fuse ─── TVS clamp ─── 1A buck ─── 5V rail
+                                                                            │
+                                                                            ▼
+                                                                  ESP32 (always on,
+                                                                  deep-sleep <50 µA)
+```
+
+Buck sized for: ESP32 (~150 mA peak) + headroom = **1A is plenty**.
+v1 doesn't have a Pi, a display, or a power-gate MOSFET — the rail is
+just ESP32.
+
+## Power architecture — v2 (Pi telematics added)
 
 ```
 OBD-II Pin 16 (+12V, always-hot) ─── 2A fuse ─── TVS clamp ─── 5A buck ─── 5V rail
@@ -68,7 +116,10 @@ OBD-II Pin 16 (+12V, always-hot) ─── 2A fuse ─── TVS clamp ───
                                                                   (gated, ~400mA peak)
 ```
 
-Buck converter is sized for: ESP32 (~150mA peak) + Pi (~400mA peak) + display (~700mA peak) + headroom = 5A is conservative.
+v2 upgrades the buck to 5A and adds the MOSFET gate so the Pi only
+draws current when the ESP32 has triggered a start cycle. Buck sized
+for: ESP32 (~150 mA peak) + Pi (~400 mA peak) + display (~700 mA peak)
++ headroom = 5A is conservative.
 
 ## Sleep states
 

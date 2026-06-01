@@ -346,3 +346,56 @@ main {
 .toast-good { background: #1b4332; color: #4ade80; border: 1px solid #2d6a4f; }
 .toast-bad  { background: #3a1e1e; color: #f87171; border: 1px solid #6a2d2d; }
 .toast-info { background: #1f2733; color: #e6edf3; border: 1px solid #2d3640; }
+
+
+/* ----- Map view + toggle button ----- */
+
+/* Floating toggle in the top-right corner. Sized for fingertip taps
+   on the 800x480 Elecrow touchscreen but also works as a mouse target
+   in a regular browser. z-index above both header and map. */
+.view-toggle {
+  position: fixed;
+  top: 8px;
+  right: 8px;
+  z-index: 1000;
+  padding: 10px 14px;
+  font-size: 15px;
+  font-weight: 600;
+  border: 1px solid #2d3640;
+  border-radius: 8px;
+  background: #1f2733;
+  color: #e6edf3;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;     /* eliminate the 300ms tap delay */
+}
+.view-toggle:active {
+  background: #2d3640;
+}
+
+/* Fullscreen map view. Hidden by default; shown when the toggle is
+   active. Uses `display:none` (not just visibility/opacity) so Leaflet
+   doesn't waste cycles rendering tiles while hidden. */
+.view-map {
+  position: fixed;
+  inset: 0;
+  background: #0d1117;
+  z-index: 500;        /* above main, below the toggle button */
+}
+.view-map #map {
+  width: 100vw;
+  height: 100vh;
+}
+.view-hidden {
+  display: none !important;
+}
+
+/* When the map is showing, also hide the header + main so the map is
+   genuinely fullscreen (otherwise the header bleeds through behind it
+   in some browsers). Applied via body.show-map by the toggle JS. */
+body.show-map header,
+body.show-map main {
+  display: none;
+}

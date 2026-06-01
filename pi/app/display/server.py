@@ -2,10 +2,15 @@
 Flask dashboard server for the in-cab 5" touchscreen + LAN access.
 
 Routes:
-    GET  /            -> dashboard.html (the main UI rendered in chromium kiosk)
+    GET  /            -> dashboard.html (the main UI rendered in the surf kiosk)
     GET  /api/state   -> current STATE snapshot as JSON (browser polls this 1Hz)
     POST /api/command -> manually trigger start/stop/etc via the UI buttons —
                          forwarded to the ESP32 via the shared Esp32Link
+
+The dashboard.html template renders TWO views — the gauges/controls
+view (default) and a Leaflet map view (lazy-init on first toggle).
+A floating button in the top-right swaps between them; tap-to-toggle
+on touch hardware = mouse click in a regular browser.
 
 The actual STATE dict and ESP32 link live in pi.app.state — see daemon.py
 for the process layout.
@@ -53,6 +58,10 @@ def dashboard():
     return render_template(
         "dashboard.html",
         poll_ms=config.DASHBOARD_POLL_MS,
+        map_center=config.MAP_DEFAULT_CENTER,
+        map_zoom=config.MAP_DEFAULT_ZOOM,
+        map_tile_url=config.MAP_TILE_URL,
+        map_tile_attribution=config.MAP_TILE_ATTRIBUTION,
     )
 
 

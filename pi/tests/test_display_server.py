@@ -111,6 +111,54 @@ def test_transmit_start_without_link_returns_503():
     assert "link" in body["error"].lower()
 
 
+# ----- Map view rendering -----
+
+def test_dashboard_includes_map_view_and_toggle():
+    """The root route renders a page with the view-toggle button, a
+    hidden map container, the Leaflet CDN refs, and the map config
+    constants injected from pi.app.config."""
+    client = server.app.test_client()
+    res = client.get("/")
+    assert res.status_code == 200
+    html = res.data.decode("utf-8")
+    # Toggle button is present and starts with the map icon (initial
+    # state is the gauges view, button offers the map).
+    assert 'id="view-toggle"' in html
+    assert "🗺" in html or "Map" in html  # button has a map-related label
+    # Map container is in the page, hidden by default.
+    assert 'id="view-map"' in html
+    assert 'class="view-map view-hidden"' in html
+    assert 'id="map"' in html
+    # Leaflet CSS + JS refs from the public CDN.
+    assert "leaflet@1.9.4/dist/leaflet.css" in html
+    assert "leaflet@1.9.4/dist/leaflet.js" in html
+    # Server-side map config bridged into JS land via window.MAP_*
+    assert "window.MAP_CENTER" in html
+    assert "window.MAP_ZOOM" in html
+    assert "window.MAP_TILE_URL" in html
+
+
+def test_dashboard_map_center_matches_config():
+    """The injected MAP_CENTER must come from config.MAP_DEFAULT_CENTER
+    (Edmonton city center as shipped). Renumber the assertion if the
+    default is ever changed in pi/app/config.py."""
+    import re
+    from pi.app import config
+    client = server.app.test_client()
+    html = client.get("/").data.decode("utf-8")
+    lat, lon = config.MAP_DEFAULT_CENTER
+    # tojson renders the tuple as a JSON array [lat, lon]
+    assert f"[{lat}, {lon}]" in html, (
+        f"expected MAP_CENTER=[{lat}, {lon}] in rendered HTML"
+    )
+    # Zoom + tile URL also wired through. Jinja's tojson + indent can
+    # introduce extra whitespace around the `=`, so match loosely.
+    assert re.search(
+        rf"window\.MAP_ZOOM\s*=\s*{config.MAP_DEFAULT_ZOOM}\s*;", html
+    ), "MAP_ZOOM not injected"
+    assert config.MAP_TILE_URL in html
+
+
 def run():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     passed = 0

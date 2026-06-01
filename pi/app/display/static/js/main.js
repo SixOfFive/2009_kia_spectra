@@ -304,3 +304,73 @@ document.querySelectorAll('button[data-tx]').forEach(btn => {
     sendTransmit(which);
   });
 });
+
+
+// ----- Map view + toggle -----
+//
+// The dashboard ships with two views — gauges (default) and an
+// embedded Leaflet map. A floating button in the top-right corner
+// toggles between them. Leaflet itself is lazy-init'd so a kiosk
+// that never opens the map never pays the tile-fetch cost.
+
+let _mapInstance = null;
+const TOGGLE_STORAGE_KEY = 'vroom.view';
+
+function initMapIfNeeded() {
+  if (_mapInstance !== null) return;
+  if (typeof L === 'undefined') {
+    // Leaflet hasn't finished loading yet — retry on next animation
+    // frame. Cheap and avoids holding up the toggle UI.
+    requestAnimationFrame(initMapIfNeeded);
+    return;
+  }
+  _mapInstance = L.map('map', {
+    center: window.MAP_CENTER || [53.5461, -113.4938],
+    zoom: window.MAP_ZOOM || 12,
+    zoomControl: true,
+  });
+  L.tileLayer(
+    window.MAP_TILE_URL || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    {
+      attribution: window.MAP_TILE_ATTRIBUTION || '&copy; OpenStreetMap',
+      maxZoom: 19,
+    }
+  ).addTo(_mapInstance);
+}
+
+function setView(view) {
+  const mapEl = document.getElementById('view-map');
+  const btn = document.getElementById('view-toggle');
+  if (view === 'map') {
+    initMapIfNeeded();
+    mapEl.classList.remove('view-hidden');
+    mapEl.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('show-map');
+    btn.textContent = '📊 Gauges';
+    // Leaflet needs a hint to recompute size if the container was
+    // hidden when it was created.
+    if (_mapInstance) setTimeout(() => _mapInstance.invalidateSize(), 50);
+  } else {
+    mapEl.classList.add('view-hidden');
+    mapEl.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('show-map');
+    btn.textContent = '🗺 Map';
+  }
+  try { localStorage.setItem(TOGGLE_STORAGE_KEY, view); }
+  catch (e) { /* private mode — ignore */ }
+}
+
+document.getElementById('view-toggle').addEventListener('click', () => {
+  const current = document.body.classList.contains('show-map') ? 'map' : 'gauges';
+  setView(current === 'map' ? 'gauges' : 'map');
+});
+
+// Restore the last-shown view across page reloads — handy for the
+// kiosk: a vroom.service restart that reloads the page shouldn't
+// bounce the operator back to gauges if they were watching the map.
+(function restoreView() {
+  let saved = 'gauges';
+  try { saved = localStorage.getItem(TOGGLE_STORAGE_KEY) || 'gauges'; }
+  catch (e) { /* private mode — default to gauges */ }
+  if (saved === 'map') setView('map');
+})();

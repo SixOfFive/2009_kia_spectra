@@ -57,6 +57,28 @@ MQTT_ENABLED = True
 MQTT_PUBLISH_INTERVAL_S = 10
 
 
+# ----- Map view (Leaflet, lazy-loaded in the dashboard template) -----
+#
+# Default center / zoom for the map view that the toggle button opens.
+# The shipped default (Edmonton city center) is a public landmark — change
+# this to whatever makes sense for your install. The map is purely
+# visual: no GPS source on the Pi, no live position tracking. If you
+# later add a GPS receiver, panning the map to live position is a one-
+# line JS change in static/js/main.js.
+#
+# Tile source — OpenStreetMap raster. Subject to OSM's tile usage
+# policy (no bulk pre-caching, reasonable polling). If your install
+# does heavy daily use, swap to a self-rendered tile server or a
+# commercial provider with an API key.
+MAP_DEFAULT_CENTER = (53.5461, -113.4938)   # Edmonton city center
+MAP_DEFAULT_ZOOM = 12
+MAP_TILE_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+MAP_TILE_ATTRIBUTION = (
+    '&copy; <a href="https://www.openstreetmap.org/copyright">'
+    "OpenStreetMap</a> contributors"
+)
+
+
 # ----- SNMPv2c responder -----
 #
 # Runs as a thread inside this daemon so it shares the in-process

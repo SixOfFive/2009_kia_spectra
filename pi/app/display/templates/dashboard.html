@@ -5,8 +5,20 @@
   <meta name="viewport" content="width=800, initial-scale=1.0, user-scalable=no">
   <title>vroom — Spectra dashboard</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+  <!-- Leaflet for the map view. Loaded from a public CDN — same as the
+       slypi-side standalone map.html. The map view is hidden by default
+       so this is a deferred cost (browser won't fetch the tile JS until
+       the user taps the toggle). -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
 </head>
 <body>
+
+<!-- View-toggle button (top-right corner). Persists across both views;
+     tap toggles between dashboard and map. Mouse-click and touch-tap
+     are identical. -->
+<button id="view-toggle" class="view-toggle" type="button"
+        aria-label="Toggle between dashboard and map">🗺 Map</button>
 
 <header>
   <h1>2009 Kia Spectra</h1>
@@ -107,10 +119,24 @@
   </section>
 </main>
 
+<!-- Map view — hidden by default. Filled in by main.js the first time
+     the toggle button is tapped (lazy init so the browser doesn't pay
+     the Leaflet+tile-fetch cost until it's actually needed). -->
+<div id="view-map" class="view-map view-hidden" aria-hidden="true">
+  <div id="map"></div>
+</div>
+
 <script>
-  // Inject poll interval from server-side config
+  // Inject server-side config into JS land.
   window.POLL_MS = {{ poll_ms }};
+  window.MAP_CENTER = {{ map_center|tojson }};
+  window.MAP_ZOOM   = {{ map_zoom|tojson }};
+  window.MAP_TILE_URL = {{ map_tile_url|tojson }};
+  window.MAP_TILE_ATTRIBUTION = {{ map_tile_attribution|tojson }};
 </script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""
+        defer></script>
 <script src="{{ url_for('static', filename='js/main.js') }}"></script>
 </body>
 </html>

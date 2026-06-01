@@ -21,7 +21,7 @@ the 5" touchscreen, confirm it's reachable from any device on your LAN.
 3. In the Imager:
    - **Choose Device**: Raspberry Pi Zero 2 W
    - **Choose OS**: **Raspberry Pi OS Lite (64-bit)** — we don't need the
-     desktop, chromium kiosk is the only UI
+     LXDE desktop; a minimal X11 + openbox + surf kiosk is the only UI
    - **Choose Storage**: your SD card
    - Click the gear icon ⚙ for advanced options:
      - Set hostname: `vroom-spectra`
@@ -60,7 +60,8 @@ sudo bash /tmp/vroom-clone/pi/setup/provision.sh
 ```
 
 What this does (idempotent — safe to re-run):
-- Installs apt packages: flask, pyserial, chromium, unclutter, etc.
+- Installs apt packages: flask, pyserial, **surf** + **openbox** + **xinit**
+  (kiosk display stack — see "Why surf, not Chromium" below), unclutter, etc.
 - Installs paho-mqtt via pip
 - Enables UART hardware (disables serial console login)
 - Creates `/var/lib/vroom` and `/var/log/vroom`
@@ -68,7 +69,29 @@ What this does (idempotent — safe to re-run):
 - Writes `/etc/sudoers.d/vroom` so the daemon can `shutdown -h` without
   password
 - Installs and enables `vroom.service` systemd unit
-- Configures chromium kiosk autostart pointing at `http://localhost:8000`
+- Configures the surf-on-openbox kiosk to auto-launch on TTY1 login,
+  pointing at `http://localhost:8000/`
+
+### Why surf, not Chromium
+
+The earlier draft of this doc and `provision.sh` used Chromium with
+`--kiosk`. On the Pi Zero 2 W (512 MB RAM total, no swap to spare
+once vroom.service + mosquitto are loaded) **Chromium reliably
+OOM-killed itself** within a minute of loading the dashboard —
+observed during the slypi bring-up on 2026-05-31. Chromium's
+baseline RSS on this hardware is 250+ MB before the page even
+renders.
+
+**surf** (the suckless WebKit2GTK browser) handles the dashboard +
+Leaflet map at ~60 MB RSS, no swap thrash, no OOM. The tradeoff is
+no extension support, no DevTools, no dynamic config — but for a
+fixed-URL kiosk pointing at our own dashboard, none of that matters.
+
+If you're deploying on a Pi with significantly more RAM (Pi 4, Pi 5,
+or a Pi Zero 2 W with `gpu_mem=16` and aggressive memory tuning)
+Chromium is still an option — it's installed as a fallback by
+`provision.sh`. Switch the kiosk launcher in `~/.xinitrc` from `surf`
+to `chromium-browser --kiosk` if you go that direction.
 
 Watch the output for any errors. Common ones:
 
@@ -151,7 +174,7 @@ The Start / Stop / Ping buttons return 503 ("esp32 link not initialized")
 until the UART link comes up — that's expected at this point. We wire
 the ESP32 in step 11.
 
-## Step 8 — Attach the touchscreen + test chromium kiosk
+## Step 8 — Attach the touchscreen + test the kiosk
 
 1. Power off the Pi: `sudo shutdown -h now`
 2. Unplug the mini-HDMI from the test monitor; plug into the Elecrow
@@ -161,8 +184,9 @@ the ESP32 in step 11.
    micro-USB OTG port — for the in-cab install we'll likely use a USB
    hub since the Pi Zero only has one data USB port)
 4. Power up
-5. Pi should boot to chromium kiosk after ~25-30 seconds, displaying
-   the dashboard fullscreen at 800x480
+5. Pi should boot to the surf kiosk after ~25-30 seconds, displaying
+   the dashboard fullscreen at 800x480. (You'll briefly see TTY1's
+   login prompt and the X server start before surf takes over.)
 
 Touch the dashboard buttons to confirm touch input works (clicks should
 produce visible button-press visual feedback even though the commands
@@ -173,9 +197,13 @@ still return 503).
 - Pi flashed with Raspberry Pi OS Lite 64-bit
 - `vroom.service` running on boot, auto-restart on failure
 - Dashboard reachable at `http://vroom-spectra.local:8000` from your LAN
-- Chromium kiosk renders the dashboard fullscreen at 800x480 on the
+- surf kiosk renders the dashboard fullscreen at 800x480 on the
   Elecrow display on boot
-- Touch input works
+- Touch input works (mouse-click and touch-tap are identical in surf;
+  the same UI works on a non-touch HDMI monitor during bench testing
+  and on the Elecrow capacitive touchscreen in the car)
+- Tap the map/gauges toggle button (top-right corner) to switch
+  between the live OBD-II gauges and the live map view
 - Awareness that buttons return 503 until UART is wired in step 11
 
 ## Where artifacts go

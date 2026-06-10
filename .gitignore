@@ -54,9 +54,17 @@ boot.log
 # Secrets (don't commit keys, wifi passwords, MQTT creds, etc.)
 secrets.py
 secrets.json
+secrets.h
+**/secrets.h
 config.local.*
 *.key
 keeloq_device_key.txt
+
+# Arduino / arduino-cli build output (regenerable, large)
+esp32-s3/**/build/
+**/*.ino.bin
+**/*.ino.elf
+**/*.ino.map
 
 # Per-FOB sensitive analysis: serial number, function-code mapping,
 # captured hopping codes, counter values. The general framing.md is

@@ -54,6 +54,17 @@ struct CompustarPulse {
   uint16_t low_us;
 };
 
+// Result of a non-transmitting CC1101 health check. See CC1101Compustar::selfTest.
+struct CC1101SelfTest {
+  bool    spiOk;       // PARTNUM/VERSION are plausible (SPI + power good)
+  uint8_t partnum;     // expect 0x00
+  uint8_t version;     // expect 0x14 (0x04/0x07 on clones)
+  bool    regsOk;      // key 433/OOK config registers read back as written
+  bool    txEntered;   // chip reached a TX-path state after STX (GDO0 held low = no carrier)
+  uint8_t marcstate;   // last MARCSTATE seen during the TX-entry probe
+  bool    ok;          // spiOk && regsOk && txEntered
+};
+
 class CC1101Compustar {
  public:
   CC1101Compustar(SPIClass* spi, int sckPin, int misoPin, int mosiPin,
@@ -67,6 +78,13 @@ class CC1101Compustar {
   bool present();
   uint8_t partnum();
   uint8_t version();
+
+  // Non-transmitting health check: confirms SPI/power (PARTNUM/VERSION),
+  // that the 433/OOK config registers read back as written, and that the
+  // chip enters a TX-path state on STX. GDO0 is held LOW throughout, which
+  // in OOK is the '0'/off level (PATABLE[0]=0x00) — so NO carrier is
+  // radiated and nothing can be triggered. Safe to run any time.
+  CC1101SelfTest selfTest();
 
   // Validate a 35-char "0"/"1" pattern, render it to the OOK pulse train
   // (sync triplet + data bits), and transmit it `repeats` times with

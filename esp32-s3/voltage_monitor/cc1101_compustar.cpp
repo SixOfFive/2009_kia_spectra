@@ -15,7 +15,7 @@ enum {
   REG_FREND0 = 0x22,
   REG_FSCAL3 = 0x23, REG_FSCAL2 = 0x24, REG_FSCAL1 = 0x25, REG_FSCAL0 = 0x26,
   REG_TEST2 = 0x2C, REG_TEST1 = 0x2D, REG_TEST0 = 0x2E,
-  REG_PARTNUM = 0x30, REG_VERSION = 0x31,
+  REG_PARTNUM = 0x30, REG_VERSION = 0x31, REG_MARCSTATE = 0x35,
   REG_PATABLE = 0x3E,
 };
 
@@ -157,6 +157,48 @@ bool CC1101Compustar::present() {
   if (pn != 0x00) return false;
   if (ver == 0x00 || ver == 0xFF) return false;
   return true;
+}
+
+CC1101SelfTest CC1101Compustar::selfTest() {
+  CC1101SelfTest t = {};
+  t.partnum = partnum();
+  t.version = version();
+  t.spiOk = (t.partnum == 0x00) && (t.version != 0x00) && (t.version != 0xFF);
+
+  // Read back a handful of the values configure433Ook() wrote. If SPI
+  // read+write are sound and the chip held its config, these match.
+  struct Expect { uint8_t addr; uint8_t val; };
+  static const Expect expect[] = {
+    {REG_FREQ2, 0x10}, {REG_FREQ1, 0xB0}, {REG_FREQ0, 0x71},
+    {REG_PKTCTRL0, 0x32}, {REG_MDMCFG2, 0x30}, {REG_FREND0, 0x11},
+  };
+  t.regsOk = true;
+  for (const Expect& e : expect) {
+    if (readReg(e.addr) != e.val) { t.regsOk = false; break; }
+  }
+
+  // Confirm the chip enters the TX path on STX. GDO0 is held LOW the whole
+  // time = OOK '0' = carrier OFF, so this radiates nothing meaningful.
+  digitalWrite(_gdo0, LOW);
+  strobe(STR_SFTX);
+  strobe(STR_STX);
+  t.txEntered = false;
+  for (int i = 0; i < 50; i++) {           // poll up to ~5 ms
+    t.marcstate = readReg(REG_MARCSTATE) & 0x1F;
+    // 0x08-0x0B = calibrate/settling (en route to TX), 0x12 = FSTXON,
+    // 0x13 = TX. Any of these means the TX path engaged.
+    if (t.marcstate == 0x12 || t.marcstate == 0x13 ||
+        (t.marcstate >= 0x08 && t.marcstate <= 0x0B)) {
+      t.txEntered = true;
+      break;
+    }
+    delayMicroseconds(100);
+  }
+  strobe(STR_SIDLE);                         // back to IDLE, transmitter off
+  digitalWrite(_gdo0, LOW);
+
+  t.ok = t.spiOk && t.regsOk && t.txEntered;
+  return t;
 }
 
 void CC1101Compustar::transmitPulses(const CompustarPulse* pulses, size_t n) {

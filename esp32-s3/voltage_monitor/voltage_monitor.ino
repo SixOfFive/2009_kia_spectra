@@ -55,7 +55,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "1.6";             // 1.6 = + CC1101 433 MHz Compustar TX
+const char* FW_VERSION = "1.7";             // 1.7 = + CC1101 /rftest self-check
 
 const int   VSENSE_PIN = 1;                 // GPIO1 = ADC1_CH0 (ADC1 = safe with WiFi on)
 const float DIVIDER    = 5.545f;            // (1M + 220k) / 220k
@@ -455,6 +455,30 @@ void handleTransmit() {
   Serial.printf("RF TX: %s x%d\n", btn.c_str(), RF_REPEATS);
 }
 
+// GET /rftest — non-transmitting CC1101 health check (see CC1101::selfTest).
+// Confirms SPI/power, config register read-back, and TX-state entry WITHOUT
+// radiating a carrier. Cannot start the car. Safe to hit any time.
+void handleRfTest() {
+  trackReq();
+  if (!RF_ENABLED) {
+    const char* m = "{\"ok\":false,\"detail\":\"RF disabled in config\"}";
+    g_out_total += strlen(m); server.send(503, "application/json", m); return;
+  }
+  CC1101SelfTest t = radio.selfTest();
+  char j[320];
+  snprintf(j, sizeof(j),
+    "{\"ok\":%s,\"spi_ok\":%s,\"partnum\":\"0x%02X\",\"version\":\"0x%02X\","
+    "\"regs_ok\":%s,\"tx_entered\":%s,\"marcstate\":\"0x%02X\","
+    "\"patterns_captured\":%s,\"note\":\"no carrier radiated; cannot start car\"}",
+    t.ok ? "true" : "false", t.spiOk ? "true" : "false", t.partnum, t.version,
+    t.regsOk ? "true" : "false", t.txEntered ? "true" : "false", t.marcstate,
+    COMPUSTAR_PATTERNS_CAPTURED ? "true" : "false");
+  g_out_total += strlen(j);
+  server.send(t.ok ? 200 : 500, "application/json", j);
+  Serial.printf("RF self-test: ok=%d spi=%d regs=%d txEntered=%d marc=0x%02X\n",
+                t.ok, t.spiOk, t.regsOk, t.txEntered, t.marcstate);
+}
+
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 OTA</title><style>
@@ -551,6 +575,7 @@ void setup() {
       }
     });
   server.on("/transmit", HTTP_POST, handleTransmit);
+  server.on("/rftest", HTTP_GET, handleRfTest);
   server.onNotFound(handleDash);
   server.begin();
   Serial.println("HTTP up. / dashboard, /json data, /history CSV, /transmit RF.");
@@ -562,6 +587,10 @@ void setup() {
       Serial.printf("CC1101 detected (partnum 0x%02X, version 0x%02X). RF TX %s.\n",
                     radio.partnum(), radio.version(),
                     COMPUSTAR_PATTERNS_CAPTURED ? "ARMED" : "blocked (no captured patterns)");
+      // Non-transmitting self-check at boot (no carrier radiated).
+      CC1101SelfTest t = radio.selfTest();
+      Serial.printf("CC1101 self-test: %s (spi=%d regs=%d txEntered=%d marc=0x%02X)\n",
+                    t.ok ? "PASS" : "FAIL", t.spiOk, t.regsOk, t.txEntered, t.marcstate);
     } else {
       Serial.println("CC1101 NOT detected - check wiring/power. RF TX disabled.");
     }

@@ -99,6 +99,11 @@ chat.txt
 chat-*.txt
 CHAT.txt
 
+# Image staging folder at the project root — raw drops (screenshots,
+# phone photos) that get curated into logs/images/YYYY-MM-DD/ before
+# committing. The folder itself is scratch; don't commit it.
+/Pictures/
+
 # Claude Code local settings + agent worktrees (not shared)
 .claude/settings.local.json
 .claude/worktrees/

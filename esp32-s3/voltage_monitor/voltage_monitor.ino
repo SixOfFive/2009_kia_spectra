@@ -55,7 +55,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "1.7";             // 1.7 = + CC1101 /rftest self-check
+const char* FW_VERSION = "1.8";             // 1.8 = + GDO0 wire-continuity self-check
 
 const int   VSENSE_PIN = 1;                 // GPIO1 = ADC1_CH0 (ADC1 = safe with WiFi on)
 const float DIVIDER    = 5.545f;            // (1M + 220k) / 220k
@@ -465,18 +465,19 @@ void handleRfTest() {
     g_out_total += strlen(m); server.send(503, "application/json", m); return;
   }
   CC1101SelfTest t = radio.selfTest();
-  char j[320];
+  char j[360];
   snprintf(j, sizeof(j),
     "{\"ok\":%s,\"spi_ok\":%s,\"partnum\":\"0x%02X\",\"version\":\"0x%02X\","
-    "\"regs_ok\":%s,\"tx_entered\":%s,\"marcstate\":\"0x%02X\","
+    "\"regs_ok\":%s,\"tx_entered\":%s,\"marcstate\":\"0x%02X\",\"gdo0_ok\":%s,"
     "\"patterns_captured\":%s,\"note\":\"no carrier radiated; cannot start car\"}",
     t.ok ? "true" : "false", t.spiOk ? "true" : "false", t.partnum, t.version,
     t.regsOk ? "true" : "false", t.txEntered ? "true" : "false", t.marcstate,
+    t.gdo0Ok ? "true" : "false",
     COMPUSTAR_PATTERNS_CAPTURED ? "true" : "false");
   g_out_total += strlen(j);
   server.send(t.ok ? 200 : 500, "application/json", j);
-  Serial.printf("RF self-test: ok=%d spi=%d regs=%d txEntered=%d marc=0x%02X\n",
-                t.ok, t.spiOk, t.regsOk, t.txEntered, t.marcstate);
+  Serial.printf("RF self-test: ok=%d spi=%d regs=%d txEntered=%d marc=0x%02X gdo0=%d\n",
+                t.ok, t.spiOk, t.regsOk, t.txEntered, t.marcstate, t.gdo0Ok);
 }
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
@@ -589,8 +590,8 @@ void setup() {
                     COMPUSTAR_PATTERNS_CAPTURED ? "ARMED" : "blocked (no captured patterns)");
       // Non-transmitting self-check at boot (no carrier radiated).
       CC1101SelfTest t = radio.selfTest();
-      Serial.printf("CC1101 self-test: %s (spi=%d regs=%d txEntered=%d marc=0x%02X)\n",
-                    t.ok ? "PASS" : "FAIL", t.spiOk, t.regsOk, t.txEntered, t.marcstate);
+      Serial.printf("CC1101 self-test: %s (spi=%d regs=%d txEntered=%d marc=0x%02X gdo0=%d)\n",
+                    t.ok ? "PASS" : "FAIL", t.spiOk, t.regsOk, t.txEntered, t.marcstate, t.gdo0Ok);
     } else {
       Serial.println("CC1101 NOT detected - check wiring/power. RF TX disabled.");
     }

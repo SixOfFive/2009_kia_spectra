@@ -197,8 +197,45 @@ CC1101SelfTest CC1101Compustar::selfTest() {
   strobe(STR_SIDLE);                         // back to IDLE, transmitter off
   digitalWrite(_gdo0, LOW);
 
-  t.ok = t.spiOk && t.regsOk && t.txEntered;
+  t.gdo0Ok = gdo0Continuity();
+
+  t.ok = t.spiOk && t.regsOk && t.txEntered && t.gdo0Ok;
   return t;
+}
+
+bool CC1101Compustar::gdo0Continuity() {
+  // Confirm the GDO0<->GPIO wire is actually connected, with no extra
+  // hardware and no RF: have the CC1101 drive a clock onto its GDO0 pin and
+  // read it back on our GPIO. A connected, actively-driven pin overrides the
+  // ESP32's internal pull both ways; a floating (disconnected) pin just
+  // follows the pull. Chip stays in IDLE — nothing is radiated.
+  strobe(STR_SIDLE);
+
+  // Release the ESP32's drive BEFORE the CC1101 starts driving (avoid
+  // momentary output-vs-output contention).
+  pinMode(_gdo0, INPUT_PULLDOWN);
+  uint8_t savedIocfg0 = readReg(REG_IOCFG0);
+  writeReg(REG_IOCFG0, 0x3F);     // GDO0 = CLK_XOSC/192 (~135 kHz)
+  delayMicroseconds(300);
+
+  // Pulldown: a driven clock still shows HIGHs; a floating pin stays low.
+  bool sawHigh = false;
+  for (int i = 0; i < 4000; i++) { if (digitalRead(_gdo0)) { sawHigh = true; break; } }
+
+  // Pullup: a driven clock still shows LOWs; a floating pin stays high.
+  pinMode(_gdo0, INPUT_PULLUP);
+  delayMicroseconds(300);
+  bool sawLow = false;
+  for (int i = 0; i < 4000; i++) { if (!digitalRead(_gdo0)) { sawLow = true; break; } }
+
+  // Restore: CC1101 GDO0 back to async-data-in FIRST, then re-take the line
+  // as our output (again, no contention).
+  writeReg(REG_IOCFG0, savedIocfg0);   // 0x2D
+  pinMode(_gdo0, OUTPUT);
+  digitalWrite(_gdo0, LOW);
+
+  // Connected => the pin was actively driven to BOTH levels against the pull.
+  return sawHigh && sawLow;
 }
 
 void CC1101Compustar::transmitPulses(const CompustarPulse* pulses, size_t n) {

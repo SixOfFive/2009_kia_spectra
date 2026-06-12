@@ -62,7 +62,8 @@ struct CC1101SelfTest {
   bool    regsOk;      // key 433/OOK config registers read back as written
   bool    txEntered;   // chip reached a TX-path state after STX (GDO0 held low = no carrier)
   uint8_t marcstate;   // last MARCSTATE seen during the TX-entry probe
-  bool    ok;          // spiOk && regsOk && txEntered
+  bool    gdo0Ok;      // GDO0<->GPIO wire continuity confirmed (CC1101 drives, ESP32 reads back)
+  bool    ok;          // spiOk && regsOk && txEntered && gdo0Ok
 };
 
 class CC1101Compustar {
@@ -112,6 +113,10 @@ class CC1101Compustar {
 
   void reset();
   void configure433Ook(uint8_t txPower);
+
+  // GDO0<->GPIO continuity check: CC1101 drives a clock on GDO0, ESP32 reads
+  // it back. No RF (chip stays IDLE). Returns true if the wire is connected.
+  bool gdo0Continuity();
 
   // Drive GDO0 through one rendered pulse list once.
   void transmitPulses(const CompustarPulse* pulses, size_t n);

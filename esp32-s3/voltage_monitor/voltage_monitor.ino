@@ -55,7 +55,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "1.8";             // 1.8 = + GDO0 wire-continuity self-check
+const char* FW_VERSION = "1.9";             // 1.9 = manual remote-start TX armed (dashboard button)
 
 const int   VSENSE_PIN = 1;                 // GPIO1 = ADC1_CH0 (ADC1 = safe with WiFi on)
 const float DIVIDER    = 5.545f;            // (1M + 220k) / 220k
@@ -290,6 +290,8 @@ canvas{width:100%;height:104px;background:var(--card);border:1px solid #21262d;b
 footer{text-align:center;color:var(--mut);font-size:12px;padding:16px}
 button.tx{background:#21262d;color:var(--fg);border:1px solid #30363d;border-radius:8px;padding:10px 16px;font-size:14px;cursor:pointer}
 button.tx:active{background:#30363d}
+button.tx.start{background:#238636;border-color:#2ea043;font-size:18px;font-weight:600;padding:14px}
+button.tx.start:active{background:#2ea043}
 </style></head><body>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -314,11 +316,11 @@ button.tx:active{background:#30363d}
 <div class="card"><div class="k">Free heap</div><div class="v"><span id="heap">--</span> KB</div></div>
 <div class="card"><div class="k">Free PSRAM</div><div class="v"><span id="psram">--</span> MB</div></div>
 </div>
-<div class="clbl">Manual transmit &mdash; 433 MHz</div>
+<div class="clbl">Remote start &mdash; 433 MHz</div>
 <div class="card" style="margin-bottom:10px">
 <div class="k">CC1101 &middot; <span id="rfstat">&hellip;</span></div>
-<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-<button class="tx" data-b="START">Start</button>
+<button class="tx start" data-b="START" style="width:100%;margin-top:10px">&#128293; Start Engine</button>
+<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
 <button class="tx" data-b="LOCK">Lock</button>
 <button class="tx" data-b="UNLOCK">Unlock</button>
 <button class="tx" data-b="TRUNK">Trunk</button>
@@ -356,7 +358,7 @@ $("dot").style.background="#3fb950";$("stxt").textContent="live";
 }).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnecting…"})}
 document.querySelectorAll("button.tx").forEach(function(btn){btn.addEventListener("click",function(){
 var b=btn.getAttribute("data-b");
-if(b=="START"&&!confirm("Transmit START? If the CC1101 is wired and the patterns are real, this CRANKS THE ENGINE."))return;
+if(b=="START"&&!confirm("Start the engine now? This transmits the real remote-start code and CRANKS THE ENGINE if the car is in range."))return;
 $("rfmsg").textContent=b+" …";
 fetch("/transmit?button="+b,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
 $("rfmsg").textContent=d.ok?(b+" sent ×"+d.repeats):(b+" failed: "+(d.detail||"error"));

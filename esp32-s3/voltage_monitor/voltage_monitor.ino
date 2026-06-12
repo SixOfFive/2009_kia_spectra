@@ -21,6 +21,7 @@
 #include <LittleFS.h>
 #include <Update.h>
 #include <SPI.h>
+#include <time.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <XPT2046_Touchscreen.h>
@@ -55,7 +56,16 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "1.9";             // 1.9 = manual remote-start TX armed (dashboard button)
+const char* FW_VERSION = "2.0";             // 2.0 = NTP time sync + timestamped history + graph hover
+
+// ----- NTP time sync (only when WiFi STA is connected) -----
+const char* NTP_SERVER1 = "time.windows.com";
+const char* NTP_SERVER2 = "pool.ntp.org";
+// POSIX TZ for Mountain Time (Edmonton/Alberta) incl. DST. Change this one
+// string if you're elsewhere — it only affects on-device localtime; the
+// dashboard formats per-sample timestamps in the browser's own timezone.
+const char* TZ_INFO = "MST7MDT,M3.2.0,M11.1.0";
+const uint32_t NTP_RESYNC_MS = 6UL * 3600UL * 1000UL;   // re-sync every 6 h (drift)
 
 const int   VSENSE_PIN = 1;                 // GPIO1 = ADC1_CH0 (ADC1 = safe with WiFi on)
 const float DIVIDER    = 5.545f;            // (1M + 220k) / 220k
@@ -101,6 +111,7 @@ const uint16_t RF_GUARD_MS = 39;            // silence between repeats
 // -----------------------------------------------------------
 
 struct Sample {
+  uint32_t ts;          // unix epoch seconds when sampled (0 if NTP not yet synced)
   float    vbatt;       // volts
   float    temp;        // chip C
   uint16_t heap_kb;     // free heap, KB
@@ -109,6 +120,21 @@ struct Sample {
   uint32_t net_out;     // bytes sent this interval
   int16_t  rssi;        // WiFi RSSI dBm (0 in AP mode)
 };
+
+// ----- time sync state -----
+uint32_t lastNtpSyncMs = 0;     // millis() of the last configTzTime() kick
+bool     g_timeSynced  = false; // true once the clock reads a plausible year
+
+bool timeIsValid() {
+  return time(nullptr) > 1700000000UL;   // ~2023-11-14; means NTP set the clock
+}
+
+// Kick off (or refresh) SNTP. Safe to call repeatedly; each call re-queries
+// the servers. Only meaningful with a live STA connection.
+void syncTimeNow() {
+  configTzTime(TZ_INFO, NTP_SERVER1, NTP_SERVER2);
+  lastNtpSyncMs = millis();
+}
 
 WebServer server(80);
 DNSServer dnsServer;
@@ -223,6 +249,7 @@ void dispDrawValue(float v, float tC) {
 void recordSample() {
   if (!hist) return;
   Sample s;
+  s.ts      = timeIsValid() ? (uint32_t)time(nullptr) : 0;
   s.vbatt   = readBatteryVolts();
   s.temp    = temperatureRead();
   s.heap_kb = (uint16_t)(ESP.getFreeHeap() / 1024);
@@ -239,7 +266,7 @@ void saveHistory() {
   if (!hist) return;
   File f = LittleFS.open("/history.bin", FILE_WRITE);
   if (!f) return;
-  uint32_t magic = 0x564F4C32;                 // "VOLT"
+  uint32_t magic = 0x564F4C33;                 // "VOL3" (added per-sample ts)
   f.write((uint8_t*)&magic, 4);
   f.write((uint8_t*)&histCount, 4);
   f.write((uint8_t*)&histHead, 4);
@@ -253,7 +280,7 @@ void loadHistory() {
   if (!f) return;
   uint32_t magic = 0;
   f.read((uint8_t*)&magic, 4);
-  if (magic == 0x564F4C32) {
+  if (magic == 0x564F4C33) {           // older formats (no ts) are discarded
     f.read((uint8_t*)&histCount, 4);
     f.read((uint8_t*)&histHead, 4);
     f.read((uint8_t*)hist, sizeof(Sample) * HIST_N);
@@ -282,7 +309,7 @@ h1{font-size:16px;margin:0;font-weight:600}
 .metric .u{font-size:16px;color:var(--mut)}
 .sub{color:var(--mut);font-size:13px;text-align:center;margin:10px 0}
 .clbl{color:var(--mut);font-size:12px;margin:14px 0 5px;text-transform:uppercase;letter-spacing:.04em}
-canvas{width:100%;height:104px;background:var(--card);border:1px solid #21262d;border-radius:10px;display:block}
+canvas{width:100%;height:104px;background:var(--card);border:1px solid #21262d;border-radius:10px;display:block;cursor:crosshair}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin:18px 0}
 .card{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px}
 .card .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
@@ -292,7 +319,9 @@ button.tx{background:#21262d;color:var(--fg);border:1px solid #30363d;border-rad
 button.tx:active{background:#30363d}
 button.tx.start{background:#238636;border-color:#2ea043;font-size:18px;font-weight:600;padding:14px}
 button.tx.start:active{background:#2ea043}
+#tip{position:fixed;display:none;pointer-events:none;z-index:50;background:#1f2733;color:var(--fg);border:1px solid #30363d;border-radius:6px;padding:6px 9px;font-size:12px;line-height:1.45;box-shadow:0 2px 10px rgba(0,0,0,.5);white-space:nowrap}
 </style></head><body>
+<div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
 <div class="wrap">
@@ -328,20 +357,66 @@ button.tx.start:active{background:#2ea043}
 <div class="k" id="rfmsg" style="margin-top:10px">&nbsp;</div>
 </div>
 </div>
-<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <a href="/update">update</a></footer>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span> &middot; <a href="/update">update</a></footer>
 <script>
 function $(i){return document.getElementById(i)}
 function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
-var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657"],DEC=[2,1,0,0,0,0,0];
-function chart(id,data,color,dec){var c=$(id),x=c.getContext("2d"),W=c.width,H=c.height;x.clearRect(0,0,W,H);if(data.length<2)return;
-var lo=Math.min.apply(null,data),hi=Math.max.apply(null,data),N=data.length;if(hi-lo<1e-6){hi+=1;lo-=1}
-var p=8;function gx(i){return p+i*(W-2*p)/(N-1)}function gy(v){return H-p-(v-lo)/(hi-lo)*(H-2*p)}
-x.strokeStyle=color;x.lineWidth=1.5;x.beginPath();
-data.forEach(function(v,i){i?x.lineTo(gx(i),gy(v)):x.moveTo(gx(i),gy(v))});x.stroke();
-x.fillStyle="#8b949e";x.font="11px system-ui";x.fillText(hi.toFixed(dec),6,13);x.fillText(lo.toFixed(dec),6,H-5)}
+// 7 graphs, in canvas order c0..c6, mapped to /history data columns 1..7.
+var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657"];
+var DEC=[2,1,0,0,0,0,0];
+var UNITS=["V","°C","KB","KB","B/min","B/min","dBm"];
+var PAD=8;
+var CHARTS={};      // id -> {data, lo, hi, color, dec, unit}
+var TS=[];          // per-sample epoch seconds (0 if NTP not synced), parallel to data
+var hoverIdx=-1;
+var IDS=["c0","c1","c2","c3","c4","c5","c6"];
+function fmtWhen(i){
+  var t=TS[i];
+  if(t&&t>1700000000){return new Date(t*1000).toLocaleString();}   // absolute (browser-local)
+  var m=Math.floor((TS.length-1-i)*60/60);                          // fallback: relative from index
+  return m>=60?(Math.floor(m/60)+"h "+(m%60)+"m ago"):(m+"m ago");
+}
+function drawChart(id){
+  var ch=CHARTS[id];if(!ch)return;
+  var c=$(id),x=c.getContext("2d"),W=c.width,H=c.height;x.clearRect(0,0,W,H);
+  var data=ch.data,N=data.length;if(N<2)return;var lo=ch.lo,hi=ch.hi;
+  function gx(i){return PAD+i*(W-2*PAD)/(N-1)}function gy(v){return H-PAD-(v-lo)/(hi-lo)*(H-2*PAD)}
+  x.strokeStyle=ch.color;x.lineWidth=1.5;x.beginPath();
+  data.forEach(function(v,i){i?x.lineTo(gx(i),gy(v)):x.moveTo(gx(i),gy(v))});x.stroke();
+  x.fillStyle="#8b949e";x.font="11px system-ui";x.fillText(hi.toFixed(ch.dec),6,13);x.fillText(lo.toFixed(ch.dec),6,H-5);
+  if(hoverIdx>=0&&hoverIdx<N){var hx=gx(hoverIdx),hy=gy(data[hoverIdx]);
+    x.strokeStyle="#6e7681";x.lineWidth=1;x.beginPath();x.moveTo(hx,PAD);x.lineTo(hx,H-PAD);x.stroke();
+    x.fillStyle=ch.color;x.beginPath();x.arc(hx,hy,3.5,0,6.2832);x.fill();}
+}
+function drawAll(){IDS.forEach(drawChart)}
+function idxFromEvent(ev,id){
+  var ch=CHARTS[id];if(!ch||ch.data.length<2)return -1;
+  var c=$(id),r=c.getBoundingClientRect(),W=c.width,N=ch.data.length;
+  var xint=(ev.clientX-r.left)/r.width*W;
+  var i=Math.round((xint-PAD)/((W-2*PAD)/(N-1)));
+  return Math.max(0,Math.min(N-1,i));
+}
+function showTip(ev,id){
+  var ch=CHARTS[id];if(!ch||hoverIdx<0)return;
+  $("tip").innerHTML="<b>"+ch.data[hoverIdx].toFixed(ch.dec)+" "+ch.unit+"</b><br>"+fmtWhen(hoverIdx);
+  $("tip").style.display="block";
+  var tx=ev.clientX+12;if(tx+170>window.innerWidth)tx=ev.clientX-160;
+  $("tip").style.left=tx+"px";$("tip").style.top=(ev.clientY+12)+"px";
+}
+function setupHover(){IDS.forEach(function(id){var c=$(id);
+  c.addEventListener("mousemove",function(ev){hoverIdx=idxFromEvent(ev,id);drawAll();showTip(ev,id)});
+  c.addEventListener("mouseleave",function(){hoverIdx=-1;drawAll();$("tip").style.display="none"});
+})}
 function loadHistory(){fetch("/history",{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
 var ln=t.trim().split("\n"),rows=[];for(var i=1;i<ln.length;i++){rows.push(ln[i].split(",").map(Number))}
-for(var col=0;col<7;col++){(function(col){chart("c"+col,rows.map(function(r){return r[col]}),COLS[col],DEC[col])})(col)}
+if(!rows.length)return;
+TS=rows.map(function(r){return r[0]});
+for(var col=0;col<7;col++){(function(col){
+  var data=rows.map(function(r){return r[col+1]});           // data cols 1..7
+  var lo=Math.min.apply(null,data),hi=Math.max.apply(null,data);if(hi-lo<1e-6){hi+=1;lo-=1}
+  CHARTS["c"+col]={data:data,lo:lo,hi:hi,color:COLS[col],dec:DEC[col],unit:UNITS[col]};
+})(col)}
+drawAll();
 }).catch(function(e){})}
 function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
 $("vbatt").textContent=d.vbatt.toFixed(2);$("temp").textContent=d.temp_c.toFixed(1);
@@ -351,6 +426,7 @@ $("heap").textContent=Math.floor(d.heap_free/1024);$("psram").textContent=(d.psr
 $("disk").textContent=Math.floor(d.disk_used/1024)+"/"+Math.floor(d.disk_total/1024)+" KB";
 $("sub").textContent="divider ×"+d.divider+" · cal "+d.cal+" · ADC "+d.adc_mv+" mV · 1 sample/"+d.interval_s+"s";
 $("net").textContent=(d.mode?d.mode.toUpperCase():"")+" · "+(d.ip||"");$("ns").textContent=d.samples;$("fw").textContent=d.fw||"?";
+$("clk").textContent=d.time_ok?new Date(d.epoch*1000).toLocaleTimeString():"no NTP";
 var RF={armed:"armed",blocked:"present, no patterns",absent:"not detected",off:"disabled"};
 $("rfstat").textContent=RF[d.rf]||d.rf||"?";
 $("rfstat").style.color=(d.rf=="armed")?"#3fb950":(d.rf=="blocked"?"#d29922":"#8b949e");
@@ -363,7 +439,7 @@ $("rfmsg").textContent=b+" …";
 fetch("/transmit?button="+b,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
 $("rfmsg").textContent=d.ok?(b+" sent ×"+d.repeats):(b+" failed: "+(d.detail||"error"));
 }).catch(function(e){$("rfmsg").textContent=b+" request error"})})});
-setInterval(poll,2000);setInterval(loadHistory,30000);poll();loadHistory();
+setupHover();setInterval(poll,2000);setInterval(loadHistory,30000);poll();loadHistory();
 </script></body></html>
 )HTML";
 
@@ -384,13 +460,15 @@ void handleJson() {
     "{\"vbatt\":%.2f,\"temp_c\":%.1f,\"adc_mv\":%d,\"divider\":%.3f,\"cal\":%.3f,"
     "\"rssi\":%d,\"uptime_s\":%lu,\"heap_free\":%u,\"heap_total\":%u,"
     "\"psram_free\":%u,\"psram_total\":%u,\"disk_used\":%u,\"disk_total\":%u,"
-    "\"mode\":\"%s\",\"ip\":\"%s\",\"interval_s\":%d,\"samples\":%d,\"led\":\"%s\",\"fw\":\"%s\",\"rf\":\"%s\"}",
+    "\"mode\":\"%s\",\"ip\":\"%s\",\"interval_s\":%d,\"samples\":%d,\"led\":\"%s\",\"fw\":\"%s\",\"rf\":\"%s\","
+    "\"epoch\":%lu,\"time_ok\":%s}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
     (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes(),
     apMode ? "ap" : "sta", ip.c_str(), (int)(SAMPLE_MS / 1000), histCount, voltStatus(v), FW_VERSION,
-    rfStatusStr());
+    rfStatusStr(),
+    (unsigned long)(timeIsValid() ? (uint32_t)time(nullptr) : 0), timeIsValid() ? "true" : "false");
   g_out_total += strlen(json);
   server.send(200, "application/json", json);
 }
@@ -400,7 +478,7 @@ void handleHistory() {
   trackReq();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  const char* hdr = "vbatt,temp,heap_kb,disk_kb,net_in,net_out,rssi\n";
+  const char* hdr = "ts,vbatt,temp,heap_kb,disk_kb,net_in,net_out,rssi\n";
   g_out_total += strlen(hdr);
   server.sendContent(hdr);
   if (hist) {
@@ -408,6 +486,7 @@ void handleHistory() {
     String chunk; chunk.reserve(2048);
     for (int n = 0; n < histCount; n++) {
       Sample& s = hist[(oldest + n) % HIST_N];
+      chunk += s.ts;               chunk += ',';
       chunk += String(s.vbatt, 2); chunk += ',';
       chunk += String(s.temp, 1);  chunk += ',';
       chunk += s.heap_kb; chunk += ',';
@@ -550,8 +629,10 @@ void setup() {
                   (unsigned long)(millis() - t0), WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
     if (MDNS.begin(HOSTNAME)) { MDNS.addService("http", "tcp", 80);
       Serial.printf("Reachable at: http://%s.local/  or  http://%s/\n", HOSTNAME, WiFi.localIP().toString().c_str()); }
+    syncTimeNow();   // kick off NTP now that STA is up
+    Serial.printf("NTP sync requested (%s / %s)\n", NTP_SERVER1, NTP_SERVER2);
   } else {
-    startAP();   // boot-time failure -> AP immediately
+    startAP();   // boot-time failure -> AP immediately (no NTP in AP mode)
   }
 
   server.on("/", handleDash);
@@ -637,6 +718,23 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) downSince = 0;
     else { if (downSince == 0) downSince = now;
            else if (now - downSince >= AP_AFTER_DOWN_MS) startAP(); }
+  }
+
+  // NTP time: only meaningful with a live STA connection.
+  if (!apMode && WiFi.status() == WL_CONNECTED) {
+    if (!g_timeSynced) {
+      // Not synced yet — retry every 30 s after the boot kick until the
+      // clock reads a plausible year.
+      if (timeIsValid()) {
+        g_timeSynced = true;
+        Serial.printf("NTP synced: %lu\n", (unsigned long)time(nullptr));
+      } else if (now - lastNtpSyncMs >= 30000) {
+        syncTimeNow();
+      }
+    } else if (now - lastNtpSyncMs >= NTP_RESYNC_MS) {
+      syncTimeNow();                               // periodic re-sync (drift)
+      Serial.println("NTP re-sync (6h)");
+    }
   }
 
   if (now - lastSample >= SAMPLE_MS) { lastSample = now; recordSample(); }

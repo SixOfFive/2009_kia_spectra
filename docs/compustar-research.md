@@ -69,17 +69,39 @@ working with a Compustar variant that does use HCS-KeeLoq. See
 - No FIFO, no packet engine — direct OOK pulse train control gives
   microsecond-precise timing across the 700–1500 µs pulse range
 
-## Why a thief can't exploit this
+## Security reality — fixed code is the weak link, not the leak
 
-- The brain validates the on-air packet, but the car still requires
-  the **mechanical key in the cylinder** to release the steering
-  column lock
-- Without the steering lock released, the car can idle but cannot be
-  driven
-- This is the same security model as factory remote start on modern
-  cars — the system is no less secure than the existing FOB
+Earlier drafts of this file claimed "a thief can't exploit this." That
+was too comforting. The honest picture:
 
-The captured 35-bit patterns are FOB-identifying values and live in
-`sdr/analysis/framing.local.md` (gitignored) — not the committed
-`framing.md`. They have the same security weight as the physical FOB:
-treat them as you'd treat your car keys.
+**What still protects the car:** the brain validates the on-air packet,
+but driving away still needs the **mechanical key** in the cylinder to
+release the steering-column lock. So a successful RF attack can make the
+car *idle*, not *drive off*. That part is true and unchanged.
+
+**The real weakness — this is FIXED CODE, so it's brute-forceable.**
+There is no rolling counter. A given button always sends the same
+packet, and the only per-vehicle variable is the **16-bit Remote ID**
+(~65,000 values); the button codes themselves are a small known set.
+That means anyone with a sub-GHz transmitter — *exactly the CC1101 +
+ESP32 this project is built on* — can simply **cycle through the code
+space and transmit the unlock / remote-start code for every ID in
+turn.** In a parking lot full of Compustar-1WG3R-equipped vehicles you
+don't even need to target one: you're spraying codes, and any car whose
+ID comes up answers — unlocking and remote-starting strangers' cars in
+short order. With many such vehicles present the effective search
+collapses to near-trivial.
+
+This is not a flaw in *this* build — it's inherent to every fixed-code
+remote, and it's the entire reason rolling-code systems (KeeLoq and the
+like) exist. The only real fix is on the FOB/brain side: a rolling-code
+remote-start, not a 1WG3R fixed-code one.
+
+**Consequence for the captured codes:** because the protocol is already
+cycle-able by anyone, the secrecy of *this* FOB's specific 35-bit
+patterns buys very little. They're kept out of the committed tree
+(`sdr/analysis/framing.local.md` is gitignored; the firmware reads them
+from a gitignored `secrets.h`) as basic hygiene — treat them like your
+car keys — but understand that the fixed-code scheme, not the
+confidentiality of these particular bits, is what actually determines
+the car's exposure.

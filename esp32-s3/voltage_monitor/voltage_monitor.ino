@@ -22,6 +22,7 @@
 #include <Update.h>
 #include <SPI.h>
 #include <time.h>
+#include <Preferences.h>   // NVS-backed persistence for CPU clock + WiFi power-save
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <XPT2046_Touchscreen.h>
@@ -56,7 +57,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "2.1";             // 2.1 = CPU clock toggle (80/240 MHz) + WiFi power-save toggle
+const char* FW_VERSION = "2.2";             // 2.2 = CPU clock + WiFi power-save persist across reboot (NVS)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -140,6 +141,13 @@ WebServer server(80);
 DNSServer dnsServer;
 bool      apMode    = false;
 int       g_last_mv = 0;
+
+// Persisted power/perf settings (NVS). Loaded in setup(), re-saved on each
+// toggle. NVS lives in a flash partition, so these survive reboot AND a
+// brownout — the chosen CPU clock and WiFi power-save state come back.
+Preferences prefs;
+uint32_t  g_cpu_mhz = 240;       // restored at boot, then applied
+bool      g_wifi_ps = true;      // restored at boot, then applied (true = modem-sleep)
 
 Sample*   hist      = nullptr;               // ring buffer (in PSRAM)
 int       histCount = 0;                     // valid samples (<= HIST_N)
@@ -605,6 +613,8 @@ void handleCpu() {
     g_out_total += strlen(m); server.send(400, "application/json", m); return;
   }
   setCpuFrequencyMhz((uint32_t)mhz);
+  g_cpu_mhz = getCpuFrequencyMhz();
+  prefs.putUInt("cpu_mhz", g_cpu_mhz);          // persist across reboot/brownout
   char j[80];
   snprintf(j, sizeof(j), "{\"ok\":true,\"cpu_mhz\":%u}", (unsigned)getCpuFrequencyMhz());
   g_out_total += strlen(j);
@@ -620,6 +630,8 @@ void handleWifiPs() {
   trackReq();
   bool on = server.arg("on").toInt() != 0;
   WiFi.setSleep(on);
+  g_wifi_ps = WiFi.getSleep();
+  prefs.putBool("wifi_ps", g_wifi_ps);          // persist across reboot/brownout
   char j[80];
   snprintf(j, sizeof(j), "{\"ok\":true,\"wifi_ps\":%s}", WiFi.getSleep() ? "true" : "false");
   g_out_total += strlen(j);
@@ -669,6 +681,18 @@ void startAP() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+
+  // Restore persisted power/perf settings from NVS and apply the CPU clock
+  // now (before WiFi). Falls back to the compiled defaults on first boot or
+  // a bad/garbage value.
+  prefs.begin("vroom", false);
+  g_cpu_mhz = prefs.getUInt("cpu_mhz", 240);
+  g_wifi_ps = prefs.getBool("wifi_ps", true);
+  if (g_cpu_mhz != 80 && g_cpu_mhz != 240) g_cpu_mhz = 240;   // sanity guard
+  setCpuFrequencyMhz(g_cpu_mhz);
+  Serial.printf("NVS restore: CPU %u MHz, WiFi power-save %s\n",
+                (unsigned)g_cpu_mhz, g_wifi_ps ? "ON" : "OFF");
+
   analogSetPinAttenuation(VSENSE_PIN, ADC_11db);
 
   if (LittleFS.begin(true)) Serial.printf("LittleFS mounted: %u / %u bytes used\n",
@@ -686,6 +710,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.setSleep(g_wifi_ps);            // apply persisted WiFi power-save state
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(400); Serial.print("."); }
   Serial.println();

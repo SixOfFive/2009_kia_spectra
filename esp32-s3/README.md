@@ -12,18 +12,27 @@ and the divergence rationale.
 
 ## What it does
 
-`voltage_monitor/voltage_monitor.ino` (fw 1.6):
+`voltage_monitor/voltage_monitor.ino` (fw 2.2):
 
 1. **Battery voltage** — reads a 1 MΩ / 220 kΩ divider on **GPIO1**
    (ADC1_CH0), scaled ×5.545, 64× averaged. 24 h history (1440 samples
-   @ 60 s) in PSRAM, snapshotted to LittleFS so it survives reboots.
+   @ 60 s, each timestamped) in PSRAM, snapshotted to LittleFS so it
+   survives reboots.
 2. **Web dashboard** served by the S3 itself — voltage + chip-temp
-   gauges, seven 24 h charts, stat tiles, OTA at `/update`. WiFi STA with
-   an AP fallback.
-3. **CC1101 433 MHz Compustar transmitter** (NEW in 1.6) — replays the
-   captured 1WG3R fixed-code packets to trigger the factory remote start.
+   gauges, seven 24 h charts with **per-point hover tooltips** (value +
+   when), stat tiles, OTA at `/update`. WiFi STA with an AP fallback.
+   **NTP time sync** (`time.windows.com`, re-synced every 6 h) drives a
+   live footer clock and the timestamps on the history/tooltips.
+3. **CC1101 433 MHz Compustar transmitter** — replays the captured
+   1WG3R fixed-code packets to trigger the factory remote start.
    `POST /transmit?button=START|LOCK|UNLOCK|TRUNK`, plus four buttons on
    the dashboard.
+4. **Power & performance controls** (NEW in 2.2) — a dashboard card to
+   toggle the **CPU clock** (80 / 240 MHz, `POST /cpu?mhz=`) and **WiFi
+   power-save** (`POST /wifips?on=`), each showing the current state
+   plainly. Both **persist across reboot/brownout** in NVS
+   (`Preferences`) and are re-applied at boot — 80 MHz is the WiFi-safe
+   floor, so the radio survives the clock drop.
 
 ## Layout
 

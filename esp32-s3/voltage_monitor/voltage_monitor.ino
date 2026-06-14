@@ -56,7 +56,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "2.0";             // 2.0 = NTP time sync + timestamped history + graph hover
+const char* FW_VERSION = "2.1";             // 2.1 = CPU clock toggle (80/240 MHz) + WiFi power-save toggle
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -320,6 +320,10 @@ button.tx:active{background:#30363d}
 button.tx.start{background:#238636;border-color:#2ea043;font-size:18px;font-weight:600;padding:14px}
 button.tx.start:active{background:#2ea043}
 #tip{position:fixed;display:none;pointer-events:none;z-index:50;background:#1f2733;color:var(--fg);border:1px solid #30363d;border-radius:6px;padding:6px 9px;font-size:12px;line-height:1.45;box-shadow:0 2px 10px rgba(0,0,0,.5);white-space:nowrap}
+button.tx.seg.on{background:#1f6feb;border-color:#388bfd;color:#fff;font-weight:600}
+.badge{display:inline-block;padding:2px 12px;border-radius:20px;font-size:15px;font-weight:700;letter-spacing:.03em}
+.badge.on{background:#1a7f37;color:#fff}.badge.off{background:#30363d;color:#8b949e}
+.pwrrow{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
 </style></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
@@ -344,6 +348,18 @@ button.tx.start:active{background:#2ea043}
 <div class="card"><div class="k">Disk</div><div class="v"><span id="disk">--</span></div></div>
 <div class="card"><div class="k">Free heap</div><div class="v"><span id="heap">--</span> KB</div></div>
 <div class="card"><div class="k">Free PSRAM</div><div class="v"><span id="psram">--</span> MB</div></div>
+</div>
+<div class="clbl">Power &amp; performance</div>
+<div class="card" style="margin-bottom:10px">
+<div class="pwrrow">
+<div><div class="k">CPU clock</div><div class="v"><span id="cpu">--</span> MHz</div></div>
+<div style="display:flex;gap:6px"><button class="tx seg" data-mhz="80">80 MHz</button><button class="tx seg" data-mhz="240">240 MHz</button></div>
+</div>
+<div class="pwrrow" style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d">
+<div><div class="k">WiFi power saving</div><div class="v"><span id="psbadge">--</span></div></div>
+<button class="tx" id="psbtn">&hellip;</button>
+</div>
+<div class="k" id="pwrmsg" style="margin-top:10px">&nbsp;</div>
 </div>
 <div class="clbl">Remote start &mdash; 433 MHz</div>
 <div class="card" style="margin-bottom:10px">
@@ -430,6 +446,11 @@ $("clk").textContent=d.time_ok?new Date(d.epoch*1000).toLocaleTimeString():"no N
 var RF={armed:"armed",blocked:"present, no patterns",absent:"not detected",off:"disabled"};
 $("rfstat").textContent=RF[d.rf]||d.rf||"?";
 $("rfstat").style.color=(d.rf=="armed")?"#3fb950":(d.rf=="blocked"?"#d29922":"#8b949e");
+$("cpu").textContent=d.cpu_mhz;
+document.querySelectorAll("button.seg").forEach(function(b){b.classList.toggle("on",+b.getAttribute("data-mhz")===d.cpu_mhz)});
+var ps=!!d.wifi_ps;
+$("psbadge").innerHTML='<span class="badge '+(ps?"on":"off")+'">'+(ps?"ON":"OFF")+'</span>';
+$("psbtn").textContent=ps?"Turn OFF":"Turn ON";$("psbtn").setAttribute("data-next",ps?"0":"1");
 $("dot").style.background="#3fb950";$("stxt").textContent="live";
 }).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnecting…"})}
 document.querySelectorAll("button.tx").forEach(function(btn){btn.addEventListener("click",function(){
@@ -439,6 +460,16 @@ $("rfmsg").textContent=b+" …";
 fetch("/transmit?button="+b,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
 $("rfmsg").textContent=d.ok?(b+" sent ×"+d.repeats):(b+" failed: "+(d.detail||"error"));
 }).catch(function(e){$("rfmsg").textContent=b+" request error"})})});
+document.querySelectorAll("button.seg").forEach(function(b){b.addEventListener("click",function(){
+var m=b.getAttribute("data-mhz");$("pwrmsg").textContent="setting CPU to "+m+" MHz…";
+fetch("/cpu?mhz="+m,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+$("pwrmsg").textContent=d.ok?("CPU now "+d.cpu_mhz+" MHz"):("CPU change failed: "+(d.detail||"error"));poll();
+}).catch(function(e){$("pwrmsg").textContent="CPU request error"})})});
+$("psbtn").addEventListener("click",function(){
+var nx=$("psbtn").getAttribute("data-next")||"0";$("pwrmsg").textContent="updating WiFi power saving…";
+fetch("/wifips?on="+nx,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+$("pwrmsg").textContent="WiFi power saving "+(d.wifi_ps?"ON":"OFF");poll();
+}).catch(function(e){$("pwrmsg").textContent="WiFi power-save request error"})});
 setupHover();setInterval(poll,2000);setInterval(loadHistory,30000);poll();loadHistory();
 </script></body></html>
 )HTML";
@@ -455,20 +486,21 @@ void handleJson() {
   float tC = temperatureRead();
   String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   int    rssi = apMode ? 0 : (int)WiFi.RSSI();
-  char json[512];
+  char json[640];
   snprintf(json, sizeof(json),
     "{\"vbatt\":%.2f,\"temp_c\":%.1f,\"adc_mv\":%d,\"divider\":%.3f,\"cal\":%.3f,"
     "\"rssi\":%d,\"uptime_s\":%lu,\"heap_free\":%u,\"heap_total\":%u,"
     "\"psram_free\":%u,\"psram_total\":%u,\"disk_used\":%u,\"disk_total\":%u,"
     "\"mode\":\"%s\",\"ip\":\"%s\",\"interval_s\":%d,\"samples\":%d,\"led\":\"%s\",\"fw\":\"%s\",\"rf\":\"%s\","
-    "\"epoch\":%lu,\"time_ok\":%s}",
+    "\"epoch\":%lu,\"time_ok\":%s,\"cpu_mhz\":%u,\"wifi_ps\":%s}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
     (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes(),
     apMode ? "ap" : "sta", ip.c_str(), (int)(SAMPLE_MS / 1000), histCount, voltStatus(v), FW_VERSION,
     rfStatusStr(),
-    (unsigned long)(timeIsValid() ? (uint32_t)time(nullptr) : 0), timeIsValid() ? "true" : "false");
+    (unsigned long)(timeIsValid() ? (uint32_t)time(nullptr) : 0), timeIsValid() ? "true" : "false",
+    (unsigned)getCpuFrequencyMhz(), WiFi.getSleep() ? "true" : "false");
   g_out_total += strlen(json);
   server.send(200, "application/json", json);
 }
@@ -559,6 +591,40 @@ void handleRfTest() {
   server.send(t.ok ? 200 : 500, "application/json", j);
   Serial.printf("RF self-test: ok=%d spi=%d regs=%d txEntered=%d marc=0x%02X gdo0=%d\n",
                 t.ok, t.spiOk, t.regsOk, t.txEntered, t.marcstate, t.gdo0Ok);
+}
+
+// POST /cpu?mhz=80|240 — set the CPU clock. 80 MHz is the floor that still
+// keeps WiFi alive; 240 MHz is full speed. Returns the live (verified) freq.
+// Lower clock = less self-heating and a bit less current draw (the radio
+// dominates power, but every mA helps a parked-car monitor).
+void handleCpu() {
+  trackReq();
+  long mhz = server.arg("mhz").toInt();
+  if (mhz != 80 && mhz != 240) {
+    const char* m = "{\"ok\":false,\"detail\":\"mhz must be 80 or 240\"}";
+    g_out_total += strlen(m); server.send(400, "application/json", m); return;
+  }
+  setCpuFrequencyMhz((uint32_t)mhz);
+  char j[80];
+  snprintf(j, sizeof(j), "{\"ok\":true,\"cpu_mhz\":%u}", (unsigned)getCpuFrequencyMhz());
+  g_out_total += strlen(j);
+  server.send(200, "application/json", j);
+  Serial.printf("CPU clock set to %u MHz (requested %ld)\n", (unsigned)getCpuFrequencyMhz(), mhz);
+}
+
+// POST /wifips?on=0|1 — enable/disable WiFi modem-sleep power saving.
+//   on=1  -> radio dozes between DTIM beacons (default; saves power, adds latency)
+//   on=0  -> radio always on (snappier, draws more current)
+// Returns the live state from WiFi.getSleep().
+void handleWifiPs() {
+  trackReq();
+  bool on = server.arg("on").toInt() != 0;
+  WiFi.setSleep(on);
+  char j[80];
+  snprintf(j, sizeof(j), "{\"ok\":true,\"wifi_ps\":%s}", WiFi.getSleep() ? "true" : "false");
+  g_out_total += strlen(j);
+  server.send(200, "application/json", j);
+  Serial.printf("WiFi power-save %s\n", WiFi.getSleep() ? "ON" : "OFF");
 }
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
@@ -660,6 +726,8 @@ void setup() {
     });
   server.on("/transmit", HTTP_POST, handleTransmit);
   server.on("/rftest", HTTP_GET, handleRfTest);
+  server.on("/cpu", HTTP_POST, handleCpu);
+  server.on("/wifips", HTTP_POST, handleWifiPs);
   server.onNotFound(handleDash);
   server.begin();
   Serial.println("HTTP up. / dashboard, /json data, /history CSV, /transmit RF.");

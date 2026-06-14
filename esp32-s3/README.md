@@ -12,7 +12,7 @@ and the divergence rationale.
 
 ## What it does
 
-`voltage_monitor/voltage_monitor.ino` (fw 2.2):
+`voltage_monitor/voltage_monitor.ino` (fw 2.3):
 
 1. **Battery voltage** — reads a 1 MΩ / 220 kΩ divider on **GPIO1**
    (ADC1_CH0), scaled ×5.545, 64× averaged. 24 h history (1440 samples

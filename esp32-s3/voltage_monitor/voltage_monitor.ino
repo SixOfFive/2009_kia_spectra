@@ -57,7 +57,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "2.2";             // 2.2 = CPU clock + WiFi power-save persist across reboot (NVS)
+const char* FW_VERSION = "2.3";             // 2.3 = fix: CPU/WiFi buttons no longer fire a stray /transmit
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -461,7 +461,7 @@ $("psbadge").innerHTML='<span class="badge '+(ps?"on":"off")+'">'+(ps?"ON":"OFF"
 $("psbtn").textContent=ps?"Turn OFF":"Turn ON";$("psbtn").setAttribute("data-next",ps?"0":"1");
 $("dot").style.background="#3fb950";$("stxt").textContent="live";
 }).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnecting…"})}
-document.querySelectorAll("button.tx").forEach(function(btn){btn.addEventListener("click",function(){
+document.querySelectorAll("button.tx[data-b]").forEach(function(btn){btn.addEventListener("click",function(){
 var b=btn.getAttribute("data-b");
 if(b=="START"&&!confirm("Start the engine now? This transmits the real remote-start code and CRANKS THE ENGINE if the car is in range."))return;
 $("rfmsg").textContent=b+" …";

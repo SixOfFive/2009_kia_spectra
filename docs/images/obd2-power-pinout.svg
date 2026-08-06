@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 590" width="900" height="590" font-family="system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <rect width="900" height="590" fill="#ffffff"/>
+
+  <!-- ===== title ===== -->
+  <text x="450" y="38" text-anchor="middle" font-size="23" font-weight="700" fill="#111827">OBD-II (J1962) — power tap pinout</text>
+  <text x="450" y="62" text-anchor="middle" font-size="14" fill="#4b5563">vroom: leeching always-hot 12 V from the diagnostic port</text>
+
+  <!-- ===== orientation banner ===== -->
+  <rect x="60" y="80" width="780" height="50" rx="6" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="450" y="100" text-anchor="middle" font-size="13.5" font-weight="700" fill="#3730a3">Orientation: looking INTO the car's socket (vehicle side, female)</text>
+  <text x="450" y="119" text-anchor="middle" font-size="13" fill="#4338ca">pins 1–8 = top row, pins 9–16 = bottom row, both numbered left → right</text>
+
+  <!-- ===== connector body (D-shape / trapezoid, wider on the pin 1-8 side) ===== -->
+  <path d="M 156 156 L 744 156 L 720 284 L 180 284 Z" fill="#f3f4f6" stroke="#374151" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- centre groove between the rows -->
+  <path d="M 168 220 L 732 220" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="5 4"/>
+
+  <!-- ===== TOP ROW: pins 1-8, left to right ===== -->
+  <circle cx="210" cy="192" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="210" y="197" text-anchor="middle" font-size="13" font-weight="600" fill="#374151">1</text>
+  <circle cx="276" cy="192" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="276" y="197" text-anchor="middle" font-size="13" font-weight="600" fill="#374151">2</text>
+  <circle cx="342" cy="192" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="342" y="197" text-anchor="middle" font-size="13" font-weight="600" fill="#374151">3</text>
+  <!-- pin 4 = CHASSIS GROUND -->
+  <circle cx="408" cy="192" r="17" fill="#111827" stroke="#000000" stroke-width="2"/>
+  <text x="408" y="197" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff">4</text>
+  <!-- pin 5 = SIGNAL GROUND -->
+  <circle cx="474" cy="192" r="17" fill="#4b5563" stroke="#111827" stroke-width="2"/>
+  <text x="474" y="197" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff">5</text>
+  <!-- pin 6 = CAN-H -->
+  <circle cx="540" cy="192" r="16" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+  <text x="540" y="197" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a">6</text>
+  <circle cx="606" cy="192" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="606" y="197" text-anchor="middle" font-size="13" font-weight="600" fill="#374151">7</text>
+  <circle cx="672" cy="192" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="672" y="197" text-anchor="middle" font-size="13" font-weight="600" fill="#374151">8</text>
+
+  <!-- ===== BOTTOM ROW: pins 9-16, left to right ===== -->
+  <circle cx="210" cy="254" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="210" y="259" text-anchor="middle" font-size="13" font-weight="600" fill="#374151">9</text>
+  <circle cx="276" cy="254" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="276" y="259" text-anchor="middle" font-size="12" font-weight="600" fill="#374151">10</text>
+  <circle cx="342" cy="254" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="342" y="259" text-anchor="middle" font-size="12" font-weight="600" fill="#374151">11</text>
+  <circle cx="408" cy="254" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="408" y="259" text-anchor="middle" font-size="12" font-weight="600" fill="#374151">12</text>
+  <circle cx="474" cy="254" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="474" y="259" text-anchor="middle" font-size="12" font-weight="600" fill="#374151">13</text>
+  <!-- pin 14 = CAN-L -->
+  <circle cx="540" cy="254" r="16" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+  <text x="540" y="259" text-anchor="middle" font-size="12" font-weight="700" fill="#1e3a8a">14</text>
+  <circle cx="606" cy="254" r="16" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="606" y="259" text-anchor="middle" font-size="12" font-weight="600" fill="#374151">15</text>
+  <!-- pin 16 = +12V ALWAYS HOT -->
+  <circle cx="672" cy="254" r="18" fill="#dc2626" stroke="#7f1d1d" stroke-width="2.5"/>
+  <text x="672" y="259" text-anchor="middle" font-size="12" font-weight="700" fill="#ffffff">16</text>
+
+  <!-- ===== callout: pin 16 (+12V) ===== -->
+  <path d="M 688 268 L 728 314 L 782 314" stroke="#dc2626" stroke-width="2" fill="none"/>
+  <circle cx="688" cy="268" r="3" fill="#dc2626"/>
+  <text x="838" y="310" text-anchor="end" font-size="14.5" font-weight="700" fill="#b91c1c">PIN 16 — +12 V, ALWAYS HOT</text>
+  <text x="838" y="328" text-anchor="end" font-size="12.5" fill="#7f1d1d">live with the key out · usually RED</text>
+
+  <!-- ===== callout: pin 4 (chassis GND) ===== -->
+  <path d="M 408 175 L 408 148 L 310 148" stroke="#111827" stroke-width="2" fill="none"/>
+  <circle cx="408" cy="175" r="3" fill="#111827"/>
+  <text x="304" y="144" text-anchor="end" font-size="14.5" font-weight="700" fill="#111827">PIN 4 — CHASSIS GROUND</text>
+  <text x="304" y="162" text-anchor="end" font-size="12.5" fill="#374151">the ground you tap · usually BLACK</text>
+
+  <!-- ===== the two-wire tap vroom actually needs ===== -->
+  <rect x="60" y="356" width="780" height="96" rx="8" fill="#fef2f2" stroke="#fecaca"/>
+  <text x="80" y="380" font-size="14" font-weight="700" fill="#111827">The v1 power tap — only these two wires:</text>
+  <circle cx="92" cy="402" r="9" fill="#dc2626"/>
+  <text x="110" y="407" font-size="13.5" fill="#1f2937"><tspan font-weight="700">Pin 16 (+12 V)</tspan>  →  2 A blade fuse  →  TVS (SMBJ24CA)  →  buck V+  →  ESP32-S3 5 V</text>
+  <circle cx="92" cy="430" r="9" fill="#111827"/>
+  <text x="110" y="435" font-size="13.5" fill="#1f2937"><tspan font-weight="700">Pin 4 (chassis GND)</tspan>  →  buck V−  →  common ground bus  →  ESP32-S3 GND</text>
+
+  <!-- ===== verify-before-you-wire warning ===== -->
+  <rect x="60" y="464" width="780" height="62" rx="8" fill="#fffbeb" stroke="#fde68a"/>
+  <text x="80" y="486" font-size="13.5" font-weight="700" fill="#92400e">⚠ Verify with a multimeter BEFORE connecting anything:</text>
+  <text x="80" y="506" font-size="12.5" fill="#78350f">Black probe on pin 4, red on pin 16 → expect ≈ 12.2–12.8 V, engine off, key out.</text>
+  <text x="80" y="521" font-size="12.5" fill="#78350f">Reads 0 V or reversed? STOP — the socket is rotated. Pin 16 is unfused: a slip welds metal.</text>
+
+  <!-- ===== legend ===== -->
+  <g font-size="12" fill="#4b5563">
+    <circle cx="80" cy="552" r="7" fill="#dc2626"/><text x="94" y="556">+12 V (pin 16)</text>
+    <circle cx="206" cy="552" r="7" fill="#111827"/><text x="220" y="556">chassis GND (pin 4)</text>
+    <circle cx="366" cy="552" r="7" fill="#4b5563"/><text x="380" y="556">signal GND (pin 5)</text>
+    <circle cx="510" cy="552" r="7" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.5"/><text x="524" y="556">CAN — v2 telematics only</text>
+    <circle cx="700" cy="552" r="7" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/><text x="714" y="556">unused — do not probe</text>
+  </g>
+</svg>

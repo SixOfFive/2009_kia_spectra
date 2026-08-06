@@ -31,6 +31,20 @@ is fully verified (step 15).
 
 ## OBD-II pinout cheat sheet (J1962 connector, looking at the car's socket)
 
+![OBD-II J1962 power tap pinout — pin 16 (+12 V always hot) and pin 4 (chassis ground)](images/obd2-power-pinout.svg)
+
+**Orientation:** looking *into* the car's socket (vehicle side, female),
+pins **1–8 are the top row** and **9–16 the bottom row**, both numbered
+left → right. So **pin 16 sits at the bottom-right**, diagonally
+opposite pin 1. Sanity check on the real connector: CAN-H (6) sits
+directly above CAN-L (14).
+
+**Always meter it first.** The socket can be mounted rotated behind the
+trim, and pin 16 is unfused straight off the battery. Black probe on
+pin 4, red on pin 16 → expect ≈ 12.2–12.8 V with the engine off and the
+key out. If it reads 0 V or reversed, stop and re-identify the pins
+before wiring anything.
+
 | Pin | Signal | Use in this build |
 |----|----|----|
 | 4 | Chassis GND | Single-point ground — controller GND ties here |

@@ -14,12 +14,12 @@ display, no MQTT** in the shipped v1 build (see "v2 — optional
 telematics" below).
 
 **Status (2026-08-06): remote start + stop verified working** on the car
-(firmware 4.4). Confirmed end-to-end via the OBD-II battery tap — a board-fired
+(firmware 4.6). Confirmed end-to-end via the OBD-II battery tap — a board-fired
 Start produces the same crank-dip → 14.3 V charging signature as the real FOB.
 Low-voltage **auto-start is armed** on the installed unit (threshold + hold are
-user-settable); the dashboard shows a live **ETA to the next auto-start**,
-projected from the parked battery-drain rate. The build is installed behind the
-OBD-II port and running.
+user-settable); the dashboard shows a live **ETA to the next auto-start** and a
+**battery-drain-rate graph**, both projected/plotted from the parked drain
+regression. The build is installed behind the OBD-II port and running.
 
 ## Scope decision — ESP32-only is the build
 

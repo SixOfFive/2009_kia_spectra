@@ -76,6 +76,7 @@ All scalars, all with the SMI `.0` instance suffix.
 | `.41.0` | Gauge32 | `autoStartParkSec` |
 | `.42.0` | Counter32 | `startEventCount` — entries in the start log |
 | `.43.0` | Gauge32 | `lastStartEpoch` — 0 if never |
+| `.44.0` | Gauge32 | `autoStartEtaSec` — est. seconds until auto-start fires (parked drain projected to the threshold + hold); `0` = n/a (disarmed, holding/charging, or fit not settled) |
 
 Add OIDs by appending to `SNMP_OIDS[]` in `voltage_monitor.ino`; the
 GETNEXT walker sorts by OID, so insertion order doesn't matter. Keep

@@ -99,7 +99,34 @@ to the plug's strain-relief boot. The OBD connector hangs straight
 down off the dash; you do not want the conductor itself taking the
 weight of the wire.
 
-## Step 3 — Power-side protection
+### As-built example — OBD-II → buck → ESP32, with the 12 V sense tap
+
+![OBD-II pigtail feeding a 12 V → 5 V buck converter, with a spliced 12 V sense tap for voltage monitoring](images/obd2-buck-power-wiring.jpg)
+
+What's in the photo, right to left:
+
+- **OBD-II pigtail** (right): the male plug's **pin 16 (+12 V, red)** and
+  **pin 4 (GND, black)** break out of the cable.
+- **12 V splice** (top): the red +12 V line is spliced so it feeds two
+  things — the buck converter's input **and** the sense tap. **This is
+  where the inline 2 A fuse and the TVS from Step 3 belong**, right at the
+  plug end, so everything downstream (buck *and* tap) is protected and a
+  blown fuse de-energises both. Verify the fuse is actually in this splice
+  before energising — pin 16 is unfused battery+.
+- **Buck converter** (centre, the finned aluminium block): 12 V in on the
+  right (red/black), **5 V out on the left (yellow = 5 V+, black = GND)**
+  to the ESP32-S3. This is the 5 A automotive buck from the BOM; set/confirm
+  its output at **5.0 V** on the bench before wiring it to the board.
+- **12 V sense tap** (far-left red lead with the Dupont end): this goes to
+  the **high side of the voltage divider** (1 MΩ / 220 kΩ), *not* shown here
+  — it lives on the ESP32 side. Tapping the **12 V rail before the buck**
+  (rather than the 5 V output) is deliberate: we want to monitor the actual
+  **battery** voltage, which is the whole point of the project. The divider
+  draws microamps, so it is a sense line, not a second power feed.
+
+> **Grounds:** the buck's input GND, its output GND, and the OBD pin-4 GND
+> must all meet at the single-point ground bus (Step 4), with pin 4 as the
+> only wire back to chassis. Do not create a second ground path.
 
 ```
 Pin 16 (+12V) ──┬── 2 A ATM mini fuse ──┬── SMBJ24CA TVS ──┬── buck V+

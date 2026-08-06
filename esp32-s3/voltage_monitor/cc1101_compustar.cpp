@@ -203,7 +203,9 @@ CC1101SelfTest CC1101Compustar::selfTest() {
   // read+write are sound and the chip held its config, these match.
   struct Expect { uint8_t addr; uint8_t val; };
   static const Expect expect[] = {
-    {REG_FREQ2, 0x10}, {REG_FREQ1, 0xB0}, {REG_FREQ0, 0x71},
+    // FREQ must match configure433Ook() (fw 3.6 trim: 433.94 MHz). These were
+    // stale (0xB0/0x71) and made regs_ok falsely fail after the trim.
+    {REG_FREQ2, 0x10}, {REG_FREQ1, 0xB1}, {REG_FREQ0, 0x1C},
     {REG_PKTCTRL0, 0x32}, {REG_MDMCFG2, 0x30}, {REG_FREND0, 0x11},
   };
   t.regsOk = true;

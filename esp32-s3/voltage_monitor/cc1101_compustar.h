@@ -31,13 +31,22 @@
 #include <SPI.h>
 
 // ---- Compustar 1WG3R / 1WSHR-PRO timing (microseconds) ----
-// rtl_433 -A measured on the project's known-good FOB; within ~3% of the
-// 1WG3R spec and well inside Compustar receiver tolerance. See
-// sdr/analysis/framing.md.
+// Re-measured directly from an SDR capture of the known-good FOB
+// (sdr/captures/fob-60s-2026-08-06.bin, 141 clean bits, SD ~4 us). Each bit is
+// a HIGH pulse followed by a LOW gap of the SAME class: a '0' is short-HIGH +
+// short-LOW (period ~1493 us), a '1' is long-HIGH + long-LOW (period ~2243 us).
+// The bit is carried by the PERIOD/gap, not just the HIGH width.
+//
+// fw 4.2 fix: the two LOW values were previously SWAPPED (SHORT_LOW=1136,
+// LONG_LOW=756), pairing a short pulse with a long gap and vice versa. That
+// made our period nearly constant (~1850 us for both 0 and 1), so a receiver
+// decoding by period/gap could not tell the bits apart -- an rtl_433-style
+// HIGH-only decoder still read them fine, which hid the bug. The Compustar
+// receiver silently ignored every (strong, on-frequency, bit-correct) packet.
 static const uint16_t CMP_SHORT_HIGH_US = 732;
-static const uint16_t CMP_SHORT_LOW_US  = 1136;
+static const uint16_t CMP_SHORT_LOW_US  = 762;   // was 1136 (swapped)
 static const uint16_t CMP_LONG_HIGH_US  = 1100;
-static const uint16_t CMP_LONG_LOW_US   = 756;
+static const uint16_t CMP_LONG_LOW_US   = 1140;  // was 756 (swapped)
 static const uint16_t CMP_SYNC_HIGH_US  = 1476;
 static const uint16_t CMP_SYNC_LOW_US   = 1500;
 

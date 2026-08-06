@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.1";             // 4.1 = FOB-matched packet gap (~1ms) + 0.5s trailing carrier
+const char* FW_VERSION = "4.3";             // 4.3 = single burst per press (match FOB; 3 bursts may self-cancel)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -125,7 +125,9 @@ const uint8_t  RF_REPEATS  = 8;             // packet repeats per press (FOB sen
 const uint16_t RF_WAKEUP_MS    = 1450;      // continuous wake-up carrier per burst (FOB ~1436 ms)
 const uint8_t  RF_TRAIN_CELLS  = 6;         // ~750 us equal on/off training cells after the carrier (FOB ~5-6)
 const uint8_t  RF_START_DATAREPS = 8;       // sync+data repeats after EACH carrier (FOB sends 8)
-const uint8_t  RF_START_BURSTS = 3;         // [carrier + train + 8x data + tail] repeats (~7 s, like a held button)
+const uint8_t  RF_START_BURSTS = 1;         // ONE burst per press, exactly like the FOB. Was 3 (over-
+                                            // engineered from a long-hold capture); a 2nd start command
+                                            // ~2.5 s later can read as a re-press and CANCEL the start.
 const uint16_t RF_GUARD_MS = 39;            // silence between bursts
 // fw 4.1: SDR timeline of the FOB (sdr/captures/fob-60s-2026-08-06.bin) showed
 // the 8 data packets are spaced only ~1.1 ms apart -- back-to-back inside the

@@ -13,6 +13,11 @@ enough enclosure + wiring to live behind the OBD-II port. **No Pi, no
 display, no MQTT** in the shipped v1 build (see "v2 — optional
 telematics" below).
 
+**Status (2026-08-06): remote start + stop verified working** on the car
+(firmware 4.3). Confirmed end-to-end via the OBD-II battery tap — a board-fired
+Start produces the same crank-dip → 14.3 V charging signature as the real FOB.
+Auto-start on low voltage is built but ships **disabled** (opt-in).
+
 ## Scope decision 2026-06-01
 
 This project briefly grew a full Raspberry Pi + 5" touchscreen + web
@@ -31,9 +36,13 @@ choice — the ESP32 firmware was always self-sufficient for the trigger.
 2. If voltage is below `LOW_V_TRIGGER` (default 12.2 V) for a sustained
    `LOW_V_SUSTAIN_S` (default 300 s — five consecutive low samples at
    the default interval), the controller transitions to STARTING.
-3. STARTING sends the captured 1WSHR-PRO "Start" packet 8 times over
-   the CC1101 at 433.92 MHz. The Compustar brain accepts the replay
-   exactly the way it accepts a real FOB press — engine cranks.
+3. STARTING replays the captured 1WSHR-PRO "Start" press over the
+   CC1101 (~433.94 MHz): one burst of a ~1.44 s wake-up carrier (the
+   receiver is duty-cycled), a short preamble, then the 3-sync + 35-bit
+   packet repeated 8× with correct pulse+gap timing, and a trailing
+   carrier. The Compustar brain accepts the replay exactly the way it
+   accepts a real FOB press — engine cranks. (Exactly one burst: a second
+   Start command would toggle the engine back off.)
 4. RUNNING holds for `RUN_DURATION_S` (default 15 min). Alternator
    tops the battery off.
 5. STOPPING sends the "Lock" / engine-stop packet, then transitions to

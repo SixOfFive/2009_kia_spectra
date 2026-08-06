@@ -34,16 +34,29 @@ decoder (covers 1WG3R-SH, 1WAMR-1900 — same protocol family as 1WSHR-PRO):
 - `reset_limit`: 1532 µs (1WG3R spec)
 - **FIXED CODE — NO KeeLoq, NO rolling counter, NO device key**
 
-Bit encoding (verified by rtl_433 `-A` pulse analyzer on our capture):
+Bit encoding — **corrected 2026-08-06** by direct SDR measurement of the FOB
+(`sdr/captures/fob-60s-2026-08-06.bin`, 141 clean bits, SD ~4 µs):
 
-| Symbol | HIGH duration | LOW duration |
-|---|---|---|
-| "0" bit | ~732 µs (short) | ~1136 µs (long) |
-| "1" bit | ~1100 µs (long) | ~756 µs (short) |
-| sync   | ~1476 µs        | ~1500 µs         |
+| Symbol | HIGH duration | LOW duration | bit PERIOD |
+|---|---|---|---|
+| "0" bit | ~731 µs (short) | ~762 µs (short) | **~1493 µs** |
+| "1" bit | ~1100 µs (long) | ~1140 µs (long) | **~2243 µs** |
+| sync   | ~1476 µs        | ~1500 µs         | ~2976 µs |
 
-Pulse-pair sum is approximately constant (~1860 µs), so bit period =
-~1860 µs. Whichever half (HIGH or LOW) is longer determines the bit.
+The HIGH and LOW of a data bit are the **same class**: a "0" is short-HIGH +
+short-LOW, a "1" is long-HIGH + long-LOW. The bit is carried by the **PERIOD**
+(1493 vs 2243 µs), NOT by a constant-sum pulse pair.
+
+> ⚠️ **Correction — this cost a full bench day.** An earlier version of this
+> table (from a mis-paired rtl_433 `-A` reading) claimed "0" = short-HIGH +
+> **long**-LOW and "1" = long-HIGH + **short**-LOW, "sum approximately constant
+> ~1860 µs". That is WRONG: it makes the 0 and 1 periods nearly identical
+> (~1860 µs each), so a receiver that decodes by period/gap cannot tell the
+> bits apart. That bad timing was copied into the firmware
+> (`CMP_SHORT_LOW_US`/`CMP_LONG_LOW_US` were swapped) and the Compustar brain
+> silently ignored every otherwise-perfect replay. An rtl_433-style decoder
+> reads only the HIGH pulse, so it "validated" the broken signal — always
+> measure the LOW/gap too. Fixed in firmware fw 4.2.
 
 ## rtl_433 ground-truth verification
 
@@ -99,17 +112,29 @@ the FOB:
 This is much simpler than the original KeeLoq path. The ESP32 firmware
 can be substantially trimmed.
 
-## Timing
-_measured in URH per step 05, populate after captures_
+## Transmit structure — one button press
+_measured 2026-08-06 from full-press SDR captures; this is what fw 4.3 replays_
 
-- TE (bit element time): _____ µs
-- Preamble: _____ half-bit cycles
-- Header gap: _____ TE periods of silence
-- Inter-packet guard: _____ ms
-- Repeats per press: _____
+A single physical FOB press is **ONE burst**, shaped like this:
 
-(These are encoder-configuration values shared by anyone with the same
-HCS variant — not FOB-identifying. OK to commit.)
+```
+[wake-up carrier ~1.44 s][~5 short preamble cells][ 8 × (3 sync + 35 data bits) ][trailing carrier ~0.5 s]
+                                                     packets spaced ~1.1 ms apart
+```
+
+- **Wake-up carrier**: ~1.44 s of continuous carrier. The receiver is
+  duty-cycled (sleeps); without this it never hears the packet. (fw 3.9)
+- **Preamble**: ~5 short (~740 µs) on/off cells to settle the slicer/clock.
+- **Data**: the 3-sync + 35-bit packet repeated ~8× back-to-back, gaps ~1.1 ms
+  (NOT the 39 ms we first used — too wide, receiver drops bit-clock lock). (fw 4.1)
+- **Trailing carrier**: ~0.5 s of carrier after the data. (fw 4.1)
+- **Bursts per press: exactly 1.** ⚠️ Sending the whole unit 3× (our first
+  design, from a long-hold capture) does NOT start the car — a second start
+  command ~2.5 s later reads as a re-press and CANCELS the start. One burst
+  per press, like the FOB. (fw 4.3 — the change that finally cranked the car)
+
+(These are encoder-configuration values shared by anyone with the same FOB
+family — not FOB-identifying. OK to commit.)
 
 ## Where the per-FOB secret stuff lives
 

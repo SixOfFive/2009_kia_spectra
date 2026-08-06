@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.5";             // 4.5 = graph battery drain rate over time (10th history column)
+const char* FW_VERSION = "4.6";             // 4.6 = drain tile shows honest partial progress (was bare "0 of 30")
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -457,7 +457,12 @@ void dispDrawValue(float v, float tC) {
 // -- a low r2 means "don't trust this yet, leave it longer".
 DrainFit computeDrain() {
   DrainFit f; f.ok = false; f.mvph = 0; f.r2 = 0; f.n = 0; f.win_s = 0; f.days = -1;
-  if (!hist || histCount < DRAIN_MIN_N) return f;
+  if (!hist || histCount < 1) return f;
+  // NB: don't early-return on histCount < DRAIN_MIN_N here -- that would report a
+  // bare n=0 and the UI reads "0 of 30 min" (looks broken) whenever total history
+  // is short, e.g. right after a reboot or a storage-format reset. Run Pass 1 so
+  // f.n reflects the real partial window; the n < DRAIN_MIN_N guard below still
+  // withholds the fitted slope until there's enough data.
   int oldest = (histCount < HIST_N) ? 0 : histHead;
 
   // Pass 1 -- find the most recent contiguous parked window (newest backwards).

@@ -136,4 +136,10 @@ public:
   uint8_t  peekReg(uint8_t addr);
   // Read the 8-byte PATABLE (PA power ramp). out[] must hold 8 bytes.
   void     readPatable(uint8_t out[8]);
+
+  // Frequency trim. nudgeFreqHz shifts the carrier by a signed Hz amount by
+  // adjusting the 24-bit FREQ word; freqWord returns the current word. Used to
+  // match the real FOB's measured frequency. Next TX auto-recalibrates.
+  void     nudgeFreqHz(int32_t hz);
+  uint32_t freqWord();
 };

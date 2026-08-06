@@ -2,6 +2,7 @@
 
 #include "cc1101_compustar.h"
 #include "driver/pulse_cnt.h"   // ESP32 hardware pulse counter (crystal measurement)
+#include <math.h>               // lround
 
 // ---- CC1101 register addresses ----
 enum {
@@ -103,9 +104,13 @@ void CC1101Compustar::configure433Ook(uint8_t txPower) {
     {REG_PKTCTRL1, 0x04},
     {REG_PKTCTRL0, 0x32},  // async serial, infinite packet length
     {REG_FSCTRL1, 0x06},
-    {REG_FREQ2, 0x10},     // 0x10B071 -> ~433.92 MHz with a 26 MHz xtal
-    {REG_FREQ1, 0xB0},
-    {REG_FREQ0, 0x71},
+    // 0x10B11C. The textbook word for 433.92 MHz @ 26 MHz is 0x10B071, but this
+    // module's crystal measures 25.991 MHz, which pulled the actual carrier down
+    // to ~433.874 MHz. Verified on an SDR against the genuine FOB (433.9415 MHz)
+    // and trimmed +68 kHz so our carrier lands at 433.9418 MHz -- on top of the FOB.
+    {REG_FREQ2, 0x10},
+    {REG_FREQ1, 0xB1},
+    {REG_FREQ0, 0x1C},
     {REG_MDMCFG4, 0xF8},
     {REG_MDMCFG3, 0x83},
     {REG_MDMCFG2, 0x30},   // OOK/ASK, no preamble, no sync (async)
@@ -148,6 +153,22 @@ bool CC1101Compustar::begin(uint8_t txPower) {
 }
 
 uint8_t CC1101Compustar::peekReg(uint8_t addr) { return readReg(addr); }
+
+uint32_t CC1101Compustar::freqWord() {
+  return ((uint32_t)readReg(REG_FREQ2) << 16) |
+         ((uint32_t)readReg(REG_FREQ1) << 8) | readReg(REG_FREQ0);
+}
+
+void CC1101Compustar::nudgeFreqHz(int32_t hz) {
+  // FREQ step = f_xtal / 2^16 ~= 396.7 Hz at 26 MHz.
+  int32_t dw = (int32_t)lround((double)hz * 65536.0 / 26000000.0);
+  uint32_t w = (uint32_t)((int32_t)freqWord() + dw);
+  strobe(STR_SIDLE);
+  writeReg(REG_FREQ2, (w >> 16) & 0xFF);
+  writeReg(REG_FREQ1, (w >> 8) & 0xFF);
+  writeReg(REG_FREQ0, w & 0xFF);
+  // next STX auto-recalibrates the synth to the new frequency (MCSM0=0x18)
+}
 
 void CC1101Compustar::readPatable(uint8_t out[8]) {
   _spi->beginTransaction(_spiSettings);

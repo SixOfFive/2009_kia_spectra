@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "3.4";             // 3.0 = AP fallback retries the home WiFi instead of latching
+const char* FW_VERSION = "3.6";             // 3.0 = AP fallback retries the home WiFi instead of latching
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -1329,6 +1329,30 @@ void handleXtalTest() {
                 xtal / 1.0e6, actualMHz, verdict);
 }
 
+// POST /rftune?khz=<signed> -- shift the carrier by N kHz (runtime, not saved).
+// Used to match the real FOB frequency measured on an SDR.
+void handleRfTune() {
+  trackReq();
+  if (!RF_ENABLED || !rfReady) {
+    const char* m = "{\"ok\":false,\"detail\":\"RF disabled or CC1101 absent\"}";
+    g_out_total += strlen(m); server.send(503, "application/json", m); return;
+  }
+  long khz = server.arg("khz").toInt();
+  if (khz < -500 || khz > 500) {
+    const char* m = "{\"ok\":false,\"detail\":\"khz must be -500..500\"}";
+    g_out_total += strlen(m); server.send(400, "application/json", m); return;
+  }
+  radio.nudgeFreqHz((int32_t)khz * 1000);
+  uint32_t w = radio.freqWord();
+  double mhz = (double)w * 26.0 / 65536.0;   // nominal, assuming 26 MHz xtal
+  char j[160];
+  snprintf(j, sizeof(j), "{\"ok\":true,\"khz\":%ld,\"freq_word\":%lu,\"nominal_mhz\":%.4f}",
+           khz, (unsigned long)w, mhz);
+  g_out_total += strlen(j);
+  server.send(200, "application/json", j);
+  Serial.printf("RF tune %+ld kHz -> word 0x%06lX (~%.4f MHz nominal)\n", khz, (unsigned long)w, mhz);
+}
+
 // GET /rfregs -- dump the CC1101 config registers the self-test doesn't check
 // (IOCFG0 = async data-pin config; PATABLE = actual PA output level). A wrong
 // PATABLE[1] or IOCFG0 means MARCSTATE reaches TX but little/no RF is modulated.
@@ -1648,6 +1672,7 @@ void setup() {
   server.on("/rftest", HTTP_GET, handleRfTest);
   server.on("/xtaltest", HTTP_GET, handleXtalTest);
   server.on("/rfregs", HTTP_GET, handleRfRegs);
+  server.on("/rftune", HTTP_POST, handleRfTune);
   server.on("/cpu", HTTP_POST, handleCpu);
   server.on("/wifips", HTTP_POST, handleWifiPs);
   server.on("/autostart", HTTP_POST, handleAutoStart);

@@ -57,7 +57,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "2.3";             // 2.3 = fix: CPU/WiFi buttons no longer fire a stray /transmit
+const char* FW_VERSION = "2.5";             // 2.5 = low-voltage auto-start (opt-in), start log, CPU load
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -109,6 +109,43 @@ const int      CC1101_GDO0 = 4;
 const uint8_t  RF_TX_POWER = 0xC0;          // PATABLE[1]: 0xC0 ~ +10 dBm (max)
 const uint8_t  RF_REPEATS  = 8;             // packet repeats per press (FOB sends ~8)
 const uint16_t RF_GUARD_MS = 39;            // silence between repeats
+
+// ----- Low-voltage auto-start (OPT-IN — ships DISABLED) -----
+// When ARMED, the firmware fires the Compustar START code by itself once
+// battery voltage has stayed at or below the threshold continuously for the
+// hold time. The point is to start the engine while the battery can still
+// crank, so the alternator puts charge back before it goes flat.
+//
+// Why a sustain time at all: cranking the engine yanks terminal voltage down
+// to ~9-10 V for a second or two. Requiring the low reading to persist for a
+// full minute means a real crank (or a momentary load like the blower) can
+// never be mistaken for a flat battery.
+// Default trigger is 12.4 V, not the 12.2 V the older MicroPython tree used.
+// Two reasons, both specific to a car parked outside in Alberta:
+//   * Cold cranking. Near -20 C the engine needs roughly double the torque
+//     while the battery can deliver only about half its rated power, so the
+//     "still cranks" line moves UP a couple tenths from the mild-weather value.
+//   * Electrolyte freezing. 12.2 V resting is about SG 1.19, which slushes up
+//     around -26 C — i.e. right at the local design low. 12.4 V is ~SG 1.23,
+//     good to about -37 C. Firing at 12.2 can mean firing at a battery that is
+//     already too cold-soaked to turn the engine.
+// In a mild climate 12.2 V is perfectly reasonable — it's one field on the page.
+const float    AS_DEF_VOLTS     = 12.4f;    // suggested trigger (V)
+const uint32_t AS_DEF_HOLD_S    = 60;       // must stay below threshold this long
+const uint32_t AS_DEF_COOL_S    = 7200;     // 2 h between auto-starts (anti-loop)
+const float    AS_V_FLOOR       = 8.0f;     // below this the divider isn't on a battery
+const float    AS_V_CEIL        = 16.0f;    // above this the reading isn't a plausible battery
+const float    AS_ALT_V         = 13.2f;    // above this the alternator is running
+const uint32_t AS_PARK_S        = 900;      // must sit below AS_ALT_V this long before arming
+const float    AS_REARM_V       = 12.55f;   // after a start, must recover above this...
+const uint32_t AS_REARM_S       = 600;      // ...for this long, before it may fire again
+const uint32_t AS_VERIFY_S      = 180;      // after firing, expect charging within this
+const uint8_t  AS_MAX_FAILS     = 2;        // consecutive unverified starts -> lockout
+const uint8_t  AS_MAX_24H       = 3;        // hard cap on auto-starts per 24 h
+const uint32_t AS_BOOT_GRACE_MS = 120000;   // no auto-start in the first 2 min after boot
+const float    AS_V_MIN_CFG     = 10.0f;    // accepted config range for the threshold
+const float    AS_V_MAX_CFG     = 13.0f;
+const int      START_N          = 64;       // start-event ring buffer length
 // -----------------------------------------------------------
 
 struct Sample {
@@ -148,6 +185,48 @@ int       g_last_mv = 0;
 Preferences prefs;
 uint32_t  g_cpu_mhz = 240;       // restored at boot, then applied
 bool      g_wifi_ps = true;      // restored at boot, then applied (true = modem-sleep)
+
+// ----- low-voltage auto-start: persisted config + live state -----
+// Config lives in NVS (survives reboot/brownout). Ships disabled; arming is
+// a deliberate click in the dashboard.
+bool      g_as_en    = false;              // ARMED?  NVS "as_en"
+float     g_as_volts = AS_DEF_VOLTS;       // trigger threshold, V   NVS "as_volts"
+uint32_t  g_as_hold  = AS_DEF_HOLD_S;      // sustain seconds        NVS "as_hold"
+uint32_t  g_as_cool  = AS_DEF_COOL_S;      // cooldown seconds       NVS "as_cool"
+uint32_t  g_lowSince    = 0;               // millis() when V first went below threshold (0 = not low)
+uint32_t  g_lastStartMs = 0;               // millis() of the last auto-start this session
+uint32_t  g_lastStartTs = 0;               // epoch of the last auto-start  NVS "as_last"
+float     g_lastV       = 0.0f;            // most recent voltage reading
+
+// Extra restraint state. These stop the three ways an automatic starter
+// misbehaves: firing while you're driving, firing over and over on a battery
+// that never really recovers, and cranking a car that isn't going to start.
+uint32_t  g_parkS       = 0;               // seconds continuously below AS_ALT_V (alternator off)
+uint32_t  g_rearmS      = 0;               // seconds continuously at/above AS_REARM_V
+bool      g_needRearm   = false;           // set after a start; blocks refiring until recovered
+bool      g_asLock      = false;           // latched lockout  NVS "as_lock"
+uint8_t   g_asFails     = 0;               // consecutive unverified starts  NVS "as_fails"
+bool      g_verifying   = false;           // waiting to see the alternator come up
+uint32_t  g_verifyMs    = 0;               // millis() when verification started
+int       g_pendingIdx  = -1;              // index of the start event awaiting verification
+bool      g_verifyAuto  = false;           // was the pending start automatic? (only those can lock out)
+uint32_t  g_win24Ms     = 0;               // millis() at the start of the rolling 24 h window
+uint8_t   g_fires24     = 0;               // auto-starts fired in that window
+
+// One logged engine-start event. Written through to flash immediately so a
+// start is never lost to the brownout that a cranking engine can cause.
+struct StartEvent {
+  uint32_t ts;        // unix epoch when fired (0 if NTP hadn't synced)
+  uint32_t up_s;      // uptime seconds at fire — orders events even with no clock
+  float    vbatt;     // battery voltage at the moment it fired
+  uint8_t  src;       // 0 = auto (low voltage), 1 = manual (dashboard button)
+  uint8_t  ok;        // 1 = the CC1101 reported the burst went out
+  uint8_t  ver;       // did the engine actually run? 0 = unknown, 1 = confirmed, 2 = no charge seen
+  uint8_t  _pad;
+};
+StartEvent g_starts[START_N];
+int       g_startCount = 0;
+int       g_startHead  = 0;
 
 Sample*   hist      = nullptr;               // ring buffer (in PSRAM)
 int       histCount = 0;                     // valid samples (<= HIST_N)
@@ -189,11 +268,51 @@ const char* compustarPattern(const String& btn) {
   return nullptr;
 }
 
+// ---------- CPU load ----------
+// Real per-core utilisation, not a proxy. The Arduino ESP32 core ships with
+// CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS + USE_TRACE_FACILITY enabled and the
+// counters clocked off esp_timer, so every task (including the two idle tasks)
+// carries a microsecond run-time counter. Load on a core is simply the share of
+// wall time its IDLE task did NOT get.
+//
+// Deliberately NOT the "spin a low-priority counter task" trick: that keeps a
+// runnable task on the CPU forever, which defeats FreeRTOS tick-idling and would
+// quietly raise the parked-car current draw.
+float g_cpu0 = 0.0f, g_cpu1 = 0.0f;   // percent, 0..100
+
+void sampleCpuLoad() {
+  static uint32_t pIdle0 = 0, pIdle1 = 0, pTotal = 0;
+  UBaseType_t n = uxTaskGetNumberOfTasks();
+  TaskStatus_t* st = (TaskStatus_t*) malloc(n * sizeof(TaskStatus_t));
+  if (!st) return;
+  uint32_t total = 0;
+  n = uxTaskGetSystemState(st, n, &total);
+  uint32_t idle0 = 0, idle1 = 0;
+  for (UBaseType_t i = 0; i < n; i++) {
+    const char* nm = st[i].pcTaskName;
+    if (nm && strncmp(nm, "IDLE", 4) == 0) {
+      if      (nm[4] == '1') idle1 = st[i].ulRunTimeCounter;
+      else                   idle0 = st[i].ulRunTimeCounter;   // "IDLE0" or plain "IDLE"
+    }
+  }
+  free(st);
+  uint32_t dT = total - pTotal;              // unsigned math handles the wrap
+  if (pTotal != 0 && dT > 0) {
+    uint32_t d0 = idle0 - pIdle0, d1 = idle1 - pIdle1;
+    float l0 = 100.0f - (100.0f * (float)d0 / (float)dT);
+    float l1 = 100.0f - (100.0f * (float)d1 / (float)dT);
+    g_cpu0 = l0 < 0 ? 0 : (l0 > 100 ? 100 : l0);
+    g_cpu1 = l1 < 0 ? 0 : (l1 > 100 ? 100 : l1);
+  }
+  pIdle0 = idle0; pIdle1 = idle1; pTotal = total;
+}
+
 float readBatteryVolts() {
   uint32_t acc = 0;
   for (int i = 0; i < SAMPLES; i++) acc += analogReadMilliVolts(VSENSE_PIN);
   g_last_mv = (int)(acc / SAMPLES);
-  return (g_last_mv / 1000.0f) * DIVIDER * CAL;
+  g_lastV = (g_last_mv / 1000.0f) * DIVIDER * CAL;
+  return g_lastV;
 }
 
 void trackReq() { g_in_total += server.uri().length() + 120; }   // approx request size
@@ -297,6 +416,194 @@ void loadHistory() {
   f.close();
 }
 
+// ---------- start-event log (LittleFS, survives reboot/brownout) ----------
+
+void saveStarts() {
+  File f = LittleFS.open("/starts.bin", FILE_WRITE);
+  if (!f) return;
+  uint32_t magic = 0x53545231;                 // "STR1"
+  f.write((uint8_t*)&magic, 4);
+  f.write((uint8_t*)&g_startCount, 4);
+  f.write((uint8_t*)&g_startHead, 4);
+  f.write((uint8_t*)g_starts, sizeof(StartEvent) * START_N);
+  f.close();
+}
+
+void loadStarts() {
+  if (!LittleFS.exists("/starts.bin")) return;
+  File f = LittleFS.open("/starts.bin", FILE_READ);
+  if (!f) return;
+  uint32_t magic = 0;
+  f.read((uint8_t*)&magic, 4);
+  if (magic == 0x53545231) {
+    f.read((uint8_t*)&g_startCount, 4);
+    f.read((uint8_t*)&g_startHead, 4);
+    f.read((uint8_t*)g_starts, sizeof(StartEvent) * START_N);
+    if (g_startCount < 0 || g_startCount > START_N ||
+        g_startHead  < 0 || g_startHead  >= START_N) { g_startCount = 0; g_startHead = 0; }
+  }
+  f.close();
+}
+
+// Append a start event and flush it to flash right away. Called for BOTH the
+// automatic trigger and a manual dashboard press, so the log answers "when did
+// this car get started, and what started it".
+// Returns the ring index it was written to, so the caller can patch in the
+// verification result once we know whether the engine actually caught.
+int recordStart(float v, uint8_t src, bool ok) {
+  StartEvent e;
+  e.ts    = timeIsValid() ? (uint32_t)time(nullptr) : 0;
+  e.up_s  = millis() / 1000;
+  e.vbatt = v;
+  e.src   = src;
+  e.ok    = ok ? 1 : 0;
+  e.ver   = 0;                                  // pending
+  e._pad  = 0;
+  int idx = g_startHead;
+  g_starts[idx] = e;
+  g_startHead = (g_startHead + 1) % START_N;
+  if (g_startCount < START_N) g_startCount++;
+  saveStarts();                                 // write through — don't risk losing it
+  return idx;
+}
+
+// Begin watching for the alternator to come up, which is the only real proof
+// the engine caught. Used for manual presses too — it answers "did that work?"
+// Only an AUTOMATIC start counts toward the lockout: a manual test press (on
+// the bench, or with the battery out) must never latch the automatic system off.
+void beginVerify(int idx, bool isAuto) {
+  g_pendingIdx = idx;
+  g_verifying  = true;
+  g_verifyAuto = isAuto;
+  g_verifyMs   = millis();
+}
+
+// ---------- low-voltage auto-start ----------
+
+// Seconds left in the post-start cooldown (0 = clear). Prefers wall-clock so
+// the cooldown SURVIVES A REBOOT — otherwise a brownout right after a start
+// would clear it and let the car re-fire immediately.
+uint32_t autoStartCooldownLeft() {
+  if (timeIsValid() && g_lastStartTs > 0) {
+    uint32_t nowTs = (uint32_t)time(nullptr);
+    if (nowTs < g_lastStartTs) return 0;        // clock stepped backwards; don't wedge
+    uint32_t el = nowTs - g_lastStartTs;
+    return (el >= g_as_cool) ? 0 : (g_as_cool - el);
+  }
+  if (g_lastStartMs == 0) return 0;
+  uint32_t el = (millis() - g_lastStartMs) / 1000;
+  return (el >= g_as_cool) ? 0 : (g_as_cool - el);
+}
+
+// Short machine-readable state for the dashboard.
+const char* autoStartState() {
+  if (!g_as_en)                                                  return "off";
+  if (g_asLock)                                                  return "lockout";
+  if (!(RF_ENABLED && rfReady && COMPUSTAR_PATTERNS_CAPTURED))   return "not-armed";
+  if (millis() < AS_BOOT_GRACE_MS)                               return "warmup";
+  if (g_lastV < AS_V_FLOOR || g_lastV > AS_V_CEIL)               return "no-battery";
+  if (g_verifying)                                               return "verifying";
+  if (g_needRearm)                                               return "recovering";
+  if (g_fires24 >= AS_MAX_24H)                                   return "daily-cap";
+  if (autoStartCooldownLeft() > 0)                               return "cooldown";
+  if (g_parkS < AS_PARK_S)                                       return "park-wait";
+  if (g_lowSince != 0)                                           return "counting";
+  return "watching";
+}
+
+// Evaluated every ~2 s from loop(). EVERY guard must pass before a packet goes
+// out; any failure resets the low-voltage timer, so the hold time always means
+// "continuously low", never "low on and off".
+void evalAutoStart(float v) {
+  uint32_t now = millis();
+  static uint32_t lastEvalMs = 0;
+  uint32_t dt = lastEvalMs ? (now - lastEvalMs) / 1000 : 0;   // seconds since last call
+  lastEvalMs = now;
+
+  // A reading outside this band isn't a car battery at all — bench rig, an
+  // unplugged sense wire, or a glitch. Treat it as "no information", never "low".
+  bool valid = (v >= AS_V_FLOOR && v <= AS_V_CEIL);
+
+  // --- accumulators, maintained regardless of arm state ---
+  // Parked = the alternator is not running. Requiring a stretch of this before
+  // arming means the starter can't fire while you're driving (or in the minutes
+  // right after shutdown, when surface charge makes voltage untrustworthy).
+  if (valid && v < AS_ALT_V) { if (g_parkS < 1000000UL) g_parkS += dt; }
+  else                         g_parkS = 0;
+
+  // Re-arm hysteresis. Without this, a battery that recovers to just above the
+  // trigger re-fires every cooldown, forever, until the tank is empty.
+  if (valid && v >= AS_REARM_V) { if (g_rearmS < 1000000UL) g_rearmS += dt; }
+  else                            g_rearmS = 0;
+  if (g_needRearm && g_rearmS >= AS_REARM_S) {
+    g_needRearm = false;
+    Serial.println("auto-start: re-armed (battery recovered and held)");
+  }
+
+  // --- did the last start actually work? the alternator coming up is the proof ---
+  if (g_verifying) {
+    if (valid && v >= AS_ALT_V) {
+      if (g_pendingIdx >= 0) { g_starts[g_pendingIdx].ver = 1; saveStarts(); }
+      g_verifying = false; g_pendingIdx = -1;
+      if (g_verifyAuto) { g_asFails = 0; prefs.putUChar("as_fails", 0); }
+      Serial.println("start verified: engine running (charging seen)");
+    } else if (now - g_verifyMs >= AS_VERIFY_S * 1000UL) {
+      if (g_pendingIdx >= 0) { g_starts[g_pendingIdx].ver = 2; saveStarts(); }
+      g_verifying = false; g_pendingIdx = -1;
+      if (!g_verifyAuto) {                      // manual press — record it, but never latch
+        Serial.printf("manual start: no charging after %lu s (not counted toward lockout)\n",
+                      (unsigned long)AS_VERIFY_S);
+      } else {
+        if (g_asFails < 255) g_asFails++;
+        prefs.putUChar("as_fails", g_asFails);
+        Serial.printf("auto-start: no charging after %lu s — fail %u of %u\n",
+                      (unsigned long)AS_VERIFY_S, g_asFails, AS_MAX_FAILS);
+        if (g_asFails >= AS_MAX_FAILS) {        // it isn't going to start; stop cranking it
+          g_asLock = true; prefs.putBool("as_lock", true);
+          Serial.println("*** auto-start LOCKED OUT after repeated failed starts ***");
+        }
+      }
+    }
+  }
+
+  // rolling 24 h fire budget
+  if (now - g_win24Ms >= 86400000UL) { g_win24Ms = now; g_fires24 = 0; }
+
+  // --- gating ---
+  if (!g_as_en)                                                { g_lowSince = 0; return; }
+  if (g_asLock)                                                { g_lowSince = 0; return; }
+  if (!(RF_ENABLED && rfReady && COMPUSTAR_PATTERNS_CAPTURED)) { g_lowSince = 0; return; }
+  if (now < AS_BOOT_GRACE_MS)                                  { g_lowSince = 0; return; }
+  if (!valid)                                                  { g_lowSince = 0; return; }
+  if (g_verifying)                                             { g_lowSince = 0; return; }
+  if (g_needRearm)                                             { g_lowSince = 0; return; }
+  if (g_parkS < AS_PARK_S)                                     { g_lowSince = 0; return; }
+  if (g_fires24 >= AS_MAX_24H)                                 { g_lowSince = 0; return; }
+  if (!(v < g_as_volts))                                       { g_lowSince = 0; return; }
+
+  if (g_lowSince == 0) {                        // first low reading — start the clock
+    g_lowSince = now;
+    Serial.printf("auto-start: %.2f V below %.2f V, counting %lu s\n",
+                  v, g_as_volts, (unsigned long)g_as_hold);
+    return;
+  }
+  if ((now - g_lowSince) / 1000 < g_as_hold) return;    // still sustaining
+  if (autoStartCooldownLeft() > 0) return;              // too soon after the last one
+
+  // ---- every guard passed: fire the starter ----
+  bool sent = radio.transmitButton(COMPUSTAR_START, RF_REPEATS, RF_GUARD_MS);
+  int idx = recordStart(v, 0, sent);
+  g_lastStartMs = now;
+  g_lastStartTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
+  prefs.putUInt("as_last", g_lastStartTs);
+  g_lowSince   = 0;
+  g_needRearm  = true;   g_rearmS = 0;
+  if (g_fires24 < 255) g_fires24++;
+  beginVerify(idx, true);
+  Serial.printf("*** AUTO-START FIRED at %.2f V (tx %s) — cooldown %lu s, fire %u/%u today ***\n",
+                v, sent ? "ok" : "FAILED", (unsigned long)g_as_cool, g_fires24, AS_MAX_24H);
+}
+
 const char DASH_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -332,6 +639,13 @@ button.tx.seg.on{background:#1f6feb;border-color:#388bfd;color:#fff;font-weight:
 .badge{display:inline-block;padding:2px 12px;border-radius:20px;font-size:15px;font-weight:700;letter-spacing:.03em}
 .badge.on{background:#1a7f37;color:#fff}.badge.off{background:#30363d;color:#8b949e}
 .pwrrow{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
+.badge.arm{background:#9e6a03;color:#fff}
+.inp{background:#0d1117;color:var(--fg);border:1px solid #30363d;border-radius:6px;padding:7px 8px;font-size:14px;width:96px}
+table.st{width:100%;border-collapse:collapse;font-size:13px}
+table.st th{text-align:left;color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:6px 4px;border-bottom:1px solid #21262d}
+table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
+.pill{display:inline-block;padding:1px 9px;border-radius:12px;font-size:11px;font-weight:600}
+.pill.auto{background:#1f6feb;color:#fff}.pill.man{background:#30363d;color:#c9d1d9}
 </style></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
@@ -356,6 +670,8 @@ button.tx.seg.on{background:#1f6feb;border-color:#388bfd;color:#fff;font-weight:
 <div class="card"><div class="k">Disk</div><div class="v"><span id="disk">--</span></div></div>
 <div class="card"><div class="k">Free heap</div><div class="v"><span id="heap">--</span> KB</div></div>
 <div class="card"><div class="k">Free PSRAM</div><div class="v"><span id="psram">--</span> MB</div></div>
+<div class="card"><div class="k">CPU core 0</div><div class="v"><span id="cpu0">--</span> %</div></div>
+<div class="card"><div class="k">CPU core 1</div><div class="v"><span id="cpu1">--</span> %</div></div>
 </div>
 <div class="clbl">Power &amp; performance</div>
 <div class="card" style="margin-bottom:10px">
@@ -379,6 +695,39 @@ button.tx.seg.on{background:#1f6feb;border-color:#388bfd;color:#fff;font-weight:
 <button class="tx" data-b="TRUNK">Trunk</button>
 </div>
 <div class="k" id="rfmsg" style="margin-top:10px">&nbsp;</div>
+</div>
+<div class="clbl">Low-voltage auto-start</div>
+<div class="card" style="margin-bottom:10px">
+<div class="pwrrow">
+<div><div class="k">Auto-start</div><div class="v"><span id="asbadge">--</span></div></div>
+<div style="display:flex;gap:8px"><button class="tx" id="asunlock" style="display:none;border-color:#8957e5">Clear lockout</button><button class="tx" id="asbtn">&hellip;</button></div>
+</div>
+<div class="k" id="asstate" style="margin-top:10px">&nbsp;</div>
+<div style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d;display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+<div><div class="k" style="margin-bottom:4px">Start below</div><input id="asv" class="inp" type="number" step="0.1" min="10" max="13"> <span class="k">V</span></div>
+<div><div class="k" style="margin-bottom:4px">Held for</div><input id="ash" class="inp" type="number" step="5" min="10" max="3600"> <span class="k">sec</span></div>
+<div><div class="k" style="margin-bottom:4px">Cooldown</div><input id="asc" class="inp" type="number" step="300" min="300" max="86400"> <span class="k">sec</span></div>
+<button class="tx" id="assave">Save</button>
+</div>
+<div class="k" style="margin-top:12px;line-height:1.7;text-transform:none;letter-spacing:0">
+<b>12.4 V</b> is the suggested trigger for a cold climate &mdash; about 75&nbsp;% charge, where the engine
+still cranks easily. Two reasons not to wait for 12.2 V here: near &minus;20&nbsp;&deg;C the engine wants
+roughly double the torque while the battery delivers about half its power, and a battery down at
+12.2&nbsp;V has electrolyte that slushes up around &minus;26&nbsp;&deg;C. In a mild climate 12.2&nbsp;V is fine.
+Below about <b>11.8 V</b> it likely won't crank at all.<br>
+The hold time ignores the brief dip while the engine is <i>actually cranking</i> (down to ~9&ndash;10 V for a
+second or two). <b>60 s</b> is far longer than any crank or momentary load.<br>
+It also won't fire while you're driving, won't re-fire until the battery recovers and holds,
+stops after <b>3</b> starts in 24&nbsp;h, and locks itself out if <b>2</b> starts in a row draw no charge.
+</div>
+<div class="k" id="asmsg" style="margin-top:8px">&nbsp;</div>
+</div>
+</div>
+<div class="wrap" style="padding-top:0">
+<div class="clbl">Start history</div>
+<div class="card" style="margin-bottom:10px">
+<div id="startbox"><div class="k">no starts recorded</div></div>
+<div style="margin-top:10px"><button class="tx" id="asclear">Clear log</button></div>
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span> &middot; <a href="/update">update</a></footer>
@@ -455,10 +804,34 @@ var RF={armed:"armed",blocked:"present, no patterns",absent:"not detected",off:"
 $("rfstat").textContent=RF[d.rf]||d.rf||"?";
 $("rfstat").style.color=(d.rf=="armed")?"#3fb950":(d.rf=="blocked"?"#d29922":"#8b949e");
 $("cpu").textContent=d.cpu_mhz;
+if(d.cpu0!==undefined){$("cpu0").textContent=d.cpu0.toFixed(1);$("cpu1").textContent=d.cpu1.toFixed(1);}
 document.querySelectorAll("button.seg").forEach(function(b){b.classList.toggle("on",+b.getAttribute("data-mhz")===d.cpu_mhz)});
 var ps=!!d.wifi_ps;
 $("psbadge").innerHTML='<span class="badge '+(ps?"on":"off")+'">'+(ps?"ON":"OFF")+'</span>';
 $("psbtn").textContent=ps?"Turn OFF":"Turn ON";$("psbtn").setAttribute("data-next",ps?"0":"1");
+var ae=!!d.as_en;
+$("asbadge").innerHTML='<span class="badge '+(ae?"arm":"off")+'">'+(ae?"ARMED":"OFF")+'</span>';
+$("asbtn").textContent=ae?"Disable":"Enable";$("asbtn").setAttribute("data-next",ae?"0":"1");
+var ST={off:"disabled — the car will not start itself",
+lockout:"LOCKED OUT — "+d.as_fails+" starts in a row drew no charge. Check the car, then clear the lockout.",
+"not-armed":"cannot fire — RF not armed (check CC1101 / patterns)",
+warmup:"warming up after boot — holding off",
+"no-battery":"sensor is not across a battery ("+d.vbatt.toFixed(2)+" V) — will not fire",
+verifying:"just started — watching for the alternator to come up",
+recovering:"waiting for the battery to recover and hold before it may fire again",
+"daily-cap":"daily cap reached ("+d.as_f24+" auto-starts in 24 h) — holding off",
+"park-wait":"confirming the car is parked ("+d.as_park_s+"s of "+d.as_park_need+"s below 13.2 V)",
+watching:"armed · watching — voltage is above "+(d.as_volts||0).toFixed(1)+" V"};
+var s=ST[d.as_state]||d.as_state;
+if(d.as_state=="counting")s="voltage low "+d.as_low_s+"s of "+d.as_hold+"s — starts in "+Math.max(0,d.as_hold-d.as_low_s)+"s";
+if(d.as_state=="cooldown")s="cooldown — "+fmtUp(d.as_cool_s)+" before it can fire again";
+$("asstate").textContent=s;
+$("asstate").style.color=(d.as_state=="counting"||d.as_state=="lockout")?"#f85149":(ae?"#3fb950":"#8b949e");
+$("asunlock").style.display=d.as_lock?"inline-block":"none";
+var af=document.activeElement?document.activeElement.id:"";
+if(af!="asv")$("asv").value=(d.as_volts||0).toFixed(1);
+if(af!="ash")$("ash").value=d.as_hold;
+if(af!="asc")$("asc").value=d.as_cool;
 $("dot").style.background="#3fb950";$("stxt").textContent="live";
 }).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnecting…"})}
 document.querySelectorAll("button.tx[data-b]").forEach(function(btn){btn.addEventListener("click",function(){
@@ -478,7 +851,40 @@ var nx=$("psbtn").getAttribute("data-next")||"0";$("pwrmsg").textContent="updati
 fetch("/wifips?on="+nx,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
 $("pwrmsg").textContent="WiFi power saving "+(d.wifi_ps?"ON":"OFF");poll();
 }).catch(function(e){$("pwrmsg").textContent="WiFi power-save request error"})});
-setupHover();setInterval(poll,2000);setInterval(loadHistory,30000);poll();loadHistory();
+function loadStarts(){fetch("/starts",{cache:"no-store"}).then(function(r){return r.json()}).then(function(a){
+if(!a||!a.length){$("startbox").innerHTML='<div class="k">no starts recorded</div>';return}
+var h='<table class="st"><tr><th>When</th><th>Voltage</th><th>Trigger</th><th>TX</th><th>Engine</th></tr>';
+var VER=['<span style="color:#8b949e">unknown</span>','<span style="color:#3fb950">ran</span>','<span style="color:#f85149">no charge</span>'];
+a.forEach(function(e){
+var w=(e.ts>1700000000)?new Date(e.ts*1000).toLocaleString():("uptime "+fmtUp(e.up_s)+" · no clock");
+h+='<tr><td>'+w+'</td><td>'+e.v.toFixed(2)+' V</td><td><span class="pill '+(e.src=="auto"?"auto":"man")+'">'+e.src+'</span></td><td>'+(e.ok?"sent":"<span style=\"color:#f85149\">failed</span>")+'</td><td>'+(VER[e.ver]||VER[0])+'</td></tr>';
+});
+$("startbox").innerHTML=h+'</table>';
+}).catch(function(e){})}
+$("asbtn").addEventListener("click",function(){
+var nx=$("asbtn").getAttribute("data-next")||"0";
+if(nx=="1"&&!confirm("ARM low-voltage auto-start?\n\nThe car will CRANK BY ITSELF, unattended, whenever battery voltage stays at or below the threshold for the hold time.\n\nNever leave this armed while the car is parked indoors or in an attached garage — engine exhaust in an enclosed space is lethal."))return;
+$("asmsg").textContent="updating…";
+fetch("/autostart?en="+nx,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+$("asmsg").textContent="auto-start "+(d.as_en?"ARMED":"disabled");poll();
+}).catch(function(e){$("asmsg").textContent="request error"})});
+$("assave").addEventListener("click",function(){
+var q="volts="+$("asv").value+"&hold="+$("ash").value+"&cool="+$("asc").value;
+$("asmsg").textContent="saving…";
+fetch("/autostart?"+q,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+$("asmsg").textContent=d.ok?("saved — start below "+d.as_volts.toFixed(1)+" V held "+d.as_hold+" s"):("save failed: "+(d.detail||"error"));poll();
+}).catch(function(e){$("asmsg").textContent="save error"})});
+$("asunlock").addEventListener("click",function(){
+if(!confirm("Clear the auto-start lockout?\n\nIt latched because starts drew no charge — the engine did not catch. Make sure you know why before re-enabling."))return;
+fetch("/autostart?unlock=1",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+$("asmsg").textContent="lockout cleared";poll();
+}).catch(function(e){$("asmsg").textContent="unlock error"})});
+$("asclear").addEventListener("click",function(){
+if(!confirm("Clear the entire start history?"))return;
+fetch("/starts",{method:"POST"}).then(function(){loadStarts();$("asmsg").textContent="start log cleared"})
+.catch(function(e){$("asmsg").textContent="clear error"})});
+setupHover();setInterval(poll,2000);setInterval(loadHistory,30000);setInterval(loadStarts,15000);
+poll();loadHistory();loadStarts();
 </script></body></html>
 )HTML";
 
@@ -494,13 +900,17 @@ void handleJson() {
   float tC = temperatureRead();
   String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   int    rssi = apMode ? 0 : (int)WiFi.RSSI();
-  char json[640];
+  char json[1100];
   snprintf(json, sizeof(json),
     "{\"vbatt\":%.2f,\"temp_c\":%.1f,\"adc_mv\":%d,\"divider\":%.3f,\"cal\":%.3f,"
     "\"rssi\":%d,\"uptime_s\":%lu,\"heap_free\":%u,\"heap_total\":%u,"
     "\"psram_free\":%u,\"psram_total\":%u,\"disk_used\":%u,\"disk_total\":%u,"
     "\"mode\":\"%s\",\"ip\":\"%s\",\"interval_s\":%d,\"samples\":%d,\"led\":\"%s\",\"fw\":\"%s\",\"rf\":\"%s\","
-    "\"epoch\":%lu,\"time_ok\":%s,\"cpu_mhz\":%u,\"wifi_ps\":%s}",
+    "\"epoch\":%lu,\"time_ok\":%s,\"cpu_mhz\":%u,\"wifi_ps\":%s,"
+    "\"as_en\":%s,\"as_volts\":%.2f,\"as_hold\":%lu,\"as_cool\":%lu,"
+    "\"as_state\":\"%s\",\"as_low_s\":%lu,\"as_cool_s\":%lu,\"as_n\":%d,"
+    "\"as_lock\":%s,\"as_fails\":%u,\"as_park_s\":%lu,\"as_park_need\":%lu,\"as_f24\":%u,"
+    "\"cpu0\":%.1f,\"cpu1\":%.1f}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
@@ -508,7 +918,14 @@ void handleJson() {
     apMode ? "ap" : "sta", ip.c_str(), (int)(SAMPLE_MS / 1000), histCount, voltStatus(v), FW_VERSION,
     rfStatusStr(),
     (unsigned long)(timeIsValid() ? (uint32_t)time(nullptr) : 0), timeIsValid() ? "true" : "false",
-    (unsigned)getCpuFrequencyMhz(), WiFi.getSleep() ? "true" : "false");
+    (unsigned)getCpuFrequencyMhz(), WiFi.getSleep() ? "true" : "false",
+    g_as_en ? "true" : "false", g_as_volts,
+    (unsigned long)g_as_hold, (unsigned long)g_as_cool, autoStartState(),
+    (unsigned long)(g_lowSince ? (millis() - g_lowSince) / 1000 : 0),
+    (unsigned long)autoStartCooldownLeft(), g_startCount,
+    g_asLock ? "true" : "false", g_asFails,
+    (unsigned long)g_parkS, (unsigned long)AS_PARK_S, g_fires24,
+    g_cpu0, g_cpu1);
   g_out_total += strlen(json);
   server.send(200, "application/json", json);
 }
@@ -566,6 +983,9 @@ void handleTransmit() {
   if (!COMPUSTAR_PATTERNS_CAPTURED)  { fail(409, "patterns not captured - TX blocked"); return; }
 
   bool sent = radio.transmitButton(pattern, RF_REPEATS, RF_GUARD_MS);
+  // Log every engine-start attempt (manual ones too) so the dashboard history
+  // answers "when was this car started, and by what".
+  if (btn == "START") beginVerify(recordStart(g_lastV, 1, sent), false);
   if (!sent) { fail(500, "bad pattern or TX failed"); return; }
 
   char j[128];
@@ -639,6 +1059,93 @@ void handleWifiPs() {
   Serial.printf("WiFi power-save %s\n", WiFi.getSleep() ? "ON" : "OFF");
 }
 
+// POST /autostart?en=0|1&volts=12.2&hold=60&cool=7200
+// Any subset of params. Arming (en=1) is what makes the car able to start
+// itself; it ships disabled and the setting persists in NVS.
+void handleAutoStart() {
+  trackReq();
+  auto fail = [&](const char* msg) {
+    char j[160];
+    snprintf(j, sizeof(j), "{\"ok\":false,\"detail\":\"%s\"}", msg);
+    g_out_total += strlen(j);
+    server.send(400, "application/json", j);
+  };
+
+  if (server.hasArg("volts")) {
+    float v = server.arg("volts").toFloat();
+    if (v < AS_V_MIN_CFG || v > AS_V_MAX_CFG) { fail("volts must be 10.0-13.0"); return; }
+    g_as_volts = v;  prefs.putFloat("as_volts", v);
+  }
+  if (server.hasArg("hold")) {
+    long h = server.arg("hold").toInt();
+    if (h < 10 || h > 3600) { fail("hold must be 10-3600 s"); return; }
+    g_as_hold = (uint32_t)h;  prefs.putUInt("as_hold", g_as_hold);
+  }
+  if (server.hasArg("cool")) {
+    long c = server.arg("cool").toInt();
+    if (c < 300 || c > 86400) { fail("cool must be 300-86400 s"); return; }
+    g_as_cool = (uint32_t)c;  prefs.putUInt("as_cool", g_as_cool);
+  }
+  if (server.hasArg("en")) {
+    g_as_en = server.arg("en").toInt() != 0;
+    prefs.putBool("as_en", g_as_en);
+  }
+  // Clearing the latched lockout after a run of failed starts is deliberate —
+  // you should have looked at why the car didn't catch before re-enabling it.
+  if (server.hasArg("unlock") && server.arg("unlock").toInt() != 0) {
+    g_asLock = false;  prefs.putBool("as_lock", false);
+    g_asFails = 0;     prefs.putUChar("as_fails", 0);
+    Serial.println("auto-start: lockout cleared by user");
+  }
+  g_lowSince = 0;              // any config change restarts the countdown
+
+  char j[320];
+  snprintf(j, sizeof(j),
+    "{\"ok\":true,\"as_en\":%s,\"as_volts\":%.2f,\"as_hold\":%lu,\"as_cool\":%lu,"
+    "\"as_state\":\"%s\",\"as_lock\":%s}",
+    g_as_en ? "true" : "false", g_as_volts,
+    (unsigned long)g_as_hold, (unsigned long)g_as_cool, autoStartState(),
+    g_asLock ? "true" : "false");
+  g_out_total += strlen(j);
+  server.send(200, "application/json", j);
+  Serial.printf("auto-start config: %s, <= %.2f V for %lu s, cooldown %lu s\n",
+                g_as_en ? "ARMED" : "disabled", g_as_volts,
+                (unsigned long)g_as_hold, (unsigned long)g_as_cool);
+}
+
+// GET /starts — the engine-start log, newest first, as a JSON array.
+void handleStarts() {
+  trackReq();
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent("[");
+  for (int n = 0; n < g_startCount; n++) {
+    int idx = (g_startHead - 1 - n + 2 * START_N) % START_N;
+    StartEvent& e = g_starts[idx];
+    char rec[176];
+    snprintf(rec, sizeof(rec),
+      "%s{\"ts\":%lu,\"up_s\":%lu,\"v\":%.2f,\"src\":\"%s\",\"ok\":%s,\"ver\":%u}",
+      n ? "," : "", (unsigned long)e.ts, (unsigned long)e.up_s, e.vbatt,
+      e.src == 0 ? "auto" : "manual", e.ok ? "true" : "false", e.ver);
+    g_out_total += strlen(rec);
+    server.sendContent(rec);
+  }
+  server.sendContent("]");
+  server.sendContent("");
+}
+
+// POST /starts — clear the start log.
+void handleStartsClear() {
+  trackReq();
+  g_startCount = 0;
+  g_startHead  = 0;
+  saveStarts();
+  const char* m = "{\"ok\":true,\"cleared\":true}";
+  g_out_total += strlen(m);
+  server.send(200, "application/json", m);
+  Serial.println("start log cleared");
+}
+
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 OTA</title><style>
@@ -693,6 +1200,24 @@ void setup() {
   Serial.printf("NVS restore: CPU %u MHz, WiFi power-save %s\n",
                 (unsigned)g_cpu_mhz, g_wifi_ps ? "ON" : "OFF");
 
+  // Low-voltage auto-start config (defaults = disabled, 12.2 V, 60 s, 2 h).
+  g_as_en       = prefs.getBool("as_en", false);
+  g_as_volts    = prefs.getFloat("as_volts", AS_DEF_VOLTS);
+  g_as_hold     = prefs.getUInt("as_hold", AS_DEF_HOLD_S);
+  g_as_cool     = prefs.getUInt("as_cool", AS_DEF_COOL_S);
+  g_lastStartTs = prefs.getUInt("as_last", 0);
+  g_asLock      = prefs.getBool("as_lock", false);
+  g_asFails     = prefs.getUChar("as_fails", 0);
+  // A corrupt stored value must fall back to the safe default, never widen the
+  // trigger window.
+  if (g_as_volts < AS_V_MIN_CFG || g_as_volts > AS_V_MAX_CFG) g_as_volts = AS_DEF_VOLTS;
+  if (g_as_hold < 10 || g_as_hold > 3600)                     g_as_hold  = AS_DEF_HOLD_S;
+  if (g_as_cool < 300 || g_as_cool > 86400)                   g_as_cool  = AS_DEF_COOL_S;
+  Serial.printf("NVS restore: auto-start %s (below %.2f V for %lu s, cooldown %lu s)%s\n",
+                g_as_en ? "ARMED" : "disabled", g_as_volts,
+                (unsigned long)g_as_hold, (unsigned long)g_as_cool,
+                g_asLock ? "  [LOCKED OUT]" : "");
+
   analogSetPinAttenuation(VSENSE_PIN, ADC_11db);
 
   if (LittleFS.begin(true)) Serial.printf("LittleFS mounted: %u / %u bytes used\n",
@@ -704,6 +1229,8 @@ void setup() {
                 hist ? "PSRAM" : "FAILED");
   loadHistory();
   Serial.printf("Loaded %d prior samples from flash.\n", histCount);
+  loadStarts();
+  Serial.printf("Loaded %d prior start events from flash.\n", g_startCount);
   g_dashLen = strlen_P(DASH_HTML);
 
   Serial.printf("Connecting to WiFi '%s' ", WIFI_SSID);
@@ -753,6 +1280,9 @@ void setup() {
   server.on("/rftest", HTTP_GET, handleRfTest);
   server.on("/cpu", HTTP_POST, handleCpu);
   server.on("/wifips", HTTP_POST, handleWifiPs);
+  server.on("/autostart", HTTP_POST, handleAutoStart);
+  server.on("/starts", HTTP_GET, handleStarts);
+  server.on("/starts", HTTP_POST, handleStartsClear);
   server.onNotFound(handleDash);
   server.begin();
   Serial.println("HTTP up. / dashboard, /json data, /history CSV, /transmit RF.");
@@ -836,6 +1366,8 @@ void loop() {
     lastPrint = now;
     float v = readBatteryVolts();
     updateLed(v);
+    sampleCpuLoad();           // per-core utilisation over the last 2 s
+    evalAutoStart(v);          // low-voltage auto-start (no-op unless armed)
     Serial.printf("Vbatt=%6.2f V  temp=%4.1f C  heap=%uKB  disk=%uKB  samples=%d  %s\n",
                   v, temperatureRead(), (unsigned)(ESP.getFreeHeap() / 1024),
                   (unsigned)(LittleFS.usedBytes() / 1024), histCount, apMode ? "[AP]" : "[STA]");

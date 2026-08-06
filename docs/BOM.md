@@ -19,7 +19,7 @@ touchscreen, and the LAN observability layer described in the
 | 4 | 433 MHz SMA whip antenna | $3 | Compustar RF transmit (~17 cm quarter-wave) |
 | 5 | IPEX-to-SMA pigtail × 1 | $3 | Routes CC1101 RF out to the case wall (only if your CC1101 board has a U.FL connector; SMA-on-board variants skip this) |
 | 6 | 12V→5V buck converter, **1A** (LM2596 module or similar) | $5 | ESP32 alone needs maybe 100 mA peak; 1A is comfortable. (v2 needs 5A — see below) |
-| 7 | Voltage divider parts (30 kΩ + 10 kΩ + 100 nF cap) + TVS SMBJ24CA + 10 µF tantalum | $7 | ADC scaling + load-dump protection (cars can hit 80 V spikes) |
+| 7 | Voltage divider parts (**1 MΩ + 220 kΩ** + 100 nF cap) + TVS SMBJ24CA + 10 µF tantalum | $7 | ADC scaling + load-dump protection (cars can hit 80 V spikes) |
 | 8 | 2A ATM mini blade fuse + inline fuse holder | $3 | Device-side overcurrent protection. (1A would work for v1 alone but 2A leaves headroom if you ever bolt v2 on top) |
 | 9 | OBD-II passive Y-splitter cable (dual-female) | $20 | Pass-through so scan tools still work alongside the install |
 | 10 | OBD-II to bare-wire pigtail | $8 | Case-side connector — taps Pin 16 (+12V) and Pin 4/5 (GND) |
@@ -29,6 +29,17 @@ touchscreen, and the LAN observability layer described in the
 | 14 | Rubber grommet | $2 | OBD pigtail pass-through in case |
 
 **v1 hardware subtotal: ~$95 CAD**
+
+> **Divider values (row 7).** Earlier revisions of this table listed 30 kΩ + 10 kΩ.
+> That is wrong for a 12 V system on this ADC: it divides by 4, so 14.6 V of
+> alternator charging lands at 3.65 V on the pin — past the ~3.1 V top of the
+> ESP32-S3's 12 dB input range and uncomfortably near the 3.3 V rail. The build
+> uses **1 MΩ (high side) + 220 kΩ (low side)**, a ÷5.545 divider that puts
+> 14.6 V at 2.63 V with ~2.6 V of battery headroom to spare, and reads usefully
+> to about 17 V. That 5.545 is the `DIVIDER` constant in the firmware. The 1 MΩ
+> doubles as the GPIO's overvoltage protection (it limits fault current into the
+> pin clamp to microamps), and the 100 nF is what makes the ~180 kΩ source
+> impedance acceptable to the sampling ADC — keep it physically at the pin.
 
 That's a complete voltage-triggered remote start in one box. Drops
 into the OBD-II Y-splitter behind the dash, sleeps until the battery

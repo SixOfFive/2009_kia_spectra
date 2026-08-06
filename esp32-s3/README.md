@@ -12,7 +12,7 @@ and the divergence rationale.
 
 ## What it does
 
-`voltage_monitor/voltage_monitor.ino` (fw 2.3):
+`voltage_monitor/voltage_monitor.ino` (fw 2.5):
 
 1. **Battery voltage** — reads a 1 MΩ / 220 kΩ divider on **GPIO1**
    (ADC1_CH0), scaled ×5.545, 64× averaged. 24 h history (1440 samples
@@ -27,12 +27,21 @@ and the divergence rationale.
    1WG3R fixed-code packets to trigger the factory remote start.
    `POST /transmit?button=START|LOCK|UNLOCK|TRUNK`, plus four buttons on
    the dashboard.
-4. **Power & performance controls** (NEW in 2.2) — a dashboard card to
+4. **Power & performance controls** — a dashboard card to
    toggle the **CPU clock** (80 / 240 MHz, `POST /cpu?mhz=`) and **WiFi
    power-save** (`POST /wifips?on=`), each showing the current state
    plainly. Both **persist across reboot/brownout** in NVS
    (`Preferences`) and are re-applied at boot — 80 MHz is the WiFi-safe
-   floor, so the radio survives the clock drop.
+   floor, so the radio survives the clock drop. Also reports true
+   **per-core CPU load** (`cpu0` / `cpu1` in `/json`), read from the
+   FreeRTOS idle-task run-time counters.
+5. **Low-voltage auto-start** (NEW in 2.4, opt-in — **ships disabled**) —
+   fires the remote start by itself once battery voltage stays below a
+   threshold for a sustained period, so the alternator can recharge the
+   battery before it's too flat to crank. Defaults: **below 12.4 V held
+   for 60 s**, 2 h cooldown. Config + the start log persist to NVS /
+   LittleFS. `POST /autostart?en=&volts=&hold=&cool=`, `GET /starts`.
+   See the safety section below.
 
 ## Layout
 
@@ -107,6 +116,41 @@ Without `secrets.h` the firmware still builds and runs (placeholder WiFi,
 RF disabled). With placeholder Compustar patterns,
 `COMPUSTAR_PATTERNS_CAPTURED 0` keeps `/transmit` blocked so a bench board
 can never emit a bogus packet.
+
+## Low-voltage auto-start
+
+Off unless you arm it. When armed, the firmware can crank the engine with
+nobody present, so it is deliberately hard to trigger by accident — **every**
+one of these must hold before a packet goes out:
+
+| Guard | Why |
+|---|---|
+| `as_en` is set (dashboard toggle) | Opt-in; the default is disabled |
+| RF armed — CC1101 present *and* real patterns loaded | Can't half-fire |
+| ≥ 2 min since boot | ADC settle; a brownout-reboot can't fire instantly |
+| Reading inside **8–16 V** | A bench rig or unplugged sense wire reads outside this and is treated as *no information*, never as "low" |
+| Voltage **strictly below** the threshold, continuously for the hold time | Rejects the 1–3 s dip while the engine is actually cranking |
+| ≥ 15 min continuously below 13.2 V | Proves the alternator is off, i.e. the car is parked — it won't fire while you're driving |
+| Cooldown elapsed (default 2 h) | Anti-loop; persists across reboot via wall-clock |
+| Battery recovered ≥ 12.55 V for 10 min since the last start | Hysteresis — without it a battery sitting just above the trigger re-fires forever |
+| Fewer than 3 auto-starts in 24 h | Hard runaway cap |
+| Not locked out | Two consecutive starts that draw no charge latch it off |
+
+After any start (manual or automatic) the firmware watches for the alternator
+to come up within 3 minutes. That's the only real proof the engine caught, and
+it's recorded per-event in the start log as *ran* / *no charge*. Two automatic
+starts in a row with no charge means the car isn't going to start — it latches
+`lockout` and stops cranking until you clear it. A **manual** press never counts
+toward that lockout, so bench testing can't disable the automatic system.
+
+**Default 12.4 V, not 12.2 V.** In a cold climate the engine wants roughly
+double the cranking torque near −20 °C while the battery delivers about half its
+power, and a battery down at 12.2 V has electrolyte that slushes around −26 °C.
+In a mild climate 12.2 V is fine — it's one field on the page.
+
+> **⚠ Never leave auto-start armed with the car parked in an attached garage or
+> any enclosed space.** It will start the engine unattended, and exhaust in an
+> enclosed space is lethal.
 
 ## ⚠ RF safety
 

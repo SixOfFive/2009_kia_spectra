@@ -12,7 +12,7 @@ and the divergence rationale.
 
 ## What it does
 
-`voltage_monitor/voltage_monitor.ino` (fw 2.6):
+`voltage_monitor/voltage_monitor.ino` (fw 2.7):
 
 1. **Battery voltage** — reads a 1 MΩ / 220 kΩ divider on **GPIO1**
    (ADC1_CH0), scaled ×5.545, 64× averaged. 24 h history (1440 samples
@@ -43,6 +43,11 @@ and the divergence rationale.
    for 60 s**, 2 h cooldown. Config + the start log persist to NVS /
    LittleFS. `POST /autostart?en=&volts=&hold=&cool=`, `GET /starts`.
    See the safety section below.
+6. **SNMP agent** (NEW in 2.7) — native read-only SNMPv1/v2c on **UDP
+   161**, exposing all of the above at `1.3.6.1.4.1.99999.8.<n>.0` so
+   Cacti / LibreNMS / `snmpwalk` can poll the board with no Pi
+   involved. GET / GETNEXT / GETBULK; **no SET path exists**. See
+   [`docs/20-snmp-integration.md`](../docs/20-snmp-integration.md).
 
 ## Layout
 

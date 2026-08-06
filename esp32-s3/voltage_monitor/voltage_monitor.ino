@@ -29,6 +29,7 @@
 #include <Fonts/FreeSansBold24pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include "cc1101_compustar.h"
+#include "snmp_agent.h"
 
 // secrets.h (gitignored) holds WiFi credentials + the per-FOB captured
 // Compustar patterns. The repo ships only secrets.h.example. Without a
@@ -57,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "2.6";             // 2.6 = 24h cap optional (0/-1 = unlimited) + CPU load graphs
+const char* FW_VERSION = "2.7";             // 2.7 = native read-only SNMP agent (Cacti/LibreNMS)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -158,6 +159,14 @@ const uint32_t AS_BOOT_GRACE_MS = 120000;   // no auto-start in the first 2 min 
 const float    AS_V_MIN_CFG     = 10.0f;    // accepted config range for the threshold
 const float    AS_V_MAX_CFG     = 13.0f;
 const int      START_N          = 64;       // start-event ring buffer length
+
+// ----- SNMP (read-only, for Cacti / LibreNMS / snmpwalk) -----
+// Enterprise subtree 1.3.6.1.4.1.99999.**8** — the Pi-side responder uses .7,
+// so both can live on one network. Port 161 is fine here: no OS privilege
+// rules on bare metal. Community is read-only; there is no SET path at all.
+const bool     SNMP_ENABLED   = true;
+const uint16_t SNMP_PORT      = 161;
+const char*    SNMP_COMMUNITY = "public";
 // -----------------------------------------------------------
 
 struct Sample {
@@ -635,6 +644,96 @@ void evalAutoStart(float v) {
                 v, sent ? "ok" : "FAILED", (unsigned long)g_as_cool, g_fires24,
                 g_as_max24 > 0 ? String(g_as_max24).c_str() : "none");
 }
+
+// ---------- SNMP OID table ----------
+// Everything the dashboard shows, exposed read-only at
+// 1.3.6.1.4.1.99999.8.<leaf>.0 . Floats are scaled to integers (millivolts,
+// deci-degrees) because SNMP has no float type and Cacti is happier with
+// integers it can apply a CDEF to. Keep this table and the table in
+// docs/20-snmp-integration.md in step.
+SnmpAgent snmp;
+
+static void oidFw(SnmpValue& v)       { v.type = SNMP_OCTET;     v.s = FW_VERSION; }
+static void oidMode(SnmpValue& v)     { v.type = SNMP_OCTET;     v.s = apMode ? "ap" : "sta"; }
+static void oidIp(SnmpValue& v)       { v.type = SNMP_OCTET;     v.s = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString(); }
+static void oidUptime(SnmpValue& v)   { v.type = SNMP_TIMETICKS; v.u = millis() / 10; }
+static void oidVbattMv(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = (uint32_t)(g_lastV * 1000.0f + 0.5f); }
+static void oidAdcMv(SnmpValue& v)    { v.type = SNMP_GAUGE32;   v.u = (uint32_t)g_last_mv; }
+static void oidTempDc(SnmpValue& v)   { v.type = SNMP_INT;       v.i = (int32_t)(temperatureRead() * 10.0f); }
+static void oidVstatus(SnmpValue& v)  { v.type = SNMP_OCTET;     v.s = voltStatus(g_lastV); }
+static void oidRssi(SnmpValue& v)     { v.type = SNMP_INT;       v.i = apMode ? 0 : (int32_t)WiFi.RSSI(); }
+static void oidHeapFree(SnmpValue& v) { v.type = SNMP_GAUGE32;   v.u = ESP.getFreeHeap(); }
+static void oidHeapTot(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = ESP.getHeapSize(); }
+static void oidPsFree(SnmpValue& v)   { v.type = SNMP_GAUGE32;   v.u = ESP.getFreePsram(); }
+static void oidPsTot(SnmpValue& v)    { v.type = SNMP_GAUGE32;   v.u = ESP.getPsramSize(); }
+static void oidDiskUsed(SnmpValue& v) { v.type = SNMP_GAUGE32;   v.u = LittleFS.usedBytes(); }
+static void oidDiskTot(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = LittleFS.totalBytes(); }
+static void oidNetIn(SnmpValue& v)    { v.type = SNMP_COUNTER32; v.u = g_in_total; }
+static void oidNetOut(SnmpValue& v)   { v.type = SNMP_COUNTER32; v.u = g_out_total; }
+static void oidCpuMhz(SnmpValue& v)   { v.type = SNMP_GAUGE32;   v.u = getCpuFrequencyMhz(); }
+static void oidCpu0(SnmpValue& v)     { v.type = SNMP_GAUGE32;   v.u = (uint32_t)(g_cpu0 + 0.5f); }
+static void oidCpu1(SnmpValue& v)     { v.type = SNMP_GAUGE32;   v.u = (uint32_t)(g_cpu1 + 0.5f); }
+static void oidWifiPs(SnmpValue& v)   { v.type = SNMP_INT;       v.i = WiFi.getSleep() ? 1 : 0; }
+static void oidSamples(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = (uint32_t)histCount; }
+static void oidEpoch(SnmpValue& v)    { v.type = SNMP_GAUGE32;   v.u = timeIsValid() ? (uint32_t)time(nullptr) : 0; }
+static void oidTimeOk(SnmpValue& v)   { v.type = SNMP_INT;       v.i = timeIsValid() ? 1 : 0; }
+static void oidRf(SnmpValue& v)       { v.type = SNMP_OCTET;     v.s = rfStatusStr(); }
+static void oidAsEn(SnmpValue& v)     { v.type = SNMP_INT;       v.i = g_as_en ? 1 : 0; }
+static void oidAsVolts(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = (uint32_t)(g_as_volts * 1000.0f + 0.5f); }
+static void oidAsHold(SnmpValue& v)   { v.type = SNMP_GAUGE32;   v.u = g_as_hold; }
+static void oidAsCool(SnmpValue& v)   { v.type = SNMP_GAUGE32;   v.u = g_as_cool; }
+static void oidAsState(SnmpValue& v)  { v.type = SNMP_OCTET;     v.s = autoStartState(); }
+static void oidAsLowS(SnmpValue& v)   { v.type = SNMP_GAUGE32;   v.u = g_lowSince ? (millis() - g_lowSince) / 1000 : 0; }
+static void oidAsCoolL(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = autoStartCooldownLeft(); }
+static void oidAsLock(SnmpValue& v)   { v.type = SNMP_INT;       v.i = g_asLock ? 1 : 0; }
+static void oidAsFails(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = g_asFails; }
+static void oidAsF24(SnmpValue& v)    { v.type = SNMP_GAUGE32;   v.u = g_fires24; }
+static void oidAsMax24(SnmpValue& v)  { v.type = SNMP_INT;       v.i = g_as_max24; }
+static void oidAsParkS(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = g_parkS; }
+static void oidStarts(SnmpValue& v)   { v.type = SNMP_COUNTER32; v.u = (uint32_t)g_startCount; }
+static void oidLastStart(SnmpValue& v){ v.type = SNMP_GAUGE32;   v.u = g_lastStartTs; }
+
+static const SnmpEntry SNMP_OIDS[] = {
+  { 1,  oidFw,        "fwVersion"        },
+  { 2,  oidMode,      "wifiMode"         },
+  { 3,  oidIp,        "ipAddress"        },
+  { 4,  oidUptime,    "uptime"           },
+  { 5,  oidVbattMv,   "batteryMillivolts"},
+  { 6,  oidAdcMv,     "adcMillivolts"    },
+  { 7,  oidTempDc,    "chipTempDeciC"    },
+  { 8,  oidVstatus,   "voltageStatus"    },
+  { 9,  oidRssi,      "wifiRssiDbm"      },
+  { 10, oidHeapFree,  "heapFreeBytes"    },
+  { 11, oidHeapTot,   "heapTotalBytes"   },
+  { 12, oidPsFree,    "psramFreeBytes"   },
+  { 13, oidPsTot,     "psramTotalBytes"  },
+  { 14, oidDiskUsed,  "diskUsedBytes"    },
+  { 15, oidDiskTot,   "diskTotalBytes"   },
+  { 16, oidNetIn,     "httpBytesIn"      },
+  { 17, oidNetOut,    "httpBytesOut"     },
+  { 18, oidCpuMhz,    "cpuClockMhz"      },
+  { 19, oidCpu0,      "cpuLoad0Pct"      },
+  { 20, oidCpu1,      "cpuLoad1Pct"      },
+  { 21, oidWifiPs,    "wifiPowerSave"    },
+  { 22, oidSamples,   "historySamples"   },
+  { 23, oidEpoch,     "clockEpoch"       },
+  { 24, oidTimeOk,    "clockSynced"      },
+  { 25, oidRf,        "rfStatus"         },
+  { 30, oidAsEn,      "autoStartEnabled" },
+  { 31, oidAsVolts,   "autoStartMv"      },
+  { 32, oidAsHold,    "autoStartHoldSec" },
+  { 33, oidAsCool,    "autoStartCoolSec" },
+  { 34, oidAsState,   "autoStartState"   },
+  { 35, oidAsLowS,    "autoStartLowSec"  },
+  { 36, oidAsCoolL,   "autoStartCoolLeft"},
+  { 37, oidAsLock,    "autoStartLockout" },
+  { 38, oidAsFails,   "autoStartFails"   },
+  { 39, oidAsF24,     "autoStartFires24h"},
+  { 40, oidAsMax24,   "autoStartMax24h"  },
+  { 41, oidAsParkS,   "autoStartParkSec" },
+  { 42, oidStarts,    "startEventCount"  },
+  { 43, oidLastStart, "lastStartEpoch"   },
+};
 
 const char DASH_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
@@ -1353,6 +1452,16 @@ void setup() {
   } else {
     Serial.println("RF disabled in config (RF_ENABLED=false).");
   }
+  // SNMP agent — read-only, so an NMS can poll the board directly with no Pi.
+  if (SNMP_ENABLED) {
+    size_t nOids = sizeof(SNMP_OIDS) / sizeof(SNMP_OIDS[0]);
+    if (snmp.begin(SNMP_PORT, SNMP_COMMUNITY, SNMP_OIDS, nOids))
+      Serial.printf("SNMP up on udp/%u, %u OIDs at 1.3.6.1.4.1.99999.8.x.0\n",
+                    SNMP_PORT, (unsigned)nOids);
+    else
+      Serial.printf("SNMP failed to bind udp/%u\n", SNMP_PORT);
+  }
+
   recordSample();                    // seed one sample now
   updateLed(readBatteryVolts());     // set the LED immediately
 
@@ -1373,6 +1482,7 @@ uint32_t lastSample = 0, lastSave = 0, lastPrint = 0, downSince = 0, lastDisp = 
 void loop() {
   if (apMode) dnsServer.processNextRequest();
   server.handleClient();
+  if (SNMP_ENABLED) snmp.poll();
   uint32_t now = millis();
 
   if (DISPLAY_ENABLED) {

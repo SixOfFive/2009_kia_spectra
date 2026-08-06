@@ -1,5 +1,113 @@
 # 20 — SNMP integration
 
+There are **two** independent SNMP responders in this project, on
+different enterprise subtrees so they can coexist on one network:
+
+| | Subtree | Where | Needed for |
+|---|---|---|---|
+| **ESP32-S3 agent** | `1.3.6.1.4.1.99999.`**`8`** | in the firmware, `esp32-s3/voltage_monitor/snmp_agent.*` | **v1** — poll the device directly, no Pi |
+| Pi responder | `1.3.6.1.4.1.99999.`**`7`** | `pi/app/snmp_responder.py` | v2 telematics only (parked) |
+
+If you are running the v1 ESP32-only build — which is the shipped
+build — **you want the ESP32 agent**, documented immediately below.
+The Pi responder documented in the rest of this file only exists if
+you opted into the deferred v2 telematics half.
+
+---
+
+## ESP32-S3 firmware agent (v1)
+
+A native read-only SNMPv1/v2c agent compiled into the firmware. It
+exposes everything the web dashboard shows, so Cacti / LibreNMS /
+`snmpwalk` can poll the board itself with nothing else deployed.
+
+- **Listens on UDP 161** (no privilege rules on bare metal, so the
+  standard port is free). Community and port are constants at the top
+  of `voltage_monitor.ino` (`SNMP_PORT`, `SNMP_COMMUNITY`).
+- **GET, GETNEXT and GETBULK.** There is **no SET path at all** — the
+  agent cannot write anything, by construction. A request with the
+  wrong community is dropped silently, the way `snmpd` behaves.
+- Values are read live from the same globals the dashboard renders, so
+  a poll and a page refresh always agree.
+- Floats are scaled to integers (**millivolts**, **deci-degrees**)
+  because SNMP has no float type and Cacti prefers an integer it can
+  apply a CDEF to.
+
+### OID reference — base `1.3.6.1.4.1.99999.8.`
+
+All scalars, all with the SMI `.0` instance suffix.
+
+| OID suffix | Type | Description |
+|---|---|---|
+| `.1.0` | STRING | `fwVersion` |
+| `.2.0` | STRING | `wifiMode` — `sta` or `ap` |
+| `.3.0` | STRING | `ipAddress` |
+| `.4.0` | TimeTicks | `uptime` — hundredths of a second |
+| `.5.0` | Gauge32 | `batteryMillivolts` — **the headline metric** |
+| `.6.0` | Gauge32 | `adcMillivolts` — raw divider node |
+| `.7.0` | INTEGER | `chipTempDeciC` — °C × 10 |
+| `.8.0` | STRING | `voltageStatus` — `red` / `blue` / `green` |
+| `.9.0` | INTEGER | `wifiRssiDbm` — signed |
+| `.10.0` / `.11.0` | Gauge32 | `heapFreeBytes` / `heapTotalBytes` |
+| `.12.0` / `.13.0` | Gauge32 | `psramFreeBytes` / `psramTotalBytes` |
+| `.14.0` / `.15.0` | Gauge32 | `diskUsedBytes` / `diskTotalBytes` |
+| `.16.0` / `.17.0` | Counter32 | `httpBytesIn` / `httpBytesOut` |
+| `.18.0` | Gauge32 | `cpuClockMhz` — 80 or 240 |
+| `.19.0` / `.20.0` | Gauge32 | `cpuLoad0Pct` / `cpuLoad1Pct` |
+| `.21.0` | INTEGER | `wifiPowerSave` — 0/1 |
+| `.22.0` | Gauge32 | `historySamples` — 0..1440 |
+| `.23.0` | Gauge32 | `clockEpoch` — unix seconds, 0 if no NTP |
+| `.24.0` | INTEGER | `clockSynced` — 0/1 |
+| `.25.0` | STRING | `rfStatus` — `armed` / `blocked` / `absent` / `off` |
+| `.30.0` | INTEGER | `autoStartEnabled` — 0/1 |
+| `.31.0` | Gauge32 | `autoStartMv` — trigger threshold in mV |
+| `.32.0` / `.33.0` | Gauge32 | `autoStartHoldSec` / `autoStartCoolSec` |
+| `.34.0` | STRING | `autoStartState` — `off`, `watching`, `counting`, `cooldown`, `lockout`, … |
+| `.35.0` | Gauge32 | `autoStartLowSec` — seconds currently sustained low |
+| `.36.0` | Gauge32 | `autoStartCoolLeft` — seconds left in cooldown |
+| `.37.0` | INTEGER | `autoStartLockout` — 0/1 |
+| `.38.0` | Gauge32 | `autoStartFails` — consecutive no-charge starts |
+| `.39.0` | Gauge32 | `autoStartFires24h` |
+| `.40.0` | INTEGER | `autoStartMax24h` — 0 = unlimited |
+| `.41.0` | Gauge32 | `autoStartParkSec` |
+| `.42.0` | Counter32 | `startEventCount` — entries in the start log |
+| `.43.0` | Gauge32 | `lastStartEpoch` — 0 if never |
+
+Add OIDs by appending to `SNMP_OIDS[]` in `voltage_monitor.ino`; the
+GETNEXT walker sorts by OID, so insertion order doesn't matter. Keep
+this table in step with that array.
+
+### Try it
+
+```sh
+snmpwalk -v2c -c public -On 192.168.15.238 1.3.6.1.4.1.99999.8
+snmpget  -v2c -c public -On 192.168.15.238 1.3.6.1.4.1.99999.8.5.0
+```
+
+### Cacti
+
+Add the device with SNMP v2c, community `public`, port 161. Then
+create a **Data Input Method** of type "Get SNMP Data" per OID you want
+to graph, pointing at the OID from the table above. The two most worth
+graphing are `.5.0` (battery mV — divide by 1000 with a CDEF for volts)
+and `.19.0`/`.20.0` (CPU load).
+
+For a parked car with a parasitic drain, `.5.0` graphed over days is
+the diagnostic: the *slope* is the drain rate, and it shows whether a
+fuse-pull changed anything.
+
+### Implementation note — buffers are `static`
+
+The BER buffers in `snmp_agent.cpp` are deliberately `static`, not
+stack locals. They total ~7 KB and the Arduino loop task only gets an
+8 KB stack; as stack locals they overflowed it and the board **rebooted
+on the third SNMP request**. `poll()` is only ever called from `loop()`,
+single-threaded, so statics are safe here.
+
+---
+
+## Pi-side responder (v2 telematics only)
+
 The Pi runs a small **read-only SNMPv2c responder** alongside the
 dashboard daemon, so an existing NMS (LibreNMS, Cacti, observium, even
 ad-hoc `snmpwalk` from your laptop) can pull vroom-specific telemetry

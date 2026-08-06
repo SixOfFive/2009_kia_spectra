@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "2.7";             // 2.7 = native read-only SNMP agent (Cacti/LibreNMS)
+const char* FW_VERSION = "2.8";             // 2.8 = every SNMP metric also visible on the dashboard
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -801,10 +801,14 @@ table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 <div class="card"><div class="k">WiFi RSSI</div><div class="v"><span id="rssi">--</span> dBm</div></div>
 <div class="card"><div class="k">Uptime</div><div class="v" id="up">--</div></div>
 <div class="card"><div class="k">Disk</div><div class="v"><span id="disk">--</span></div></div>
-<div class="card"><div class="k">Free heap</div><div class="v"><span id="heap">--</span> KB</div></div>
-<div class="card"><div class="k">Free PSRAM</div><div class="v"><span id="psram">--</span> MB</div></div>
+<div class="card"><div class="k">Free heap</div><div class="v"><span id="heap">--</span></div></div>
+<div class="card"><div class="k">Free PSRAM</div><div class="v"><span id="psram">--</span></div></div>
 <div class="card"><div class="k">CPU core 0</div><div class="v"><span id="cpu0">--</span> %</div></div>
 <div class="card"><div class="k">CPU core 1</div><div class="v"><span id="cpu1">--</span> %</div></div>
+<div class="card"><div class="k">Voltage status</div><div class="v" id="vstat">--</div></div>
+<div class="card"><div class="k">Clock (NTP)</div><div class="v" id="ntp">--</div></div>
+<div class="card"><div class="k">HTTP in total</div><div class="v"><span id="nin">--</span></div></div>
+<div class="card"><div class="k">HTTP out total</div><div class="v"><span id="nout">--</span></div></div>
 </div>
 <div class="clbl">Power &amp; performance</div>
 <div class="card" style="margin-bottom:10px">
@@ -858,6 +862,16 @@ the engine clearly isn't catching and it latches off until you clear it.
 </div>
 <div class="k" id="asmsg" style="margin-top:8px">&nbsp;</div>
 </div>
+<div class="grid" style="margin-top:0">
+<div class="card"><div class="k">Low for</div><div class="v"><span id="aslow">--</span></div></div>
+<div class="card"><div class="k">Cooldown left</div><div class="v"><span id="ascool">--</span></div></div>
+<div class="card"><div class="k">Park confirm</div><div class="v"><span id="aspark">--</span></div></div>
+<div class="card"><div class="k">Auto-starts 24 h</div><div class="v"><span id="asf24">--</span></div></div>
+<div class="card"><div class="k">Fail streak</div><div class="v"><span id="asfail">--</span></div></div>
+<div class="card"><div class="k">Lockout</div><div class="v"><span id="aslock">--</span></div></div>
+<div class="card"><div class="k">Starts logged</div><div class="v"><span id="asn">--</span></div></div>
+<div class="card"><div class="k">Last start</div><div class="v" style="font-size:13px" id="aslast">--</div></div>
+</div>
 </div>
 <div class="wrap" style="padding-top:0">
 <div class="clbl">Start history</div>
@@ -870,6 +884,7 @@ the engine clearly isn't catching and it latches off until you clear it.
 <script>
 function $(i){return document.getElementById(i)}
 function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
+function fmtB(b){if(b===undefined||b===null)return "--";if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(1)+" KB";return (b/1048576).toFixed(2)+" MB"}
 // 9 graphs, in canvas order c0..c8, mapped to /history data columns 1..9.
 var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657","#7ee787","#e3b341"];
 var DEC=[2,1,0,0,0,0,0,0,0];
@@ -932,8 +947,14 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
 $("vbatt").textContent=d.vbatt.toFixed(2);$("temp").textContent=d.temp_c.toFixed(1);
 $("vbatt").style.color={red:"#f85149",blue:"#58a6ff",green:"#3fb950"}[d.led]||"#e6edf3";
 $("adc").textContent=d.adc_mv;$("rssi").textContent=d.rssi;$("up").textContent=fmtUp(d.uptime_s);
-$("heap").textContent=Math.floor(d.heap_free/1024);$("psram").textContent=(d.psram_free/1048576).toFixed(2);
+$("heap").textContent=Math.floor(d.heap_free/1024)+"/"+Math.floor(d.heap_total/1024)+" KB";
+$("psram").textContent=(d.psram_free/1048576).toFixed(2)+"/"+(d.psram_total/1048576).toFixed(2)+" MB";
 $("disk").textContent=Math.floor(d.disk_used/1024)+"/"+Math.floor(d.disk_total/1024)+" KB";
+$("vstat").textContent=d.led;
+$("vstat").style.color={red:"#f85149",blue:"#58a6ff",green:"#3fb950"}[d.led]||"#e6edf3";
+$("ntp").textContent=d.time_ok?"synced":"not synced";
+$("ntp").style.color=d.time_ok?"#3fb950":"#d29922";
+$("nin").textContent=fmtB(d.net_in);$("nout").textContent=fmtB(d.net_out);
 $("sub").textContent="divider ×"+d.divider+" · cal "+d.cal+" · ADC "+d.adc_mv+" mV · 1 sample/"+d.interval_s+"s";
 $("net").textContent=(d.mode?d.mode.toUpperCase():"")+" · "+(d.ip||"");$("ns").textContent=d.samples;$("fw").textContent=d.fw||"?";
 $("clk").textContent=d.time_ok?new Date(d.epoch*1000).toLocaleTimeString():"no NTP";
@@ -965,6 +986,20 @@ if(d.as_state=="cooldown")s="cooldown — "+fmtUp(d.as_cool_s)+" before it can f
 $("asstate").textContent=s;
 $("asstate").style.color=(d.as_state=="counting"||d.as_state=="lockout")?"#f85149":(ae?"#3fb950":"#8b949e");
 $("asunlock").style.display=d.as_lock?"inline-block":"none";
+// always-visible auto-start counters (these were previously only readable
+// via SNMP, or only surfaced in one particular state's status line)
+$("aslow").textContent=d.as_low_s?(d.as_low_s+" / "+d.as_hold+" s"):"--";
+$("aslow").style.color=d.as_low_s?"#f85149":"#e6edf3";
+$("ascool").textContent=d.as_cool_s?fmtUp(d.as_cool_s):"clear";
+$("aspark").textContent=d.as_park_s>=d.as_park_need?"confirmed":(d.as_park_s+" / "+d.as_park_need+" s");
+$("aspark").style.color=(d.as_park_s>=d.as_park_need)?"#3fb950":"#8b949e";
+$("asf24").textContent=d.as_f24+(d.as_max24>0?(" / "+d.as_max24):" (no cap)");
+$("asfail").textContent=d.as_fails+" / 2";
+$("asfail").style.color=d.as_fails?"#d29922":"#e6edf3";
+$("aslock").textContent=d.as_lock?"LOCKED":"no";
+$("aslock").style.color=d.as_lock?"#f85149":"#3fb950";
+$("asn").textContent=d.as_n;
+$("aslast").textContent=(d.as_last>1700000000)?new Date(d.as_last*1000).toLocaleString():"never";
 var af=document.activeElement?document.activeElement.id:"";
 if(af!="asv")$("asv").value=(d.as_volts||0).toFixed(1);
 if(af!="ash")$("ash").value=d.as_hold;
@@ -1038,7 +1073,7 @@ void handleJson() {
   float tC = temperatureRead();
   String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   int    rssi = apMode ? 0 : (int)WiFi.RSSI();
-  char json[1100];
+  char json[1280];
   snprintf(json, sizeof(json),
     "{\"vbatt\":%.2f,\"temp_c\":%.1f,\"adc_mv\":%d,\"divider\":%.3f,\"cal\":%.3f,"
     "\"rssi\":%d,\"uptime_s\":%lu,\"heap_free\":%u,\"heap_total\":%u,"
@@ -1048,7 +1083,8 @@ void handleJson() {
     "\"as_en\":%s,\"as_volts\":%.2f,\"as_hold\":%lu,\"as_cool\":%lu,"
     "\"as_state\":\"%s\",\"as_low_s\":%lu,\"as_cool_s\":%lu,\"as_n\":%d,"
     "\"as_lock\":%s,\"as_fails\":%u,\"as_park_s\":%lu,\"as_park_need\":%lu,\"as_f24\":%u,"
-    "\"as_max24\":%d,\"cpu0\":%.1f,\"cpu1\":%.1f}",
+    "\"as_max24\":%d,\"cpu0\":%.1f,\"cpu1\":%.1f,"
+    "\"net_in\":%lu,\"net_out\":%lu,\"as_last\":%lu}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
@@ -1063,7 +1099,9 @@ void handleJson() {
     (unsigned long)autoStartCooldownLeft(), g_startCount,
     g_asLock ? "true" : "false", g_asFails,
     (unsigned long)g_parkS, (unsigned long)AS_PARK_S, g_fires24,
-    g_as_max24, g_cpu0, g_cpu1);
+    g_as_max24, g_cpu0, g_cpu1,
+    (unsigned long)g_in_total, (unsigned long)g_out_total,
+    (unsigned long)g_lastStartTs);
   g_out_total += strlen(json);
   server.send(200, "application/json", json);
 }

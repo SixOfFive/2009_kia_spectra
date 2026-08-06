@@ -125,6 +125,20 @@ class CC1101Compustar {
   bool enterTxAndWait(uint32_t timeoutUs);
 
 public:
+  // Faithful remote-start replay. The real FOB precedes each data packet with a
+  // ~1.4 s CONTINUOUS CARRIER to wake the receiver's duty-cycled listener, then
+  // a short training run, then the sync+data. Plain transmitButton() (used for
+  // lock/unlock) skips the wake-up, so a duty-cycled receiver sleeps through it.
+  // Structure per burst: [wake-up carrier][training][sync+data x dataReps].
+  // The FOB sends the data ~8 times after each carrier so the just-woken
+  // receiver reliably catches it -- sending it once (dataReps=1) lets the
+  // single packet slip past before the receiver locks on. `bursts` repeats
+  // the whole [carrier..data] unit.
+  bool transmitButtonWakeup(const char* pattern, uint16_t wakeupMs,
+                            uint8_t trainCells, uint8_t dataReps,
+                            uint8_t bursts, uint16_t guardMs);
+
+public:
   // Measure the module's crystal frequency in Hz, with no SDR: the CC1101
   // outputs CLK_XOSC/192 on GDO0 and the ESP32 counts edges. This decides
   // whether our 433.92 MHz frequency words are actually on-target -- a 27 MHz

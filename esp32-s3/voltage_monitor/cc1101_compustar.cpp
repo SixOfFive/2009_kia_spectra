@@ -413,3 +413,52 @@ bool CC1101Compustar::transmitButton(const char* pattern, uint8_t repeats,
   strobe(STR_SIDLE);
   return true;
 }
+
+bool CC1101Compustar::transmitButtonWakeup(const char* pattern, uint16_t wakeupMs,
+                                           uint8_t trainCells, uint8_t dataReps,
+                                           uint8_t bursts, uint16_t guardMs) {
+  if (!_ready || !pattern) return false;
+  size_t len = strlen(pattern);
+  if (len != CMP_PACKET_BITS) return false;
+  for (size_t i = 0; i < len; i++)
+    if (pattern[i] != '0' && pattern[i] != '1') return false;
+
+  // Render the sync triplet + data bits, same as transmitButton.
+  CompustarPulse pulses[CMP_SYNC_COUNT + CMP_PACKET_BITS];
+  size_t k = 0;
+  for (uint8_t s = 0; s < CMP_SYNC_COUNT; s++) {
+    pulses[k].high_us = CMP_SYNC_HIGH_US; pulses[k].low_us = CMP_SYNC_LOW_US; k++;
+  }
+  for (size_t i = 0; i < len; i++) {
+    if (pattern[i] == '1') { pulses[k].high_us = CMP_LONG_HIGH_US;  pulses[k].low_us = CMP_LONG_LOW_US; }
+    else                   { pulses[k].high_us = CMP_SHORT_HIGH_US; pulses[k].low_us = CMP_SHORT_LOW_US; }
+    k++;
+  }
+
+  if (!enterTxAndWait(5000)) { strobe(STR_SIDLE); return false; }
+
+  for (uint8_t b = 0; b < bursts; b++) {
+    // (1) Wake-up carrier: hold the carrier ON continuously so a duty-cycled
+    //     receiver catches it during one of its listen windows. delay() yields
+    //     to the RTOS, so WiFi survives; GDO0 stays HIGH the whole time.
+    digitalWrite(_gdo0, HIGH);
+    delay(wakeupMs);
+    // (2) Training run: a few ~750 us equal on/off cells, as the FOB sends,
+    //     to let the receiver's data slicer settle its threshold and clock.
+    for (uint8_t t = 0; t < trainCells; t++) {
+      digitalWrite(_gdo0, LOW);  delayMicroseconds(760);
+      digitalWrite(_gdo0, HIGH); delayMicroseconds(745);
+    }
+    digitalWrite(_gdo0, LOW);
+    // (3) The sync + data packet, repeated dataReps times so the just-woken
+    //     receiver reliably catches it (the FOB sends ~8).
+    for (uint8_t d = 0; d < dataReps; d++) {
+      transmitPulses(pulses, k);
+      if (d < dataReps - 1) delay(guardMs);
+    }
+    if (b < bursts - 1) delay(guardMs);
+  }
+  digitalWrite(_gdo0, LOW);
+  strobe(STR_SIDLE);
+  return true;
+}

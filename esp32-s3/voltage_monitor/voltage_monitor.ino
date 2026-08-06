@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "3.6";             // 3.0 = AP fallback retries the home WiFi instead of latching
+const char* FW_VERSION = "4.0";             // 3.0 = AP fallback retries the home WiFi instead of latching
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -115,6 +115,17 @@ const int      CC1101_CS   = 15;
 const int      CC1101_GDO0 = 4;
 const uint8_t  RF_TX_POWER = 0xC0;          // PATABLE[1]: 0xC0 ~ +10 dBm (max)
 const uint8_t  RF_REPEATS  = 8;             // packet repeats per press (FOB sends ~8)
+// Remote-start is a press-AND-HOLD on the real FOB (the SDR captures were ~10
+// bursts over many seconds), and the brain deliberately wants the start code
+// sustained before it will crank -- an anti-accidental-start guard. A short
+// lock-length burst isn't enough. START therefore repeats far more (~4.5 s of
+// continuous packets) to mimic a held button.
+// START wake-up structure (the FOB precedes each start packet with a long
+// carrier to wake the receiver's duty-cycled listener):
+const uint16_t RF_WAKEUP_MS    = 1450;      // continuous wake-up carrier per burst (FOB ~1436 ms)
+const uint8_t  RF_TRAIN_CELLS  = 6;         // ~750 us equal on/off training cells after the carrier (FOB ~5-6)
+const uint8_t  RF_START_DATAREPS = 8;       // sync+data repeats after EACH carrier (FOB sends 8)
+const uint8_t  RF_START_BURSTS = 3;         // [carrier + train + 8x data] repeats (~8 s, like a held button)
 const uint16_t RF_GUARD_MS = 39;            // silence between repeats
 
 // ----- Low-voltage auto-start (OPT-IN -- ships DISABLED) -----
@@ -721,7 +732,9 @@ void evalAutoStart(float v) {
   if (autoStartCooldownLeft() > 0) return;              // too soon after the last one
 
   // ---- every guard passed: fire the starter ----
-  bool sent = radio.transmitButton(COMPUSTAR_START, RF_REPEATS, RF_GUARD_MS);
+  bool sent = radio.transmitButtonWakeup(COMPUSTAR_START, RF_WAKEUP_MS,
+                                         RF_TRAIN_CELLS, RF_START_DATAREPS,
+                                         RF_START_BURSTS, RF_GUARD_MS);
   int idx = recordStart(v, 0, sent);
   g_lastStartMs = now;
   g_lastStartTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
@@ -1290,15 +1303,21 @@ void handleTransmit() {
   if (!rfReady)                      { fail(503, "CC1101 not detected"); return; }
   if (!COMPUSTAR_PATTERNS_CAPTURED)  { fail(409, "patterns not captured - TX blocked"); return; }
 
-  bool sent = radio.transmitButton(pattern, RF_REPEATS, RF_GUARD_MS);
-  // Log every engine-start attempt (manual ones too) so the dashboard history
-  // answers "when was this car started, and by what".
-  if (btn == "START") beginVerify(recordStart(g_lastV, 1, sent), false);
+  // START needs the wake-up carrier (duty-cycled receiver); lock/unlock/trunk
+  // are short taps the receiver catches without it.
+  bool sent;
+  if (btn == "START") {
+    sent = radio.transmitButtonWakeup(pattern, RF_WAKEUP_MS, RF_TRAIN_CELLS,
+                                      RF_START_DATAREPS, RF_START_BURSTS, RF_GUARD_MS);
+    beginVerify(recordStart(g_lastV, 1, sent), false);   // log the attempt
+  } else {
+    sent = radio.transmitButton(pattern, RF_REPEATS, RF_GUARD_MS);
+  }
   if (!sent) { fail(500, "bad pattern or TX failed"); return; }
 
   char j[128];
-  snprintf(j, sizeof(j), "{\"ok\":true,\"button\":\"%s\",\"repeats\":%d}",
-           btn.c_str(), RF_REPEATS);
+  snprintf(j, sizeof(j), "{\"ok\":true,\"button\":\"%s\",\"bursts\":%d}",
+           btn.c_str(), (btn == "START") ? RF_START_BURSTS : RF_REPEATS);
   g_out_total += strlen(j);
   server.send(200, "application/json", j);
   Serial.printf("RF TX: %s x%d\n", btn.c_str(), RF_REPEATS);

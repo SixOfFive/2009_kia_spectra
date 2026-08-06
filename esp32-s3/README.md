@@ -12,15 +12,16 @@ and the divergence rationale.
 
 ## What it does
 
-`voltage_monitor/voltage_monitor.ino` (fw 2.5):
+`voltage_monitor/voltage_monitor.ino` (fw 2.6):
 
 1. **Battery voltage** — reads a 1 MΩ / 220 kΩ divider on **GPIO1**
    (ADC1_CH0), scaled ×5.545, 64× averaged. 24 h history (1440 samples
    @ 60 s, each timestamped) in PSRAM, snapshotted to LittleFS so it
    survives reboots.
 2. **Web dashboard** served by the S3 itself — voltage + chip-temp
-   gauges, seven 24 h charts with **per-point hover tooltips** (value +
-   when), stat tiles, OTA at `/update`. WiFi STA with an AP fallback.
+   gauges, nine 24 h charts (incl. both CPU cores) with **per-point hover
+   tooltips** (value + when), stat tiles, OTA at `/update`. WiFi STA with
+   an AP fallback.
    **NTP time sync** (`time.windows.com`, re-synced every 6 h) drives a
    live footer clock and the timestamps on the history/tooltips.
 3. **CC1101 433 MHz Compustar transmitter** — replays the captured
@@ -132,8 +133,8 @@ one of these must hold before a packet goes out:
 | Voltage **strictly below** the threshold, continuously for the hold time | Rejects the 1–3 s dip while the engine is actually cranking |
 | ≥ 15 min continuously below 13.2 V | Proves the alternator is off, i.e. the car is parked — it won't fire while you're driving |
 | Cooldown elapsed (default 2 h) | Anti-loop; persists across reboot via wall-clock |
-| Battery recovered ≥ 12.55 V for 10 min since the last start | Hysteresis — without it a battery sitting just above the trigger re-fires forever |
-| Fewer than 3 auto-starts in 24 h | Hard runaway cap |
+| Battery recovered to (threshold + 0.15 V) for 10 min since the last start | Hysteresis — without it a battery sitting just above the trigger re-fires forever. Relative to the threshold, and it times out after 2 cooldowns, so it can delay a start but never block one permanently |
+| Under the 24 h cap, **if** one is set | **Off by default** (`0` or `−1` = unlimited) — see below |
 | Not locked out | Two consecutive starts that draw no charge latch it off |
 
 After any start (manual or automatic) the firmware watches for the alternator
@@ -147,6 +148,16 @@ toward that lockout, so bench testing can't disable the automatic system.
 double the cranking torque near −20 °C while the battery delivers about half its
 power, and a battery down at 12.2 V has electrolyte that slushes around −26 °C.
 In a mild climate 12.2 V is fine — it's one field on the page.
+
+**No 24 h cap by default.** This car has a known parasitic drain that has
+already destroyed two batteries by deep-discharge sulfation. Capping the number
+of starts would mean *choosing* to let the battery sit flat once the cap is hit
+— which is the exact failure the project exists to prevent, and the thing that
+kills lead-acid. The runaway protection that matters is the **lockout**: if two
+starts in a row draw no charge, the engine isn't catching and further cranking
+achieves nothing, so it latches off. That distinguishes "the battery legitimately
+needs frequent help" from "something is broken"; a fixed count can't. Set a cap
+only if you specifically want a ceiling.
 
 > **⚠ Never leave auto-start armed with the car parked in an attached garage or
 > any enclosed space.** It will start the engine unattended, and exhaust in an

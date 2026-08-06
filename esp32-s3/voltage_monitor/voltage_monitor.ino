@@ -57,7 +57,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "2.5";             // 2.5 = low-voltage auto-start (opt-in), start log, CPU load
+const char* FW_VERSION = "2.6";             // 2.6 = 24h cap optional (0/-1 = unlimited) + CPU load graphs
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -137,11 +137,23 @@ const float    AS_V_FLOOR       = 8.0f;     // below this the divider isn't on a
 const float    AS_V_CEIL        = 16.0f;    // above this the reading isn't a plausible battery
 const float    AS_ALT_V         = 13.2f;    // above this the alternator is running
 const uint32_t AS_PARK_S        = 900;      // must sit below AS_ALT_V this long before arming
-const float    AS_REARM_V       = 12.55f;   // after a start, must recover above this...
-const uint32_t AS_REARM_S       = 600;      // ...for this long, before it may fire again
+// Re-arm hysteresis: after a start the battery must climb back above the
+// trigger by this margin and hold, so a battery sitting right at the trigger
+// doesn't re-fire every cooldown. Deliberately RELATIVE to the threshold, not a
+// fixed 12.55 V — on a tired battery that can only recover to, say, 12.5 V a
+// fixed bar would never be met and auto-start would silently stop working.
+// AS_REARM_MAX_COOLDOWNS is the escape hatch for the same reason: hysteresis
+// may delay a start, it must never be able to block one permanently.
+const float    AS_REARM_MARGIN  = 0.15f;    // must recover to (threshold + this)...
+const uint32_t AS_REARM_S       = 600;      // ...and hold it this long
+const uint8_t  AS_REARM_MAX_COOLDOWNS = 2;  // after this many cooldowns, re-arm anyway
 const uint32_t AS_VERIFY_S      = 180;      // after firing, expect charging within this
 const uint8_t  AS_MAX_FAILS     = 2;        // consecutive unverified starts -> lockout
-const uint8_t  AS_MAX_24H       = 3;        // hard cap on auto-starts per 24 h
+// Optional cap on auto-starts per rolling 24 h. 0 (or any value <= 0) means
+// UNLIMITED, which is the default: if the battery genuinely needs starting six
+// times in a cold night, refusing on the seventh is its own kind of failure.
+// The lockout-on-no-charge guard is what stops a runaway, not this.
+const int      AS_DEF_MAX24     = 0;        // 0 / -1 = unlimited
 const uint32_t AS_BOOT_GRACE_MS = 120000;   // no auto-start in the first 2 min after boot
 const float    AS_V_MIN_CFG     = 10.0f;    // accepted config range for the threshold
 const float    AS_V_MAX_CFG     = 13.0f;
@@ -157,6 +169,8 @@ struct Sample {
   uint32_t net_in;      // bytes received this interval (approx, HTTP)
   uint32_t net_out;     // bytes sent this interval
   int16_t  rssi;        // WiFi RSSI dBm (0 in AP mode)
+  uint8_t  cpu0;        // core 0 load %, averaged across the interval
+  uint8_t  cpu1;        // core 1 load %, averaged across the interval
 };
 
 // ----- time sync state -----
@@ -211,7 +225,8 @@ uint32_t  g_verifyMs    = 0;               // millis() when verification started
 int       g_pendingIdx  = -1;              // index of the start event awaiting verification
 bool      g_verifyAuto  = false;           // was the pending start automatic? (only those can lock out)
 uint32_t  g_win24Ms     = 0;               // millis() at the start of the rolling 24 h window
-uint8_t   g_fires24     = 0;               // auto-starts fired in that window
+uint8_t   g_fires24     = 0;               // auto-starts fired in that window (informational)
+int       g_as_max24    = AS_DEF_MAX24;    // cap per 24 h; <= 0 = unlimited  NVS "as_max24"
 
 // One logged engine-start event. Written through to flash immediately so a
 // start is never lost to the brownout that a cranking engine can cause.
@@ -278,7 +293,11 @@ const char* compustarPattern(const String& btn) {
 // Deliberately NOT the "spin a low-priority counter task" trick: that keeps a
 // runnable task on the CPU forever, which defeats FreeRTOS tick-idling and would
 // quietly raise the parked-car current draw.
-float g_cpu0 = 0.0f, g_cpu1 = 0.0f;   // percent, 0..100
+float g_cpu0 = 0.0f, g_cpu1 = 0.0f;   // percent, 0..100 (latest 2 s window)
+// Accumulated across the history interval so the graph plots the average load
+// over the whole minute, not whichever 2 s window happened to land on it.
+float    g_cpuAcc0 = 0.0f, g_cpuAcc1 = 0.0f;
+uint16_t g_cpuN    = 0;
 
 void sampleCpuLoad() {
   static uint32_t pIdle0 = 0, pIdle1 = 0, pTotal = 0;
@@ -303,6 +322,7 @@ void sampleCpuLoad() {
     float l1 = 100.0f - (100.0f * (float)d1 / (float)dT);
     g_cpu0 = l0 < 0 ? 0 : (l0 > 100 ? 100 : l0);
     g_cpu1 = l1 < 0 ? 0 : (l1 > 100 ? 100 : l1);
+    g_cpuAcc0 += g_cpu0; g_cpuAcc1 += g_cpu1; g_cpuN++;
   }
   pIdle0 = idle0; pIdle1 = idle1; pTotal = total;
 }
@@ -384,6 +404,9 @@ void recordSample() {
   s.net_in  = g_in_total  - lastInSnap;   lastInSnap  = g_in_total;
   s.net_out = g_out_total - lastOutSnap;  lastOutSnap = g_out_total;
   s.rssi    = apMode ? 0 : (int16_t)WiFi.RSSI();
+  s.cpu0    = g_cpuN ? (uint8_t)(g_cpuAcc0 / g_cpuN + 0.5f) : (uint8_t)(g_cpu0 + 0.5f);
+  s.cpu1    = g_cpuN ? (uint8_t)(g_cpuAcc1 / g_cpuN + 0.5f) : (uint8_t)(g_cpu1 + 0.5f);
+  g_cpuAcc0 = 0; g_cpuAcc1 = 0; g_cpuN = 0;      // start a fresh interval average
   hist[histHead] = s;
   histHead = (histHead + 1) % HIST_N;
   if (histCount < HIST_N) histCount++;
@@ -393,7 +416,7 @@ void saveHistory() {
   if (!hist) return;
   File f = LittleFS.open("/history.bin", FILE_WRITE);
   if (!f) return;
-  uint32_t magic = 0x564F4C33;                 // "VOL3" (added per-sample ts)
+  uint32_t magic = 0x564F4C34;                 // "VOL4" (per-sample ts + CPU load)
   f.write((uint8_t*)&magic, 4);
   f.write((uint8_t*)&histCount, 4);
   f.write((uint8_t*)&histHead, 4);
@@ -407,7 +430,7 @@ void loadHistory() {
   if (!f) return;
   uint32_t magic = 0;
   f.read((uint8_t*)&magic, 4);
-  if (magic == 0x564F4C33) {           // older formats (no ts) are discarded
+  if (magic == 0x564F4C34) {           // older formats (no CPU columns) are discarded
     f.read((uint8_t*)&histCount, 4);
     f.read((uint8_t*)&histHead, 4);
     f.read((uint8_t*)hist, sizeof(Sample) * HIST_N);
@@ -504,7 +527,7 @@ const char* autoStartState() {
   if (g_lastV < AS_V_FLOOR || g_lastV > AS_V_CEIL)               return "no-battery";
   if (g_verifying)                                               return "verifying";
   if (g_needRearm)                                               return "recovering";
-  if (g_fires24 >= AS_MAX_24H)                                   return "daily-cap";
+  if (g_as_max24 > 0 && g_fires24 >= g_as_max24)                 return "daily-cap";
   if (autoStartCooldownLeft() > 0)                               return "cooldown";
   if (g_parkS < AS_PARK_S)                                       return "park-wait";
   if (g_lowSince != 0)                                           return "counting";
@@ -533,11 +556,19 @@ void evalAutoStart(float v) {
 
   // Re-arm hysteresis. Without this, a battery that recovers to just above the
   // trigger re-fires every cooldown, forever, until the tank is empty.
-  if (valid && v >= AS_REARM_V) { if (g_rearmS < 1000000UL) g_rearmS += dt; }
-  else                            g_rearmS = 0;
+  if (valid && v >= (g_as_volts + AS_REARM_MARGIN)) { if (g_rearmS < 1000000UL) g_rearmS += dt; }
+  else                                                g_rearmS = 0;
   if (g_needRearm && g_rearmS >= AS_REARM_S) {
     g_needRearm = false;
     Serial.println("auto-start: re-armed (battery recovered and held)");
+  }
+  // Escape hatch — a battery too tired to reach the re-arm bar must not wedge
+  // auto-start off forever. This car has a known parasitic drain; being unable
+  // to fire is the worse failure. Cooldown still spaces the starts out.
+  if (g_needRearm && g_lastStartMs != 0 &&
+      (now - g_lastStartMs) / 1000 >= (uint32_t)AS_REARM_MAX_COOLDOWNS * g_as_cool) {
+    g_needRearm = false;
+    Serial.println("auto-start: re-armed by timeout (battery never reached the re-arm bar)");
   }
 
   // --- did the last start actually work? the alternator coming up is the proof ---
@@ -578,7 +609,7 @@ void evalAutoStart(float v) {
   if (g_verifying)                                             { g_lowSince = 0; return; }
   if (g_needRearm)                                             { g_lowSince = 0; return; }
   if (g_parkS < AS_PARK_S)                                     { g_lowSince = 0; return; }
-  if (g_fires24 >= AS_MAX_24H)                                 { g_lowSince = 0; return; }
+  if (g_as_max24 > 0 && g_fires24 >= g_as_max24)               { g_lowSince = 0; return; }
   if (!(v < g_as_volts))                                       { g_lowSince = 0; return; }
 
   if (g_lowSince == 0) {                        // first low reading — start the clock
@@ -600,8 +631,9 @@ void evalAutoStart(float v) {
   g_needRearm  = true;   g_rearmS = 0;
   if (g_fires24 < 255) g_fires24++;
   beginVerify(idx, true);
-  Serial.printf("*** AUTO-START FIRED at %.2f V (tx %s) — cooldown %lu s, fire %u/%u today ***\n",
-                v, sent ? "ok" : "FAILED", (unsigned long)g_as_cool, g_fires24, AS_MAX_24H);
+  Serial.printf("*** AUTO-START FIRED at %.2f V (tx %s) — cooldown %lu s, fire %u today (cap %s) ***\n",
+                v, sent ? "ok" : "FAILED", (unsigned long)g_as_cool, g_fires24,
+                g_as_max24 > 0 ? String(g_as_max24).c_str() : "none");
 }
 
 const char DASH_HTML[] PROGMEM = R"HTML(
@@ -663,6 +695,8 @@ table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 <div class="clbl">Network in B/min (24 h)</div><canvas id="c4" width="800" height="104"></canvas>
 <div class="clbl">Network out B/min (24 h)</div><canvas id="c5" width="800" height="104"></canvas>
 <div class="clbl">WiFi RSSI dBm (24 h)</div><canvas id="c6" width="800" height="104"></canvas>
+<div class="clbl">CPU core 0 load % (24 h)</div><canvas id="c7" width="800" height="104"></canvas>
+<div class="clbl">CPU core 1 load % (24 h)</div><canvas id="c8" width="800" height="104"></canvas>
 <div class="grid">
 <div class="card"><div class="k">ADC node</div><div class="v"><span id="adc">--</span> mV</div></div>
 <div class="card"><div class="k">WiFi RSSI</div><div class="v"><span id="rssi">--</span> dBm</div></div>
@@ -707,6 +741,7 @@ table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 <div><div class="k" style="margin-bottom:4px">Start below</div><input id="asv" class="inp" type="number" step="0.1" min="10" max="13"> <span class="k">V</span></div>
 <div><div class="k" style="margin-bottom:4px">Held for</div><input id="ash" class="inp" type="number" step="5" min="10" max="3600"> <span class="k">sec</span></div>
 <div><div class="k" style="margin-bottom:4px">Cooldown</div><input id="asc" class="inp" type="number" step="300" min="300" max="86400"> <span class="k">sec</span></div>
+<div><div class="k" style="margin-bottom:4px">Max per 24 h</div><input id="asm" class="inp" type="number" step="1" min="-1" max="255"> <span class="k">0 = &infin;</span></div>
 <button class="tx" id="assave">Save</button>
 </div>
 <div class="k" style="margin-top:12px;line-height:1.7;text-transform:none;letter-spacing:0">
@@ -717,8 +752,10 @@ roughly double the torque while the battery delivers about half its power, and a
 Below about <b>11.8 V</b> it likely won't crank at all.<br>
 The hold time ignores the brief dip while the engine is <i>actually cranking</i> (down to ~9&ndash;10 V for a
 second or two). <b>60 s</b> is far longer than any crank or momentary load.<br>
-It also won't fire while you're driving, won't re-fire until the battery recovers and holds,
-stops after <b>3</b> starts in 24&nbsp;h, and locks itself out if <b>2</b> starts in a row draw no charge.
+It also won't fire while you're driving and won't re-fire until the battery recovers and holds.
+<b>Max per 24 h</b> is off by default (<b>0</b> or <b>&minus;1</b> = unlimited) &mdash; set a number only if you
+want a hard ceiling. The real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge,
+the engine clearly isn't catching and it latches off until you clear it.
 </div>
 <div class="k" id="asmsg" style="margin-top:8px">&nbsp;</div>
 </div>
@@ -734,15 +771,15 @@ stops after <b>3</b> starts in 24&nbsp;h, and locks itself out if <b>2</b> start
 <script>
 function $(i){return document.getElementById(i)}
 function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
-// 7 graphs, in canvas order c0..c6, mapped to /history data columns 1..7.
-var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657"];
-var DEC=[2,1,0,0,0,0,0];
-var UNITS=["V","°C","KB","KB","B/min","B/min","dBm"];
+// 9 graphs, in canvas order c0..c8, mapped to /history data columns 1..9.
+var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657","#7ee787","#e3b341"];
+var DEC=[2,1,0,0,0,0,0,0,0];
+var UNITS=["V","°C","KB","KB","B/min","B/min","dBm","%","%"];
 var PAD=8;
 var CHARTS={};      // id -> {data, lo, hi, color, dec, unit}
 var TS=[];          // per-sample epoch seconds (0 if NTP not synced), parallel to data
 var hoverIdx=-1;
-var IDS=["c0","c1","c2","c3","c4","c5","c6"];
+var IDS=["c0","c1","c2","c3","c4","c5","c6","c7","c8"];
 function fmtWhen(i){
   var t=TS[i];
   if(t&&t>1700000000){return new Date(t*1000).toLocaleString();}   // absolute (browser-local)
@@ -784,9 +821,10 @@ function loadHistory(){fetch("/history",{cache:"no-store"}).then(function(r){ret
 var ln=t.trim().split("\n"),rows=[];for(var i=1;i<ln.length;i++){rows.push(ln[i].split(",").map(Number))}
 if(!rows.length)return;
 TS=rows.map(function(r){return r[0]});
-for(var col=0;col<7;col++){(function(col){
-  var data=rows.map(function(r){return r[col+1]});           // data cols 1..7
+for(var col=0;col<9;col++){(function(col){
+  var data=rows.map(function(r){return r[col+1]});           // data cols 1..9
   var lo=Math.min.apply(null,data),hi=Math.max.apply(null,data);if(hi-lo<1e-6){hi+=1;lo-=1}
+  if(col>=7){lo=0;hi=Math.max(10,hi)}                        // CPU %: always anchor at 0
   CHARTS["c"+col]={data:data,lo:lo,hi:hi,color:COLS[col],dec:DEC[col],unit:UNITS[col]};
 })(col)}
 drawAll();
@@ -819,7 +857,7 @@ warmup:"warming up after boot — holding off",
 "no-battery":"sensor is not across a battery ("+d.vbatt.toFixed(2)+" V) — will not fire",
 verifying:"just started — watching for the alternator to come up",
 recovering:"waiting for the battery to recover and hold before it may fire again",
-"daily-cap":"daily cap reached ("+d.as_f24+" auto-starts in 24 h) — holding off",
+"daily-cap":"24 h cap reached ("+d.as_f24+" of "+d.as_max24+") — holding off",
 "park-wait":"confirming the car is parked ("+d.as_park_s+"s of "+d.as_park_need+"s below 13.2 V)",
 watching:"armed · watching — voltage is above "+(d.as_volts||0).toFixed(1)+" V"};
 var s=ST[d.as_state]||d.as_state;
@@ -832,6 +870,7 @@ var af=document.activeElement?document.activeElement.id:"";
 if(af!="asv")$("asv").value=(d.as_volts||0).toFixed(1);
 if(af!="ash")$("ash").value=d.as_hold;
 if(af!="asc")$("asc").value=d.as_cool;
+if(af!="asm")$("asm").value=d.as_max24;
 $("dot").style.background="#3fb950";$("stxt").textContent="live";
 }).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnecting…"})}
 document.querySelectorAll("button.tx[data-b]").forEach(function(btn){btn.addEventListener("click",function(){
@@ -869,7 +908,7 @@ fetch("/autostart?en="+nx,{method:"POST"}).then(function(r){return r.json()}).th
 $("asmsg").textContent="auto-start "+(d.as_en?"ARMED":"disabled");poll();
 }).catch(function(e){$("asmsg").textContent="request error"})});
 $("assave").addEventListener("click",function(){
-var q="volts="+$("asv").value+"&hold="+$("ash").value+"&cool="+$("asc").value;
+var q="volts="+$("asv").value+"&hold="+$("ash").value+"&cool="+$("asc").value+"&max24="+$("asm").value;
 $("asmsg").textContent="saving…";
 fetch("/autostart?"+q,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
 $("asmsg").textContent=d.ok?("saved — start below "+d.as_volts.toFixed(1)+" V held "+d.as_hold+" s"):("save failed: "+(d.detail||"error"));poll();
@@ -910,7 +949,7 @@ void handleJson() {
     "\"as_en\":%s,\"as_volts\":%.2f,\"as_hold\":%lu,\"as_cool\":%lu,"
     "\"as_state\":\"%s\",\"as_low_s\":%lu,\"as_cool_s\":%lu,\"as_n\":%d,"
     "\"as_lock\":%s,\"as_fails\":%u,\"as_park_s\":%lu,\"as_park_need\":%lu,\"as_f24\":%u,"
-    "\"cpu0\":%.1f,\"cpu1\":%.1f}",
+    "\"as_max24\":%d,\"cpu0\":%.1f,\"cpu1\":%.1f}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
@@ -925,7 +964,7 @@ void handleJson() {
     (unsigned long)autoStartCooldownLeft(), g_startCount,
     g_asLock ? "true" : "false", g_asFails,
     (unsigned long)g_parkS, (unsigned long)AS_PARK_S, g_fires24,
-    g_cpu0, g_cpu1);
+    g_as_max24, g_cpu0, g_cpu1);
   g_out_total += strlen(json);
   server.send(200, "application/json", json);
 }
@@ -935,7 +974,7 @@ void handleHistory() {
   trackReq();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  const char* hdr = "ts,vbatt,temp,heap_kb,disk_kb,net_in,net_out,rssi\n";
+  const char* hdr = "ts,vbatt,temp,heap_kb,disk_kb,net_in,net_out,rssi,cpu0,cpu1\n";
   g_out_total += strlen(hdr);
   server.sendContent(hdr);
   if (hist) {
@@ -950,7 +989,9 @@ void handleHistory() {
       chunk += s.disk_kb; chunk += ',';
       chunk += s.net_in;  chunk += ',';
       chunk += s.net_out; chunk += ',';
-      chunk += s.rssi;    chunk += '\n';
+      chunk += s.rssi;    chunk += ',';
+      chunk += s.cpu0;    chunk += ',';
+      chunk += s.cpu1;    chunk += '\n';
       if (chunk.length() > 1500) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; }
     }
     if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
@@ -1086,6 +1127,12 @@ void handleAutoStart() {
     if (c < 300 || c > 86400) { fail("cool must be 300-86400 s"); return; }
     g_as_cool = (uint32_t)c;  prefs.putUInt("as_cool", g_as_cool);
   }
+  if (server.hasArg("max24")) {
+    long m = server.arg("max24").toInt();
+    if (m > 255) { fail("max24 must be <= 255 (0 or -1 = unlimited)"); return; }
+    g_as_max24 = (m <= 0) ? 0 : (int)m;      // 0 and -1 both mean unlimited
+    prefs.putInt("as_max24", g_as_max24);
+  }
   if (server.hasArg("en")) {
     g_as_en = server.arg("en").toInt() != 0;
     prefs.putBool("as_en", g_as_en);
@@ -1102,10 +1149,10 @@ void handleAutoStart() {
   char j[320];
   snprintf(j, sizeof(j),
     "{\"ok\":true,\"as_en\":%s,\"as_volts\":%.2f,\"as_hold\":%lu,\"as_cool\":%lu,"
-    "\"as_state\":\"%s\",\"as_lock\":%s}",
+    "\"as_state\":\"%s\",\"as_lock\":%s,\"as_max24\":%d}",
     g_as_en ? "true" : "false", g_as_volts,
     (unsigned long)g_as_hold, (unsigned long)g_as_cool, autoStartState(),
-    g_asLock ? "true" : "false");
+    g_asLock ? "true" : "false", g_as_max24);
   g_out_total += strlen(j);
   server.send(200, "application/json", j);
   Serial.printf("auto-start config: %s, <= %.2f V for %lu s, cooldown %lu s\n",
@@ -1208,6 +1255,8 @@ void setup() {
   g_lastStartTs = prefs.getUInt("as_last", 0);
   g_asLock      = prefs.getBool("as_lock", false);
   g_asFails     = prefs.getUChar("as_fails", 0);
+  g_as_max24    = prefs.getInt("as_max24", AS_DEF_MAX24);
+  if (g_as_max24 < 0 || g_as_max24 > 255) g_as_max24 = 0;     // <=0 / bad -> unlimited
   // A corrupt stored value must fall back to the safe default, never widen the
   // trigger window.
   if (g_as_volts < AS_V_MIN_CFG || g_as_volts > AS_V_MAX_CFG) g_as_volts = AS_DEF_VOLTS;

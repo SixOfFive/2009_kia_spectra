@@ -62,6 +62,7 @@ keeloq_device_key.txt
 
 # Arduino / arduino-cli build output (regenerable, large)
 esp32-s3/**/build/
+esp32-s3/**/build-out/
 **/*.ino.bin
 **/*.ino.elf
 **/*.ino.map

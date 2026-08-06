@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.0";             // 3.0 = AP fallback retries the home WiFi instead of latching
+const char* FW_VERSION = "4.1";             // 4.1 = FOB-matched packet gap (~1ms) + 0.5s trailing carrier
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -125,8 +125,15 @@ const uint8_t  RF_REPEATS  = 8;             // packet repeats per press (FOB sen
 const uint16_t RF_WAKEUP_MS    = 1450;      // continuous wake-up carrier per burst (FOB ~1436 ms)
 const uint8_t  RF_TRAIN_CELLS  = 6;         // ~750 us equal on/off training cells after the carrier (FOB ~5-6)
 const uint8_t  RF_START_DATAREPS = 8;       // sync+data repeats after EACH carrier (FOB sends 8)
-const uint8_t  RF_START_BURSTS = 3;         // [carrier + train + 8x data] repeats (~8 s, like a held button)
-const uint16_t RF_GUARD_MS = 39;            // silence between repeats
+const uint8_t  RF_START_BURSTS = 3;         // [carrier + train + 8x data + tail] repeats (~7 s, like a held button)
+const uint16_t RF_GUARD_MS = 39;            // silence between bursts
+// fw 4.1: SDR timeline of the FOB (sdr/captures/fob-60s-2026-08-06.bin) showed
+// the 8 data packets are spaced only ~1.1 ms apart -- back-to-back inside the
+// window the carrier just woke -- and a ~0.5 s carrier trails the data. Our 4.0
+// spaced packets 39 ms apart and sent no tail, so the receiver likely dropped
+// bit-clock lock between packets. Match the FOB exactly.
+const uint16_t RF_START_PKT_GAP_MS = 1;     // gap between the 8 data packets (FOB ~1.1 ms)
+const uint16_t RF_TAIL_CARRIER_MS  = 525;   // trailing carrier after the data (FOB ~525 ms)
 
 // ----- Low-voltage auto-start (OPT-IN -- ships DISABLED) -----
 // When ARMED, the firmware fires the Compustar START code by itself once
@@ -734,7 +741,8 @@ void evalAutoStart(float v) {
   // ---- every guard passed: fire the starter ----
   bool sent = radio.transmitButtonWakeup(COMPUSTAR_START, RF_WAKEUP_MS,
                                          RF_TRAIN_CELLS, RF_START_DATAREPS,
-                                         RF_START_BURSTS, RF_GUARD_MS);
+                                         RF_START_BURSTS, RF_GUARD_MS,
+                                         RF_START_PKT_GAP_MS, RF_TAIL_CARRIER_MS);
   int idx = recordStart(v, 0, sent);
   g_lastStartMs = now;
   g_lastStartTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
@@ -1308,7 +1316,8 @@ void handleTransmit() {
   bool sent;
   if (btn == "START") {
     sent = radio.transmitButtonWakeup(pattern, RF_WAKEUP_MS, RF_TRAIN_CELLS,
-                                      RF_START_DATAREPS, RF_START_BURSTS, RF_GUARD_MS);
+                                      RF_START_DATAREPS, RF_START_BURSTS, RF_GUARD_MS,
+                                      RF_START_PKT_GAP_MS, RF_TAIL_CARRIER_MS);
     beginVerify(recordStart(g_lastV, 1, sent), false);   // log the attempt
   } else {
     sent = radio.transmitButton(pattern, RF_REPEATS, RF_GUARD_MS);

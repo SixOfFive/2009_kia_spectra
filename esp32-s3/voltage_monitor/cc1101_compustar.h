@@ -129,14 +129,19 @@ public:
   // ~1.4 s CONTINUOUS CARRIER to wake the receiver's duty-cycled listener, then
   // a short training run, then the sync+data. Plain transmitButton() (used for
   // lock/unlock) skips the wake-up, so a duty-cycled receiver sleeps through it.
-  // Structure per burst: [wake-up carrier][training][sync+data x dataReps].
-  // The FOB sends the data ~8 times after each carrier so the just-woken
-  // receiver reliably catches it -- sending it once (dataReps=1) lets the
-  // single packet slip past before the receiver locks on. `bursts` repeats
-  // the whole [carrier..data] unit.
+  // Structure per burst, matched to an SDR timeline of the genuine FOB:
+  //   [wake-up carrier ~1.44 s][training][sync+data x dataReps][trailing carrier].
+  // The FOB packs its ~8 data repeats only ~1.1 ms apart (pktGapMs) inside the
+  // window it just woke with the carrier -- spacing them far apart (the old
+  // 39 ms) lets the receiver drop bit-clock lock or re-sleep between packets.
+  // It then holds a ~0.5 s trailing carrier (tailCarrierMs) after the data.
+  // Sending the data once (dataReps=1) lets the single packet slip past before
+  // the receiver locks on. `bursts` repeats the whole unit, `guardMs` spaces
+  // the bursts.
   bool transmitButtonWakeup(const char* pattern, uint16_t wakeupMs,
                             uint8_t trainCells, uint8_t dataReps,
-                            uint8_t bursts, uint16_t guardMs);
+                            uint8_t bursts, uint16_t guardMs,
+                            uint16_t pktGapMs = 1, uint16_t tailCarrierMs = 525);
 
 public:
   // Measure the module's crystal frequency in Hz, with no SDR: the CC1101

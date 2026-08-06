@@ -416,7 +416,8 @@ bool CC1101Compustar::transmitButton(const char* pattern, uint8_t repeats,
 
 bool CC1101Compustar::transmitButtonWakeup(const char* pattern, uint16_t wakeupMs,
                                            uint8_t trainCells, uint8_t dataReps,
-                                           uint8_t bursts, uint16_t guardMs) {
+                                           uint8_t bursts, uint16_t guardMs,
+                                           uint16_t pktGapMs, uint16_t tailCarrierMs) {
   if (!_ready || !pattern) return false;
   size_t len = strlen(pattern);
   if (len != CMP_PACKET_BITS) return false;
@@ -451,10 +452,18 @@ bool CC1101Compustar::transmitButtonWakeup(const char* pattern, uint16_t wakeupM
     }
     digitalWrite(_gdo0, LOW);
     // (3) The sync + data packet, repeated dataReps times so the just-woken
-    //     receiver reliably catches it (the FOB sends ~8).
+    //     receiver reliably catches it. The FOB packs its ~8 repeats only
+    //     ~1.1 ms apart (pktGapMs) -- back-to-back inside the awake window --
+    //     not the 39 ms burst gap, which would let the receiver drop lock.
     for (uint8_t d = 0; d < dataReps; d++) {
       transmitPulses(pulses, k);
-      if (d < dataReps - 1) delay(guardMs);
+      if (d < dataReps - 1 && pktGapMs) delay(pktGapMs);
+    }
+    // (4) Trailing carrier: the FOB holds the carrier ~0.5 s after the data.
+    if (tailCarrierMs) {
+      digitalWrite(_gdo0, HIGH);
+      delay(tailCarrierMs);
+      digitalWrite(_gdo0, LOW);
     }
     if (b < bursts - 1) delay(guardMs);
   }

@@ -120,4 +120,7 @@ class CC1101Compustar {
 
   // Drive GDO0 through one rendered pulse list once.
   void transmitPulses(const CompustarPulse* pulses, size_t n);
+  // Strobe into TX and poll MARCSTATE until the PA is really up (the
+  // IDLE->TX calibration takes ~721 us and radiates nothing). false = timeout.
+  bool enterTxAndWait(uint32_t timeoutUs);
 };

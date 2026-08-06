@@ -22,6 +22,7 @@ enum {
 // Command strobes
 enum {
   STR_SRES = 0x30, STR_STX = 0x35, STR_SIDLE = 0x36, STR_SFTX = 0x3B,
+  MARC_TX = 0x13,        // MARCSTATE value meaning the PA is actually keyed
 };
 
 // SPI header bits
@@ -238,9 +239,33 @@ bool CC1101Compustar::gdo0Continuity() {
   return sawHigh && sawLow;
 }
 
-void CC1101Compustar::transmitPulses(const CompustarPulse* pulses, size_t n) {
-  strobe(STR_SFTX);   // flush, then enter TX
+// Enter TX and wait until the PA is genuinely up.
+//
+// This wait is not optional. MCSM0 = 0x18 means FS_AUTOCAL = "calibrate on
+// every IDLE->TX", and that calibration takes ~721 us at 26 MHz during which
+// the chip radiates NOTHING. The old code strobed STX and started toggling
+// GDO0 immediately, so the ~1476 us leading sync pulse was half-swallowed --
+// and because each repeat dropped back to IDLE, all 8 repeats lost their
+// sync. The packet went out and the receiver never framed it: transmitter
+// healthy, self-test green, car silent. (The boot self-test even recorded the
+// symptom -- MARCSTATE read 0x08 = CALIBRATE right after STX, never 0x13 = TX.)
+bool CC1101Compustar::enterTxAndWait(uint32_t timeoutUs) {
+  strobe(STR_SIDLE);
+  strobe(STR_SFTX);
   strobe(STR_STX);
+  uint32_t t0 = micros();
+  while ((uint32_t)(micros() - t0) < timeoutUs) {
+    if ((readReg(REG_MARCSTATE) & 0x1F) == MARC_TX) return true;
+    delayMicroseconds(20);
+  }
+  return false;
+}
+
+void CC1101Compustar::transmitPulses(const CompustarPulse* pulses, size_t n) {
+  // Caller has already put the chip in TX and confirmed it settled; we only
+  // modulate here. Staying in TX across the whole burst is correct for OOK --
+  // PATABLE[0] is 0x00, so GDO0 LOW is genuinely zero output power, i.e. the
+  // inter-repeat guard is real silence without a re-calibration each time.
 
   // Bit-bang GDO0. Pulse widths are 700-1500 us; delayMicroseconds on the
   // S3 is cycle-accurate and the few-us of WiFi-ISR jitter is far inside
@@ -257,8 +282,7 @@ void CC1101Compustar::transmitPulses(const CompustarPulse* pulses, size_t n) {
       delayMicroseconds(pulses[i].low_us);
     }
   }
-  digitalWrite(_gdo0, LOW);
-  strobe(STR_SIDLE);
+  digitalWrite(_gdo0, LOW);   // leave the carrier off; caller strobes IDLE
 }
 
 bool CC1101Compustar::transmitButton(const char* pattern, uint8_t repeats,
@@ -292,9 +316,17 @@ bool CC1101Compustar::transmitButton(const char* pattern, uint8_t repeats,
     k++;
   }
 
+  // Key the PA ONCE for the whole burst and confirm it actually reached TX
+  // before the first edge, then hold TX across all repeats.
+  if (!enterTxAndWait(5000)) {
+    strobe(STR_SIDLE);
+    return false;                       // never got to TX -- report failure
+  }
   for (uint8_t r = 0; r < repeats; r++) {
     transmitPulses(pulses, k);
-    if (r < repeats - 1) delay(guardMs);
+    if (r < repeats - 1) delay(guardMs);  // GDO0 low = carrier off = real silence
   }
+  digitalWrite(_gdo0, LOW);
+  strobe(STR_SIDLE);
   return true;
 }

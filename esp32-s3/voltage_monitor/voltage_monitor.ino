@@ -1,4 +1,4 @@
-﻿// voltage_monitor.ino
+// voltage_monitor.ino
 // ESP32-S3-N16R8 voltage monitor with on-device history + live web dashboard.
 //
 //   * Reads a resistor divider on GPIO1, scales to the real source voltage.
@@ -34,7 +34,7 @@
 // secrets.h (gitignored) holds WiFi credentials + the per-FOB captured
 // Compustar patterns. The repo ships only secrets.h.example. Without a
 // real secrets.h the firmware still builds and runs (AP-only, RF disabled)
-// using the placeholders below â€” nothing secret is committed.
+// using the placeholders below -- nothing secret is committed.
 #if __has_include("secrets.h")
   #include "secrets.h"
 #else
@@ -64,7 +64,7 @@ const char* FW_VERSION = "2.9";             // 2.9 = battery drain rate (mV/h) +
 const char* NTP_SERVER1 = "time.windows.com";
 const char* NTP_SERVER2 = "pool.ntp.org";
 // POSIX TZ for Mountain Time (Edmonton/Alberta) incl. DST. Change this one
-// string if you're elsewhere â€” it only affects on-device localtime; the
+// string if you're elsewhere -- it only affects on-device localtime; the
 // dashboard formats per-sample timestamps in the browser's own timezone.
 const char* TZ_INFO = "MST7MDT,M3.2.0,M11.1.0";
 const uint32_t NTP_RESYNC_MS = 6UL * 3600UL * 1000UL;   // re-sync every 6 h (drift)
@@ -97,7 +97,7 @@ const int  TFT_CS = 10, TFT_DC = 9, TFT_RST = 14, TFT_BL = 21;
 const int  TS_CS = 8, TS_IRQ = 7;
 
 // CC1101 433.92 MHz OOK transmitter (Compustar 1WG3R replay).
-// 3.3V logic ONLY â€” the CC1101 is not 5V tolerant. Pins chosen to avoid
+// 3.3V logic ONLY -- the CC1101 is not 5V tolerant. Pins chosen to avoid
 // the ADC voltage pin (GPIO1), the strapping pins (0/3/45/46), the
 // flash/PSRAM pins (26-37), native USB (19/20), UART0 (43/44), the RGB
 // LED (48), and the display pins (7-14, 21). See cc1101_compustar.h.
@@ -111,7 +111,7 @@ const uint8_t  RF_TX_POWER = 0xC0;          // PATABLE[1]: 0xC0 ~ +10 dBm (max)
 const uint8_t  RF_REPEATS  = 8;             // packet repeats per press (FOB sends ~8)
 const uint16_t RF_GUARD_MS = 39;            // silence between repeats
 
-// ----- Low-voltage auto-start (OPT-IN â€” ships DISABLED) -----
+// ----- Low-voltage auto-start (OPT-IN -- ships DISABLED) -----
 // When ARMED, the firmware fires the Compustar START code by itself once
 // battery voltage has stayed at or below the threshold continuously for the
 // hold time. The point is to start the engine while the battery can still
@@ -127,10 +127,10 @@ const uint16_t RF_GUARD_MS = 39;            // silence between repeats
 //     while the battery can deliver only about half its rated power, so the
 //     "still cranks" line moves UP a couple tenths from the mild-weather value.
 //   * Electrolyte freezing. 12.2 V resting is about SG 1.19, which slushes up
-//     around -26 C â€” i.e. right at the local design low. 12.4 V is ~SG 1.23,
+//     around -26 C -- i.e. right at the local design low. 12.4 V is ~SG 1.23,
 //     good to about -37 C. Firing at 12.2 can mean firing at a battery that is
 //     already too cold-soaked to turn the engine.
-// In a mild climate 12.2 V is perfectly reasonable â€” it's one field on the page.
+// In a mild climate 12.2 V is perfectly reasonable -- it's one field on the page.
 const float    AS_DEF_VOLTS     = 12.4f;    // suggested trigger (V)
 const uint32_t AS_DEF_HOLD_S    = 60;       // must stay below threshold this long
 const uint32_t AS_DEF_COOL_S    = 7200;     // 2 h between auto-starts (anti-loop)
@@ -141,7 +141,7 @@ const uint32_t AS_PARK_S        = 900;      // must sit below AS_ALT_V this long
 // Re-arm hysteresis: after a start the battery must climb back above the
 // trigger by this margin and hold, so a battery sitting right at the trigger
 // doesn't re-fire every cooldown. Deliberately RELATIVE to the threshold, not a
-// fixed 12.55 V â€” on a tired battery that can only recover to, say, 12.5 V a
+// fixed 12.55 V -- on a tired battery that can only recover to, say, 12.5 V a
 // fixed bar would never be met and auto-start would silently stop working.
 // AS_REARM_MAX_COOLDOWNS is the escape hatch for the same reason: hysteresis
 // may delay a start, it must never be able to block one permanently.
@@ -161,7 +161,7 @@ const float    AS_V_MAX_CFG     = 13.0f;
 const int      START_N          = 64;       // start-event ring buffer length
 
 // ----- SNMP (read-only, for Cacti / LibreNMS / snmpwalk) -----
-// Enterprise subtree 1.3.6.1.4.1.99999.**8** â€” the Pi-side responder uses .7,
+// Enterprise subtree 1.3.6.1.4.1.99999.**8** -- the Pi-side responder uses .7,
 // so both can live on one network. Port 161 is fine here: no OS privilege
 // rules on bare metal. Community is read-only; there is no SET path at all.
 const bool     SNMP_ENABLED   = true;
@@ -184,7 +184,7 @@ struct Sample {
 
 // Battery-drain regression result. Declared up here with Sample because the
 // .ino auto-prototype pass emits `DrainFit computeDrain();` near the top of the
-// file — the type has to already exist by then or the build fails.
+// file -- the type has to already exist by then or the build fails.
 const int      DRAIN_MIN_N  = 30;      // need at least 30 min of samples
 const float    DRAIN_FLAT_V = 11.8f;   // projection target: below this it won't crank
 const uint32_t DRAIN_GAP_S  = 600;     // a >10 min hole ends the window (board was off)
@@ -221,7 +221,7 @@ int       g_last_mv = 0;
 
 // Persisted power/perf settings (NVS). Loaded in setup(), re-saved on each
 // toggle. NVS lives in a flash partition, so these survive reboot AND a
-// brownout â€” the chosen CPU clock and WiFi power-save state come back.
+// brownout -- the chosen CPU clock and WiFi power-save state come back.
 Preferences prefs;
 uint32_t  g_cpu_mhz = 240;       // restored at boot, then applied
 bool      g_wifi_ps = true;      // restored at boot, then applied (true = modem-sleep)
@@ -258,7 +258,7 @@ int       g_as_max24    = AS_DEF_MAX24;    // cap per 24 h; <= 0 = unlimited  NV
 // start is never lost to the brownout that a cranking engine can cause.
 struct StartEvent {
   uint32_t ts;        // unix epoch when fired (0 if NTP hadn't synced)
-  uint32_t up_s;      // uptime seconds at fire â€” orders events even with no clock
+  uint32_t up_s;      // uptime seconds at fire -- orders events even with no clock
   float    vbatt;     // battery voltage at the moment it fired
   uint8_t  src;       // 0 = auto (low voltage), 1 = manual (dashboard button)
   uint8_t  ok;        // 1 = the CC1101 reported the burst went out
@@ -433,12 +433,12 @@ DrainFit computeDrain() {
   if (!hist || histCount < DRAIN_MIN_N) return f;
   int oldest = (histCount < HIST_N) ? 0 : histHead;
 
-  // Pass 1 â€” find the most recent contiguous parked window (newest backwards).
+  // Pass 1 -- find the most recent contiguous parked window (newest backwards).
   // Two passes rather than buffering, to keep ~11 KB of arrays off the heap.
   int n = 0; uint32_t prevTs = 0, oldTs = 0, newTs = 0; bool useTs = true; float vNow = 0;
   for (int k = histCount - 1; k >= 0; k--) {
     Sample& s = hist[(oldest + k) % HIST_N];
-    if (s.vbatt >= AS_ALT_V) break;       // alternator was running â€” window ends
+    if (s.vbatt >= AS_ALT_V) break;       // alternator was running -- window ends
     if (s.vbatt < 1.0f)      break;       // implausible / no source
     uint32_t t = (s.ts > 1700000000UL) ? s.ts : 0;
     if (!t) useTs = false;
@@ -450,7 +450,7 @@ DrainFit computeDrain() {
   }
   if (n < DRAIN_MIN_N) return f;
 
-  // Pass 2 â€” accumulate the regression sums over exactly that window.
+  // Pass 2 -- accumulate the regression sums over exactly that window.
   double sx = 0, sy = 0, sxy = 0, sxx = 0, syy = 0;
   int i = 0;
   for (int k = histCount - 1; k >= 0 && i < n; k--, i++) {
@@ -574,12 +574,12 @@ int recordStart(float v, uint8_t src, bool ok) {
   g_starts[idx] = e;
   g_startHead = (g_startHead + 1) % START_N;
   if (g_startCount < START_N) g_startCount++;
-  saveStarts();                                 // write through â€” don't risk losing it
+  saveStarts();                                 // write through -- don't risk losing it
   return idx;
 }
 
 // Begin watching for the alternator to come up, which is the only real proof
-// the engine caught. Used for manual presses too â€” it answers "did that work?"
+// the engine caught. Used for manual presses too -- it answers "did that work?"
 // Only an AUTOMATIC start counts toward the lockout: a manual test press (on
 // the bench, or with the battery out) must never latch the automatic system off.
 void beginVerify(int idx, bool isAuto) {
@@ -592,7 +592,7 @@ void beginVerify(int idx, bool isAuto) {
 // ---------- low-voltage auto-start ----------
 
 // Seconds left in the post-start cooldown (0 = clear). Prefers wall-clock so
-// the cooldown SURVIVES A REBOOT â€” otherwise a brownout right after a start
+// the cooldown SURVIVES A REBOOT -- otherwise a brownout right after a start
 // would clear it and let the car re-fire immediately.
 uint32_t autoStartCooldownLeft() {
   if (timeIsValid() && g_lastStartTs > 0) {
@@ -631,7 +631,7 @@ void evalAutoStart(float v) {
   uint32_t dt = lastEvalMs ? (now - lastEvalMs) / 1000 : 0;   // seconds since last call
   lastEvalMs = now;
 
-  // A reading outside this band isn't a car battery at all â€” bench rig, an
+  // A reading outside this band isn't a car battery at all -- bench rig, an
   // unplugged sense wire, or a glitch. Treat it as "no information", never "low".
   bool valid = (v >= AS_V_FLOOR && v <= AS_V_CEIL);
 
@@ -650,7 +650,7 @@ void evalAutoStart(float v) {
     g_needRearm = false;
     Serial.println("auto-start: re-armed (battery recovered and held)");
   }
-  // Escape hatch â€” a battery too tired to reach the re-arm bar must not wedge
+  // Escape hatch -- a battery too tired to reach the re-arm bar must not wedge
   // auto-start off forever. This car has a known parasitic drain; being unable
   // to fire is the worse failure. Cooldown still spaces the starts out.
   if (g_needRearm && g_lastStartMs != 0 &&
@@ -669,13 +669,13 @@ void evalAutoStart(float v) {
     } else if (now - g_verifyMs >= AS_VERIFY_S * 1000UL) {
       if (g_pendingIdx >= 0) { g_starts[g_pendingIdx].ver = 2; saveStarts(); }
       g_verifying = false; g_pendingIdx = -1;
-      if (!g_verifyAuto) {                      // manual press â€” record it, but never latch
+      if (!g_verifyAuto) {                      // manual press -- record it, but never latch
         Serial.printf("manual start: no charging after %lu s (not counted toward lockout)\n",
                       (unsigned long)AS_VERIFY_S);
       } else {
         if (g_asFails < 255) g_asFails++;
         prefs.putUChar("as_fails", g_asFails);
-        Serial.printf("auto-start: no charging after %lu s â€” fail %u of %u\n",
+        Serial.printf("auto-start: no charging after %lu s -- fail %u of %u\n",
                       (unsigned long)AS_VERIFY_S, g_asFails, AS_MAX_FAILS);
         if (g_asFails >= AS_MAX_FAILS) {        // it isn't going to start; stop cranking it
           g_asLock = true; prefs.putBool("as_lock", true);
@@ -700,7 +700,7 @@ void evalAutoStart(float v) {
   if (g_as_max24 > 0 && g_fires24 >= g_as_max24)               { g_lowSince = 0; return; }
   if (!(v < g_as_volts))                                       { g_lowSince = 0; return; }
 
-  if (g_lowSince == 0) {                        // first low reading â€” start the clock
+  if (g_lowSince == 0) {                        // first low reading -- start the clock
     g_lowSince = now;
     Serial.printf("auto-start: %.2f V below %.2f V, counting %lu s\n",
                   v, g_as_volts, (unsigned long)g_as_hold);
@@ -719,7 +719,7 @@ void evalAutoStart(float v) {
   g_needRearm  = true;   g_rearmS = 0;
   if (g_fires24 < 255) g_fires24++;
   beginVerify(idx, true);
-  Serial.printf("*** AUTO-START FIRED at %.2f V (tx %s) â€” cooldown %lu s, fire %u today (cap %s) ***\n",
+  Serial.printf("*** AUTO-START FIRED at %.2f V (tx %s) -- cooldown %lu s, fire %u today (cap %s) ***\n",
                 v, sent ? "ok" : "FAILED", (unsigned long)g_as_cool, g_fires24,
                 g_as_max24 > 0 ? String(g_as_max24).c_str() : "none");
 }
@@ -985,7 +985,7 @@ function fmtB(b){if(b===undefined||b===null)return "--";if(b<1024)return b+" B";
 // 9 graphs, in canvas order c0..c8, mapped to /history data columns 1..9.
 var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657","#7ee787","#e3b341"];
 var DEC=[2,1,0,0,0,0,0,0,0];
-var UNITS=["V","Â°C","KB","KB","B/min","B/min","dBm","%","%"];
+var UNITS=["V","degC","KB","KB","B/min","B/min","dBm","%","%"];
 var PAD=8;
 var CHARTS={};      // id -> {data, lo, hi, color, dec, unit}
 var TS=[];          // per-sample epoch seconds (0 if NTP not synced), parallel to data
@@ -1063,12 +1063,12 @@ if(!d.drain_ok){
   $("drate").style.color=(mv>=0)?"#3fb950":(mv>-3?"#e6edf3":(mv>-10?"#d29922":"#f85149"));
   $("dproj").textContent=(d.drain_days>0)?(d.drain_days<1?(Math.round(d.drain_days*24)+" h"):(d.drain_days.toFixed(1)+" days")):"n/a";
   var trust=r2>=0.9?"solid":(r2>=0.6?"usable":"too noisy to trust yet");
-  $("dmeta").textContent="fit r²="+r2.toFixed(2)+" ("+trust+") · "+hrs.toFixed(1)+" h window · "+d.drain_n+" samples"
-    +(r2<0.6?" — leave it sitting longer before comparing":"");
+  $("dmeta").textContent="fit r^2="+r2.toFixed(2)+" ("+trust+") | "+hrs.toFixed(1)+" h window | "+d.drain_n+" samples"
+    +(r2<0.6?" -- leave it sitting longer before comparing":"");
   $("dmeta").style.color=(r2<0.6)?"#d29922":"#8b949e";
 }
-$("sub").textContent="divider Ã—"+d.divider+" Â· cal "+d.cal+" Â· ADC "+d.adc_mv+" mV Â· 1 sample/"+d.interval_s+"s";
-$("net").textContent=(d.mode?d.mode.toUpperCase():"")+" Â· "+(d.ip||"");$("ns").textContent=d.samples;$("fw").textContent=d.fw||"?";
+$("sub").textContent="divider x"+d.divider+" | cal "+d.cal+" | ADC "+d.adc_mv+" mV | 1 sample/"+d.interval_s+"s";
+$("net").textContent=(d.mode?d.mode.toUpperCase():"")+" | "+(d.ip||"");$("ns").textContent=d.samples;$("fw").textContent=d.fw||"?";
 $("clk").textContent=d.time_ok?new Date(d.epoch*1000).toLocaleTimeString():"no NTP";
 var RF={armed:"armed",blocked:"present, no patterns",absent:"not detected",off:"disabled"};
 $("rfstat").textContent=RF[d.rf]||d.rf||"?";
@@ -1082,19 +1082,19 @@ $("psbtn").textContent=ps?"Turn OFF":"Turn ON";$("psbtn").setAttribute("data-nex
 var ae=!!d.as_en;
 $("asbadge").innerHTML='<span class="badge '+(ae?"arm":"off")+'">'+(ae?"ARMED":"OFF")+'</span>';
 $("asbtn").textContent=ae?"Disable":"Enable";$("asbtn").setAttribute("data-next",ae?"0":"1");
-var ST={off:"disabled â€” the car will not start itself",
-lockout:"LOCKED OUT â€” "+d.as_fails+" starts in a row drew no charge. Check the car, then clear the lockout.",
-"not-armed":"cannot fire â€” RF not armed (check CC1101 / patterns)",
-warmup:"warming up after boot â€” holding off",
-"no-battery":"sensor is not across a battery ("+d.vbatt.toFixed(2)+" V) â€” will not fire",
-verifying:"just started â€” watching for the alternator to come up",
+var ST={off:"disabled -- the car will not start itself",
+lockout:"LOCKED OUT -- "+d.as_fails+" starts in a row drew no charge. Check the car, then clear the lockout.",
+"not-armed":"cannot fire -- RF not armed (check CC1101 / patterns)",
+warmup:"warming up after boot -- holding off",
+"no-battery":"sensor is not across a battery ("+d.vbatt.toFixed(2)+" V) -- will not fire",
+verifying:"just started -- watching for the alternator to come up",
 recovering:"waiting for the battery to recover and hold before it may fire again",
-"daily-cap":"24 h cap reached ("+d.as_f24+" of "+d.as_max24+") â€” holding off",
+"daily-cap":"24 h cap reached ("+d.as_f24+" of "+d.as_max24+") -- holding off",
 "park-wait":"confirming the car is parked ("+d.as_park_s+"s of "+d.as_park_need+"s below 13.2 V)",
-watching:"armed Â· watching â€” voltage is above "+(d.as_volts||0).toFixed(1)+" V"};
+watching:"armed | watching -- voltage is above "+(d.as_volts||0).toFixed(1)+" V"};
 var s=ST[d.as_state]||d.as_state;
-if(d.as_state=="counting")s="voltage low "+d.as_low_s+"s of "+d.as_hold+"s â€” starts in "+Math.max(0,d.as_hold-d.as_low_s)+"s";
-if(d.as_state=="cooldown")s="cooldown â€” "+fmtUp(d.as_cool_s)+" before it can fire again";
+if(d.as_state=="counting")s="voltage low "+d.as_low_s+"s of "+d.as_hold+"s -- starts in "+Math.max(0,d.as_hold-d.as_low_s)+"s";
+if(d.as_state=="cooldown")s="cooldown -- "+fmtUp(d.as_cool_s)+" before it can fire again";
 $("asstate").textContent=s;
 $("asstate").style.color=(d.as_state=="counting"||d.as_state=="lockout")?"#f85149":(ae?"#3fb950":"#8b949e");
 $("asunlock").style.display=d.as_lock?"inline-block":"none";
@@ -1118,21 +1118,21 @@ if(af!="ash")$("ash").value=d.as_hold;
 if(af!="asc")$("asc").value=d.as_cool;
 if(af!="asm")$("asm").value=d.as_max24;
 $("dot").style.background="#3fb950";$("stxt").textContent="live";
-}).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnectingâ€¦"})}
+}).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnecting..."})}
 document.querySelectorAll("button.tx[data-b]").forEach(function(btn){btn.addEventListener("click",function(){
 var b=btn.getAttribute("data-b");
 if(b=="START"&&!confirm("Start the engine now? This transmits the real remote-start code and CRANKS THE ENGINE if the car is in range."))return;
-$("rfmsg").textContent=b+" â€¦";
+$("rfmsg").textContent=b+" ...";
 fetch("/transmit?button="+b,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
-$("rfmsg").textContent=d.ok?(b+" sent Ã—"+d.repeats):(b+" failed: "+(d.detail||"error"));
+$("rfmsg").textContent=d.ok?(b+" sent x"+d.repeats):(b+" failed: "+(d.detail||"error"));
 }).catch(function(e){$("rfmsg").textContent=b+" request error"})})});
 document.querySelectorAll("button.seg").forEach(function(b){b.addEventListener("click",function(){
-var m=b.getAttribute("data-mhz");$("pwrmsg").textContent="setting CPU to "+m+" MHzâ€¦";
+var m=b.getAttribute("data-mhz");$("pwrmsg").textContent="setting CPU to "+m+" MHz...";
 fetch("/cpu?mhz="+m,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
 $("pwrmsg").textContent=d.ok?("CPU now "+d.cpu_mhz+" MHz"):("CPU change failed: "+(d.detail||"error"));poll();
 }).catch(function(e){$("pwrmsg").textContent="CPU request error"})})});
 $("psbtn").addEventListener("click",function(){
-var nx=$("psbtn").getAttribute("data-next")||"0";$("pwrmsg").textContent="updating WiFi power savingâ€¦";
+var nx=$("psbtn").getAttribute("data-next")||"0";$("pwrmsg").textContent="updating WiFi power saving...";
 fetch("/wifips?on="+nx,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
 $("pwrmsg").textContent="WiFi power saving "+(d.wifi_ps?"ON":"OFF");poll();
 }).catch(function(e){$("pwrmsg").textContent="WiFi power-save request error"})});
@@ -1141,26 +1141,26 @@ if(!a||!a.length){$("startbox").innerHTML='<div class="k">no starts recorded</di
 var h='<table class="st"><tr><th>When</th><th>Voltage</th><th>Trigger</th><th>TX</th><th>Engine</th></tr>';
 var VER=['<span style="color:#8b949e">unknown</span>','<span style="color:#3fb950">ran</span>','<span style="color:#f85149">no charge</span>'];
 a.forEach(function(e){
-var w=(e.ts>1700000000)?new Date(e.ts*1000).toLocaleString():("uptime "+fmtUp(e.up_s)+" Â· no clock");
+var w=(e.ts>1700000000)?new Date(e.ts*1000).toLocaleString():("uptime "+fmtUp(e.up_s)+" | no clock");
 h+='<tr><td>'+w+'</td><td>'+e.v.toFixed(2)+' V</td><td><span class="pill '+(e.src=="auto"?"auto":"man")+'">'+e.src+'</span></td><td>'+(e.ok?"sent":"<span style=\"color:#f85149\">failed</span>")+'</td><td>'+(VER[e.ver]||VER[0])+'</td></tr>';
 });
 $("startbox").innerHTML=h+'</table>';
 }).catch(function(e){})}
 $("asbtn").addEventListener("click",function(){
 var nx=$("asbtn").getAttribute("data-next")||"0";
-if(nx=="1"&&!confirm("ARM low-voltage auto-start?\n\nThe car will CRANK BY ITSELF, unattended, whenever battery voltage stays at or below the threshold for the hold time.\n\nNever leave this armed while the car is parked indoors or in an attached garage â€” engine exhaust in an enclosed space is lethal."))return;
-$("asmsg").textContent="updatingâ€¦";
+if(nx=="1"&&!confirm("ARM low-voltage auto-start?\n\nThe car will CRANK BY ITSELF, unattended, whenever battery voltage stays at or below the threshold for the hold time.\n\nNever leave this armed while the car is parked indoors or in an attached garage -- engine exhaust in an enclosed space is lethal."))return;
+$("asmsg").textContent="updating...";
 fetch("/autostart?en="+nx,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
 $("asmsg").textContent="auto-start "+(d.as_en?"ARMED":"disabled");poll();
 }).catch(function(e){$("asmsg").textContent="request error"})});
 $("assave").addEventListener("click",function(){
 var q="volts="+$("asv").value+"&hold="+$("ash").value+"&cool="+$("asc").value+"&max24="+$("asm").value;
-$("asmsg").textContent="savingâ€¦";
+$("asmsg").textContent="saving...";
 fetch("/autostart?"+q,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
-$("asmsg").textContent=d.ok?("saved â€” start below "+d.as_volts.toFixed(1)+" V held "+d.as_hold+" s"):("save failed: "+(d.detail||"error"));poll();
+$("asmsg").textContent=d.ok?("saved -- start below "+d.as_volts.toFixed(1)+" V held "+d.as_hold+" s"):("save failed: "+(d.detail||"error"));poll();
 }).catch(function(e){$("asmsg").textContent="save error"})});
 $("asunlock").addEventListener("click",function(){
-if(!confirm("Clear the auto-start lockout?\n\nIt latched because starts drew no charge â€” the engine did not catch. Make sure you know why before re-enabling."))return;
+if(!confirm("Clear the auto-start lockout?\n\nIt latched because starts drew no charge -- the engine did not catch. Make sure you know why before re-enabling."))return;
 fetch("/autostart?unlock=1",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
 $("asmsg").textContent="lockout cleared";poll();
 }).catch(function(e){$("asmsg").textContent="unlock error"})});
@@ -1176,7 +1176,9 @@ poll();loadHistory();loadStarts();
 void handleDash() {
   trackReq();
   g_out_total += g_dashLen;
-  server.send_P(200, "text/html", DASH_HTML);
+  // charset declared on the header, not just the <meta> tag ??? belt and braces
+  // so the page can never be rendered as Latin-1 and show mojibake.
+  server.send_P(200, "text/html; charset=utf-8", DASH_HTML);
 }
 
 void handleJson() {
@@ -1290,7 +1292,7 @@ void handleTransmit() {
   Serial.printf("RF TX: %s x%d\n", btn.c_str(), RF_REPEATS);
 }
 
-// GET /rftest â€” non-transmitting CC1101 health check (see CC1101::selfTest).
+// GET /rftest -- non-transmitting CC1101 health check (see CC1101::selfTest).
 // Confirms SPI/power, config register read-back, and TX-state entry WITHOUT
 // radiating a carrier. Cannot start the car. Safe to hit any time.
 void handleRfTest() {
@@ -1315,7 +1317,7 @@ void handleRfTest() {
                 t.ok, t.spiOk, t.regsOk, t.txEntered, t.marcstate, t.gdo0Ok);
 }
 
-// POST /cpu?mhz=80|240 â€” set the CPU clock. 80 MHz is the floor that still
+// POST /cpu?mhz=80|240 -- set the CPU clock. 80 MHz is the floor that still
 // keeps WiFi alive; 240 MHz is full speed. Returns the live (verified) freq.
 // Lower clock = less self-heating and a bit less current draw (the radio
 // dominates power, but every mA helps a parked-car monitor).
@@ -1336,7 +1338,7 @@ void handleCpu() {
   Serial.printf("CPU clock set to %u MHz (requested %ld)\n", (unsigned)getCpuFrequencyMhz(), mhz);
 }
 
-// POST /wifips?on=0|1 â€” enable/disable WiFi modem-sleep power saving.
+// POST /wifips?on=0|1 -- enable/disable WiFi modem-sleep power saving.
 //   on=1  -> radio dozes between DTIM beacons (default; saves power, adds latency)
 //   on=0  -> radio always on (snappier, draws more current)
 // Returns the live state from WiFi.getSleep().
@@ -1390,7 +1392,7 @@ void handleAutoStart() {
     g_as_en = server.arg("en").toInt() != 0;
     prefs.putBool("as_en", g_as_en);
   }
-  // Clearing the latched lockout after a run of failed starts is deliberate â€”
+  // Clearing the latched lockout after a run of failed starts is deliberate --
   // you should have looked at why the car didn't catch before re-enabling it.
   if (server.hasArg("unlock") && server.arg("unlock").toInt() != 0) {
     g_asLock = false;  prefs.putBool("as_lock", false);
@@ -1413,7 +1415,7 @@ void handleAutoStart() {
                 (unsigned long)g_as_hold, (unsigned long)g_as_cool);
 }
 
-// GET /starts â€” the engine-start log, newest first, as a JSON array.
+// GET /starts -- the engine-start log, newest first, as a JSON array.
 void handleStarts() {
   trackReq();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -1434,7 +1436,7 @@ void handleStarts() {
   server.sendContent("");
 }
 
-// POST /starts â€” clear the start log.
+// POST /starts -- clear the start log.
 void handleStartsClear() {
   trackReq();
   g_startCount = 0;
@@ -1459,7 +1461,7 @@ a{color:#58a6ff}</style></head><body>
 <input type="file" id="fw" accept=".bin"><br>
 <button onclick="up()">Upload &amp; flash</button>
 <progress id="pb" value="0" max="100"></progress>
-<div id="m">pick the compiled .bin â€” the board flashes it and reboots</div>
+<div id="m">pick the compiled .bin -- the board flashes it and reboots</div>
 <p><a href="/">&larr; back to dashboard</a></p></div>
 <script>
 function up(){var f=document.getElementById('fw').files[0];if(!f){return}
@@ -1558,7 +1560,7 @@ void setup() {
   server.on("/", handleDash);
   server.on("/json", handleJson);
   server.on("/history", handleHistory);
-  server.on("/update", HTTP_GET, []() { trackReq(); server.send_P(200, "text/html", UPDATE_HTML); });
+  server.on("/update", HTTP_GET, []() { trackReq(); server.send_P(200, "text/html; charset=utf-8", UPDATE_HTML); });
   server.on("/update", HTTP_POST,
     []() {                                    // runs after the upload finishes
       bool ok = !Update.hasError();
@@ -1606,7 +1608,7 @@ void setup() {
   } else {
     Serial.println("RF disabled in config (RF_ENABLED=false).");
   }
-  // SNMP agent â€” read-only, so an NMS can poll the board directly with no Pi.
+  // SNMP agent -- read-only, so an NMS can poll the board directly with no Pi.
   if (SNMP_ENABLED) {
     size_t nOids = sizeof(SNMP_OIDS) / sizeof(SNMP_OIDS[0]);
     if (snmp.begin(SNMP_PORT, SNMP_COMMUNITY, SNMP_OIDS, nOids))
@@ -1659,7 +1661,7 @@ void loop() {
   // NTP time: only meaningful with a live STA connection.
   if (!apMode && WiFi.status() == WL_CONNECTED) {
     if (!g_timeSynced) {
-      // Not synced yet â€” retry every 30 s after the boot kick until the
+      // Not synced yet -- retry every 30 s after the boot kick until the
       // clock reads a plausible year.
       if (timeIsValid()) {
         g_timeSynced = true;

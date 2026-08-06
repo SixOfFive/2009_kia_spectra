@@ -1,4 +1,4 @@
-// cc1101_compustar.cpp — implementation. See cc1101_compustar.h.
+// cc1101_compustar.cpp -- implementation. See cc1101_compustar.h.
 
 #include "cc1101_compustar.h"
 
@@ -58,7 +58,7 @@ void CC1101Compustar::writeReg(uint8_t addr, uint8_t value) {
 
 uint8_t CC1101Compustar::readReg(uint8_t addr) {
   // Status registers (>= 0x30) require the burst bit set, per the
-  // datasheet — otherwise the read targets a command strobe.
+  // datasheet -- otherwise the read targets a command strobe.
   uint8_t header = HDR_READ | (addr >= 0x30 ? HDR_BURST : 0) | (addr & 0x3F);
   _spi->beginTransaction(_spiSettings);
   csLow();
@@ -208,7 +208,7 @@ bool CC1101Compustar::gdo0Continuity() {
   // hardware and no RF: have the CC1101 drive a clock onto its GDO0 pin and
   // read it back on our GPIO. A connected, actively-driven pin overrides the
   // ESP32's internal pull both ways; a floating (disconnected) pin just
-  // follows the pull. Chip stays in IDLE — nothing is radiated.
+  // follows the pull. Chip stays in IDLE -- nothing is radiated.
   strobe(STR_SIDLE);
 
   // Release the ESP32's drive BEFORE the CC1101 starts driving (avoid

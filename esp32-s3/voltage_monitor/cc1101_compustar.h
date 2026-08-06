@@ -4,13 +4,13 @@
 //
 // Ported from the project's MicroPython reference driver
 // (esp32/src/lib/cc1101.py + esp32/src/lib/compustar.py). No external
-// CC1101 Arduino library — the register init comes straight from TI
+// CC1101 Arduino library -- the register init comes straight from TI
 // SmartRF Studio for 433.92 MHz async OOK, and we bit-bang the GDO0 pin
 // with the exact (HIGH_us, LOW_us) pulse pairs the Compustar 1WG3R
 // family expects. See docs/compustar-research.md and
 // sdr/analysis/framing.md for the protocol.
 //
-// Wiring (CC1101 module -> ESP32-S3, all 3.3V logic — the CC1101 is
+// Wiring (CC1101 module -> ESP32-S3, all 3.3V logic -- the CC1101 is
 // NOT 5V tolerant):
 //
 //     CC1101   ESP32-S3 GPIO (defaults; override in the .ino)
@@ -45,7 +45,7 @@ static const uint16_t CMP_SYNC_LOW_US   = 1500;
 static const uint8_t  CMP_SYNC_COUNT = 3;
 static const uint8_t  CMP_PACKET_BITS = 35;
 
-// Burst defaults — mimic how the genuine FOB repeats a packet per press.
+// Burst defaults -- mimic how the genuine FOB repeats a packet per press.
 static const uint8_t  CMP_DEFAULT_REPEATS  = 8;
 static const uint16_t CMP_DEFAULT_GUARD_MS = 39;
 
@@ -83,7 +83,7 @@ class CC1101Compustar {
   // Non-transmitting health check: confirms SPI/power (PARTNUM/VERSION),
   // that the 433/OOK config registers read back as written, and that the
   // chip enters a TX-path state on STX. GDO0 is held LOW throughout, which
-  // in OOK is the '0'/off level (PATABLE[0]=0x00) — so NO carrier is
+  // in OOK is the '0'/off level (PATABLE[0]=0x00) -- so NO carrier is
   // radiated and nothing can be triggered. Safe to run any time.
   CC1101SelfTest selfTest();
 

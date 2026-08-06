@@ -1,4 +1,4 @@
-// snmp_agent.h — minimal read-only SNMPv1/v2c agent for the ESP32-S3.
+// snmp_agent.h -- minimal read-only SNMPv1/v2c agent for the ESP32-S3.
 //
 // Exists so an existing NMS (Cacti, LibreNMS, observium, ad-hoc snmpwalk) can
 // poll the board DIRECTLY, without the Raspberry Pi half of the project. The
@@ -8,7 +8,7 @@
 //
 // Scope, deliberately small:
 //   * SNMPv1 (version 0) and SNMPv2c (version 1)
-//   * GET, GETNEXT, GETBULK  — read-only. SET is refused.
+//   * GET, GETNEXT, GETBULK  -- read-only. SET is refused.
 //   * A flat table of scalar OIDs, all BASE.<leaf>.0
 //   * No traps, no standard host MIBs (sysUpTime/ifTable/hrStorage). Poll the
 //     host those normally come from; this tree is vroom-specific telemetry.

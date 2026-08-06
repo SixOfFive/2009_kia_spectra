@@ -1,4 +1,4 @@
-// snmp_agent.cpp — see snmp_agent.h.
+// snmp_agent.cpp -- see snmp_agent.h.
 //
 // Hand-rolled BER because the alternative is dragging in a full SNMP library
 // for what amounts to "parse a nested TLV, walk a sorted table, emit a nested
@@ -7,7 +7,7 @@
 #include "snmp_agent.h"
 
 // Enterprise subtree: 1.3.6.1.4.1.99999.8
-// (.99999 is a squatted Private Enterprise Number — see docs/20-snmp-integration.md)
+// (.99999 is a squatted Private Enterprise Number -- see docs/20-snmp-integration.md)
 static const uint32_t BASE_OID[] = {1, 3, 6, 1, 4, 1, 99999, 8};
 static const uint8_t  BASE_LEN   = sizeof(BASE_OID) / sizeof(BASE_OID[0]);
 
@@ -53,7 +53,7 @@ static int encInt(uint8_t* b, int32_t v) {
   return o;
 }
 
-// Unsigned application types (Counter32/Gauge32/TimeTicks) — never negative,
+// Unsigned application types (Counter32/Gauge32/TimeTicks) -- never negative,
 // so a leading 0x00 is prepended if the top bit would otherwise set.
 static int encUint(uint8_t* b, uint8_t tag, uint32_t v) {
   uint8_t tmp[5]; int n = 0;

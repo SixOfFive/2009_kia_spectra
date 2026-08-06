@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "2.9";             // 2.9 = battery drain rate (mV/h) + projection to flat
+const char* FW_VERSION = "3.0";             // 3.0 = AP fallback retries the home WiFi instead of latching
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -77,6 +77,12 @@ const int      HIST_N     = 1440;           // ring-buffer length (24 h @ 60 s)
 const uint32_t SAMPLE_MS  = 60000;          // one history sample per 60 s
 const uint32_t SAVE_MS    = 600000;         // snapshot history to flash every 10 min
 const uint32_t AP_AFTER_DOWN_MS = 300000;   // 5 min of lost WiFi -> Access Point
+// ...and once in AP mode, keep trying to get back onto the home network. Without
+// this the fallback is a one-way door: a brief router hiccup strands the board
+// in SoftAP until someone power-cycles it. In a parked car that means it is
+// unreachable AND drawing roughly double (AP mode has no power save at all).
+const uint32_t AP_RETRY_STA_MS  = 600000;   // from AP, re-try the home WiFi every 10 min
+const uint32_t AP_RETRY_WAIT_MS = 10000;    // how long to wait for the join
 const int      SAMPLES    = 64;             // ADC averaging
 
 // Onboard RGB LED voltage indicator (volts):
@@ -1641,6 +1647,7 @@ void setup() {
 }
 
 uint32_t lastSample = 0, lastSave = 0, lastPrint = 0, downSince = 0, lastDisp = 0;
+uint32_t lastApRetry = 0;      // millis() of the last AP->STA reconnect attempt
 void loop() {
   if (apMode) dnsServer.processNextRequest();
   server.handleClient();
@@ -1661,7 +1668,35 @@ void loop() {
   if (!apMode) {                                   // 5 min of lost WiFi -> AP
     if (WiFi.status() == WL_CONNECTED) downSince = 0;
     else { if (downSince == 0) downSince = now;
-           else if (now - downSince >= AP_AFTER_DOWN_MS) startAP(); }
+           else if (now - downSince >= AP_AFTER_DOWN_MS) { startAP(); lastApRetry = now; } }
+  } else if (now - lastApRetry >= AP_RETRY_STA_MS) {
+    // In AP mode: periodically try to get back onto the home network. Runs the
+    // AP and STA together during the attempt so anyone connected to the
+    // fallback AP isn't kicked off just because the retry failed.
+    lastApRetry = now;
+    Serial.printf("AP mode: retrying home WiFi '%s'...\n", WIFI_SSID);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < AP_RETRY_WAIT_MS) {
+      server.handleClient();                       // stay responsive while waiting
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      dnsServer.stop();
+      WiFi.softAPdisconnect(true);                 // tear the AP down, back to plain STA
+      WiFi.mode(WIFI_STA);
+      WiFi.setSleep(g_wifi_ps);                    // re-apply the persisted power-save
+      apMode    = false;
+      downSince = 0;
+      if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
+      syncTimeNow();
+      Serial.printf("rejoined '%s' as %s - AP torn down\n",
+                    WIFI_SSID, WiFi.localIP().toString().c_str());
+    } else {
+      WiFi.mode(WIFI_AP);                          // give up for now; AP-only draws less
+      Serial.println("home WiFi still unavailable; staying in AP mode");
+    }
   }
 
   // NTP time: only meaningful with a live STA connection.

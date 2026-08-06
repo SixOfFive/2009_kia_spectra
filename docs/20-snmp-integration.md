@@ -59,6 +59,10 @@ All scalars, all with the SMI `.0` instance suffix.
 | `.23.0` | Gauge32 | `clockEpoch` — unix seconds, 0 if no NTP |
 | `.24.0` | INTEGER | `clockSynced` — 0/1 |
 | `.25.0` | STRING | `rfStatus` — `armed` / `blocked` / `absent` / `off` |
+| `.26.0` | INTEGER | `drainMicrovoltsPerHour` — **signed**; negative = discharging. µV/h so no scaling is needed |
+| `.27.0` | Gauge32 | `drainFitPct` — r² × 100. Below ~60 the slope is noise, don't act on it |
+| `.28.0` | Gauge32 | `drainWindowSec` — span the fit covers |
+| `.29.0` | Gauge32 | `drainHoursToFlat` — projected hours to 11.8 V, `0` = n/a |
 | `.30.0` | INTEGER | `autoStartEnabled` — 0/1 |
 | `.31.0` | Gauge32 | `autoStartMv` — trigger threshold in mV |
 | `.32.0` / `.33.0` | Gauge32 | `autoStartHoldSec` / `autoStartCoolSec` |

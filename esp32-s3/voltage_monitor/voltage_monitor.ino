@@ -448,6 +448,11 @@ DrainFit computeDrain() {
     oldTs = t;
     n++;
   }
+  // Report the partial window even when it's too short to fit, so the UI can
+  // show honest progress ("need 10 more minutes") instead of a bare 0 that
+  // reads as broken. A reboot ends the window, so this counts up from the
+  // last power cycle, not from the start of history.
+  f.n = n;
   if (n < DRAIN_MIN_N) return f;
 
   // Pass 2 -- accumulate the regression sums over exactly that window.
@@ -1056,7 +1061,8 @@ $("nin").textContent=fmtB(d.net_in);$("nout").textContent=fmtB(d.net_out);
 if(!d.drain_ok){
   $("drate").textContent="--";$("drate").style.color="#8b949e";
   $("dproj").textContent="--";
-  $("dmeta").textContent="need "+Math.max(0,30-(d.samples||0))+" more minutes of samples (30 min minimum)";
+  $("dmeta").textContent="settling: "+(d.drain_n||0)+" of 30 min needed. The window restarts at every"
+    +" reboot and at any gap in the log, so a slope is never fitted across a hole.";
 }else{
   var mv=d.drain_mvph, r2=d.drain_r2, hrs=(d.drain_win_s/3600);
   $("drate").textContent=(mv>0?"+":"")+mv.toFixed(1)+" mV/h";

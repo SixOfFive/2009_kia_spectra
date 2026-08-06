@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.4";             // 4.4 = ETA-to-auto-start (projects parked drain to threshold + hold)
+const char* FW_VERSION = "4.5";             // 4.5 = graph battery drain rate over time (10th history column)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -206,6 +206,7 @@ struct Sample {
   int16_t  rssi;        // WiFi RSSI dBm (0 in AP mode)
   uint8_t  cpu0;        // core 0 load %, averaged across the interval
   uint8_t  cpu1;        // core 1 load %, averaged across the interval
+  int16_t  drain;       // battery drain rate at this sample, mV/h (signed; <0 = discharging, 0 = not fitted yet)
 };
 
 // Battery-drain regression result. Declared up here with Sample because the
@@ -545,6 +546,12 @@ void recordSample() {
   s.rssi    = apMode ? 0 : (int16_t)WiFi.RSSI();
   s.cpu0    = g_cpuN ? (uint8_t)(g_cpuAcc0 / g_cpuN + 0.5f) : (uint8_t)(g_cpu0 + 0.5f);
   s.cpu1    = g_cpuN ? (uint8_t)(g_cpuAcc1 / g_cpuN + 0.5f) : (uint8_t)(g_cpu1 + 0.5f);
+  // Stored one cycle behind (computeDrain runs at the end of this function), which
+  // is a 60 s lag on a metric that moves over hours -- fine. 0 while the fit settles.
+  float mv = g_drain.ok ? g_drain.mvph : 0.0f;
+  if (mv >  32000.0f) mv =  32000.0f;
+  if (mv < -32000.0f) mv = -32000.0f;
+  s.drain   = (int16_t)lroundf(mv);
   g_cpuAcc0 = 0; g_cpuAcc1 = 0; g_cpuN = 0;      // start a fresh interval average
   hist[histHead] = s;
   histHead = (histHead + 1) % HIST_N;
@@ -556,7 +563,7 @@ void saveHistory() {
   if (!hist) return;
   File f = LittleFS.open("/history.bin", FILE_WRITE);
   if (!f) return;
-  uint32_t magic = 0x564F4C34;                 // "VOL4" (per-sample ts + CPU load)
+  uint32_t magic = 0x564F4C35;                 // "VOL5" (adds per-sample drain rate)
   f.write((uint8_t*)&magic, 4);
   f.write((uint8_t*)&histCount, 4);
   f.write((uint8_t*)&histHead, 4);
@@ -570,7 +577,7 @@ void loadHistory() {
   if (!f) return;
   uint32_t magic = 0;
   f.read((uint8_t*)&magic, 4);
-  if (magic == 0x564F4C34) {           // older formats (no CPU columns) are discarded
+  if (magic == 0x564F4C35) {           // older formats are discarded (layout changed)
     f.read((uint8_t*)&histCount, 4);
     f.read((uint8_t*)&histHead, 4);
     f.read((uint8_t*)hist, sizeof(Sample) * HIST_N);
@@ -950,6 +957,7 @@ table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 <div class="clbl">WiFi RSSI dBm (24 h)</div><canvas id="c6" width="800" height="104"></canvas>
 <div class="clbl">CPU core 0 load % (24 h)</div><canvas id="c7" width="800" height="104"></canvas>
 <div class="clbl">CPU core 1 load % (24 h)</div><canvas id="c8" width="800" height="104"></canvas>
+<div class="clbl">Battery drain rate mV/h (24 h) &mdash; below 0 = discharging</div><canvas id="c9" width="800" height="104"></canvas>
 <div class="grid">
 <div class="card"><div class="k">ADC node</div><div class="v"><span id="adc">--</span> mV</div></div>
 <div class="card"><div class="k">WiFi RSSI</div><div class="v"><span id="rssi">--</span> dBm</div></div>
@@ -1041,15 +1049,15 @@ function $(i){return document.getElementById(i)}
 function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
 function fmtB(b){if(b===undefined||b===null)return "--";if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(1)+" KB";return (b/1048576).toFixed(2)+" MB"}
 function fmtEta(s){if(s===undefined||s===null||s<0)return null;if(s<3600)return "~"+Math.max(1,Math.round(s/60))+" min";if(s<86400)return "~"+(s/3600).toFixed(1)+" h";return "~"+(s/86400).toFixed(1)+" days"}
-// 9 graphs, in canvas order c0..c8, mapped to /history data columns 1..9.
-var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657","#7ee787","#e3b341"];
-var DEC=[2,1,0,0,0,0,0,0,0];
-var UNITS=["V","degC","KB","KB","B/min","B/min","dBm","%","%"];
+// 10 graphs, in canvas order c0..c9, mapped to /history data columns 1..10.
+var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657","#7ee787","#e3b341","#ff7b72"];
+var DEC=[2,1,0,0,0,0,0,0,0,0];
+var UNITS=["V","degC","KB","KB","B/min","B/min","dBm","%","%","mV/h"];
 var PAD=8;
 var CHARTS={};      // id -> {data, lo, hi, color, dec, unit}
 var TS=[];          // per-sample epoch seconds (0 if NTP not synced), parallel to data
 var hoverIdx=-1;
-var IDS=["c0","c1","c2","c3","c4","c5","c6","c7","c8"];
+var IDS=["c0","c1","c2","c3","c4","c5","c6","c7","c8","c9"];
 function fmtWhen(i){
   var t=TS[i];
   if(t&&t>1700000000){return new Date(t*1000).toLocaleString();}   // absolute (browser-local)
@@ -1091,10 +1099,11 @@ function loadHistory(){fetch("/history",{cache:"no-store"}).then(function(r){ret
 var ln=t.trim().split("\n"),rows=[];for(var i=1;i<ln.length;i++){rows.push(ln[i].split(",").map(Number))}
 if(!rows.length)return;
 TS=rows.map(function(r){return r[0]});
-for(var col=0;col<9;col++){(function(col){
-  var data=rows.map(function(r){return r[col+1]});           // data cols 1..9
+for(var col=0;col<10;col++){(function(col){
+  var data=rows.map(function(r){return r[col+1]});           // data cols 1..10
   var lo=Math.min.apply(null,data),hi=Math.max.apply(null,data);if(hi-lo<1e-6){hi+=1;lo-=1}
-  if(col>=7){lo=0;hi=Math.max(10,hi)}                        // CPU %: always anchor at 0
+  if(col==7||col==8){lo=0;hi=Math.max(10,hi)}                // CPU %: always anchor at 0
+  if(col==9){lo=Math.min(0,lo);hi=Math.max(0,hi);if(hi-lo<1e-6){hi+=1;lo-=1}}  // drain: keep 0 in view
   CHARTS["c"+col]={data:data,lo:lo,hi:hi,color:COLS[col],dec:DEC[col],unit:UNITS[col]};
 })(col)}
 drawAll();
@@ -1293,7 +1302,7 @@ void handleHistory() {
   trackReq();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  const char* hdr = "ts,vbatt,temp,heap_kb,disk_kb,net_in,net_out,rssi,cpu0,cpu1\n";
+  const char* hdr = "ts,vbatt,temp,heap_kb,disk_kb,net_in,net_out,rssi,cpu0,cpu1,drain_mvph\n";
   g_out_total += strlen(hdr);
   server.sendContent(hdr);
   if (hist) {
@@ -1310,7 +1319,8 @@ void handleHistory() {
       chunk += s.net_out; chunk += ',';
       chunk += s.rssi;    chunk += ',';
       chunk += s.cpu0;    chunk += ',';
-      chunk += s.cpu1;    chunk += '\n';
+      chunk += s.cpu1;    chunk += ',';
+      chunk += s.drain;   chunk += '\n';
       if (chunk.length() > 1500) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; }
     }
     if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }

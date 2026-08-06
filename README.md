@@ -14,19 +14,26 @@ display, no MQTT** in the shipped v1 build (see "v2 — optional
 telematics" below).
 
 **Status (2026-08-06): remote start + stop verified working** on the car
-(firmware 4.3). Confirmed end-to-end via the OBD-II battery tap — a board-fired
+(firmware 4.4). Confirmed end-to-end via the OBD-II battery tap — a board-fired
 Start produces the same crank-dip → 14.3 V charging signature as the real FOB.
-Auto-start on low voltage is built but ships **disabled** (opt-in).
+Low-voltage **auto-start is armed** on the installed unit (threshold + hold are
+user-settable); the dashboard shows a live **ETA to the next auto-start**,
+projected from the parked battery-drain rate. The build is installed behind the
+OBD-II port and running.
 
-## Scope decision 2026-06-01
+## Scope decision — ESP32-only is the build
 
 This project briefly grew a full Raspberry Pi + 5" touchscreen + web
 dashboard + MQTT + SNMP + map view side ("telematics") on top of the
-core trigger. **Pulled back to ESP32-only as v1.** The Pi side is
-parked at the existing quality level (it works, all 199 tests pass,
-provisioning is documented) and can be opted into later if the
-telematics half becomes interesting. The split is purely a scope
-choice — the ESP32 firmware was always self-sufficient for the trigger.
+core trigger. **The delivered system is ESP32-only** — one board does the
+whole job (battery sensing, dashboard, SNMP, and the remote-start trigger),
+installed and working in the car.
+
+The Raspberry Pi / telematics half is **most likely not being pursued.** Its
+code still lives in the repo, fully built and tested (`pi/`, all tests pass),
+so it *could* be revived, but it is not part of the shipped system and is not
+maintained going forward. Everything below about the Pi is kept for reference
+only — treat it as archived, not a roadmap.
 
 ## How the trigger works
 
@@ -109,10 +116,16 @@ checklist. Day-by-day progress in [`logs/`](logs/).
 Single board, one enclosure, drops into the existing OBD-II passive
 Y-splitter for a non-permanent install.
 
-## v2 — optional telematics (deferred)
+## Raspberry Pi telematics — archived, most likely not pursued
 
-The repo also ships a Raspberry Pi-side daemon that adds, on top of
-v1:
+> **Not part of the shipped system.** The ESP32 build above is the product.
+> This Pi-side daemon was fully built and bench-tested earlier, but the project
+> has settled on ESP32-only and the Pi half is most likely not being pursued.
+> It's kept in the repo (`pi/`) for reference and remains revivable, but it is
+> not maintained. Everything that mattered from it — the dashboard and SNMP —
+> already runs on the ESP32 itself.
+
+The Pi-side daemon adds, on top of the ESP32 build:
 
 - 5" touchscreen dashboard (gauges + map toggle + manual controls)
 - Web UI / `/api/state` JSON over Wi-Fi
@@ -121,15 +134,15 @@ v1:
 - Persistent OBD-II trip log + sparklines
 - mosquitto broker for the LAN
 
-All of that is **fully built and tested** on a bench Pi, but **not
-required for v1** — the ESP32 trigger works standalone with no Pi
-wired up. To opt into v2, add the Pi-side hardware from the deferred
-BOM, deploy per [`docs/10-pi-setup.md`](docs/10-pi-setup.md), and
-connect the UART link per [`docs/11-uart-link.md`](docs/11-uart-link.md).
+All of it is **fully built and tested** on a bench Pi. To revive it, add the
+Pi-side hardware from the deferred BOM, deploy per
+[`docs/10-pi-setup.md`](docs/10-pi-setup.md), and connect the UART link per
+[`docs/11-uart-link.md`](docs/11-uart-link.md). The slypi (bench Pi) deployment
+was the reference install; runtime details are in the private vault note.
 
-The slypi (bench Pi) deployment is the reference v2 install; see the
-private vault note for runtime details that can't go on a public
-remote.
+(The ESP32 already serves its own live dashboard and an SNMP agent, so the
+main reasons to add the Pi are the touchscreen and MQTT/Home-Assistant — not
+the monitoring, which is covered standalone.)
 
 ## Repository layout
 

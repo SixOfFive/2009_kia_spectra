@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.3";             // 4.3 = single burst per press (match FOB; 3 bursts may self-cancel)
+const char* FW_VERSION = "4.4";             // 4.4 = ETA-to-auto-start (projects parked drain to threshold + hold)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -510,6 +510,27 @@ DrainFit computeDrain() {
   return f;
 }
 
+// Estimated seconds until low-voltage auto-start would fire: project the current
+// parked drain rate (g_drain) down to the trigger threshold, then add the
+// sustain hold. Same math as the "projected to 11.8 V" countdown, but the target
+// is the user's g_as_volts and it includes g_as_hold. Returns -1 when it doesn't
+// apply -- auto-start disarmed or locked, no trustworthy discharging fit yet, or
+// the battery is holding/charging so it won't reach the threshold at this rate.
+// If voltage is already below the threshold, returns the sustain time remaining.
+long autoStartEtaS(float v) {
+  if (!g_as_en || g_asLock) return -1;
+  if (v < g_as_volts) {                                 // already low: hold remaining
+    if (g_lowSince == 0) return (long)g_as_hold;
+    long rem = (long)g_as_hold - (long)((millis() - g_lowSince) / 1000);
+    return rem > 0 ? rem : 0;
+  }
+  if (!g_drain.ok || g_drain.mvph >= 0) return -1;      // no fit, or not discharging
+  double vps = (-(double)g_drain.mvph) / 3600000.0;     // mV/h -> V/s (positive)
+  if (vps < 1e-12) return -1;
+  double toThresh = ((double)v - (double)g_as_volts) / vps;
+  return (long)(toThresh + (double)g_as_hold);
+}
+
 
 void recordSample() {
   if (!hist) return;
@@ -812,6 +833,7 @@ static void oidAsMax24(SnmpValue& v)  { v.type = SNMP_INT;       v.i = g_as_max2
 static void oidAsParkS(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = g_parkS; }
 static void oidStarts(SnmpValue& v)   { v.type = SNMP_COUNTER32; v.u = (uint32_t)g_startCount; }
 static void oidLastStart(SnmpValue& v){ v.type = SNMP_GAUGE32;   v.u = g_lastStartTs; }
+static void oidAsEtaS(SnmpValue& v)   { v.type = SNMP_GAUGE32;   long e = autoStartEtaS(g_lastV); v.u = (e > 0) ? (uint32_t)e : 0; }
 
 static const SnmpEntry SNMP_OIDS[] = {
   { 1,  oidFw,        "fwVersion"        },
@@ -857,6 +879,7 @@ static const SnmpEntry SNMP_OIDS[] = {
   { 41, oidAsParkS,   "autoStartParkSec" },
   { 42, oidStarts,    "startEventCount"  },
   { 43, oidLastStart, "lastStartEpoch"   },
+  { 44, oidAsEtaS,    "autoStartEtaSec"  },
 };
 
 const char DASH_HTML[] PROGMEM = R"HTML(
@@ -995,6 +1018,7 @@ the engine clearly isn't catching and it latches off until you clear it.
 </div>
 <div class="grid" style="margin-top:0">
 <div class="card"><div class="k">Low for</div><div class="v"><span id="aslow">--</span></div></div>
+<div class="card"><div class="k">Est. to auto-start</div><div class="v"><span id="aseta">--</span></div></div>
 <div class="card"><div class="k">Cooldown left</div><div class="v"><span id="ascool">--</span></div></div>
 <div class="card"><div class="k">Park confirm</div><div class="v"><span id="aspark">--</span></div></div>
 <div class="card"><div class="k">Auto-starts 24 h</div><div class="v"><span id="asf24">--</span></div></div>
@@ -1016,6 +1040,7 @@ the engine clearly isn't catching and it latches off until you clear it.
 function $(i){return document.getElementById(i)}
 function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
 function fmtB(b){if(b===undefined||b===null)return "--";if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(1)+" KB";return (b/1048576).toFixed(2)+" MB"}
+function fmtEta(s){if(s===undefined||s===null||s<0)return null;if(s<3600)return "~"+Math.max(1,Math.round(s/60))+" min";if(s<86400)return "~"+(s/3600).toFixed(1)+" h";return "~"+(s/86400).toFixed(1)+" days"}
 // 9 graphs, in canvas order c0..c8, mapped to /history data columns 1..9.
 var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657","#7ee787","#e3b341"];
 var DEC=[2,1,0,0,0,0,0,0,0];
@@ -1115,6 +1140,10 @@ var ps=!!d.wifi_ps;
 $("psbadge").innerHTML='<span class="badge '+(ps?"on":"off")+'">'+(ps?"ON":"OFF")+'</span>';
 $("psbtn").textContent=ps?"Turn OFF":"Turn ON";$("psbtn").setAttribute("data-next",ps?"0":"1");
 var ae=!!d.as_en;
+// est. time until auto-start fires: parked-drain projection to the threshold + hold
+var eta=fmtEta(d.as_eta_s);
+$("aseta").textContent=ae?(eta||(d.drain_ok?"holding":"settling")):"--";
+$("aseta").style.color=(!ae||d.as_eta_s<0)?"#8b949e":(d.drain_r2<0.6?"#d29922":"#3fb950");
 $("asbadge").innerHTML='<span class="badge '+(ae?"arm":"off")+'">'+(ae?"ARMED":"OFF")+'</span>';
 $("asbtn").textContent=ae?"Disable":"Enable";$("asbtn").setAttribute("data-next",ae?"0":"1");
 var ST={off:"disabled -- the car will not start itself",
@@ -1126,7 +1155,7 @@ verifying:"just started -- watching for the alternator to come up",
 recovering:"waiting for the battery to recover and hold before it may fire again",
 "daily-cap":"24 h cap reached ("+d.as_f24+" of "+d.as_max24+") -- holding off",
 "park-wait":"confirming the car is parked ("+d.as_park_s+"s of "+d.as_park_need+"s below 13.2 V)",
-watching:"armed | watching -- voltage is above "+(d.as_volts||0).toFixed(1)+" V"};
+watching:"armed | watching -- above "+(d.as_volts||0).toFixed(1)+" V"+(fmtEta(d.as_eta_s)?" ("+fmtEta(d.as_eta_s)+" to auto-start)":"")};
 var s=ST[d.as_state]||d.as_state;
 if(d.as_state=="counting")s="voltage low "+d.as_low_s+"s of "+d.as_hold+"s -- starts in "+Math.max(0,d.as_hold-d.as_low_s)+"s";
 if(d.as_state=="cooldown")s="cooldown -- "+fmtUp(d.as_cool_s)+" before it can fire again";
@@ -1232,7 +1261,7 @@ void handleJson() {
     "\"as_en\":%s,\"as_volts\":%.2f,\"as_hold\":%lu,\"as_cool\":%lu,"
     "\"as_state\":\"%s\",\"as_low_s\":%lu,\"as_cool_s\":%lu,\"as_n\":%d,"
     "\"as_lock\":%s,\"as_fails\":%u,\"as_park_s\":%lu,\"as_park_need\":%lu,\"as_f24\":%u,"
-    "\"as_max24\":%d,\"cpu0\":%.1f,\"cpu1\":%.1f,"
+    "\"as_max24\":%d,\"as_eta_s\":%ld,\"cpu0\":%.1f,\"cpu1\":%.1f,"
     "\"net_in\":%lu,\"net_out\":%lu,\"as_last\":%lu,"
     "\"drain_ok\":%s,\"drain_mvph\":%.2f,\"drain_r2\":%.3f,\"drain_n\":%d,"
     "\"drain_win_s\":%lu,\"drain_days\":%.2f}",
@@ -1250,7 +1279,7 @@ void handleJson() {
     (unsigned long)autoStartCooldownLeft(), g_startCount,
     g_asLock ? "true" : "false", g_asFails,
     (unsigned long)g_parkS, (unsigned long)AS_PARK_S, g_fires24,
-    g_as_max24, g_cpu0, g_cpu1,
+    g_as_max24, autoStartEtaS(v), g_cpu0, g_cpu1,
     (unsigned long)g_in_total, (unsigned long)g_out_total,
     (unsigned long)g_lastStartTs,
     g_drain.ok ? "true" : "false", g_drain.mvph, g_drain.r2, g_drain.n,

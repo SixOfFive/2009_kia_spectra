@@ -1,6 +1,7 @@
 // cc1101_compustar.cpp -- implementation. See cc1101_compustar.h.
 
 #include "cc1101_compustar.h"
+#include "driver/pulse_cnt.h"   // ESP32 hardware pulse counter (crystal measurement)
 
 // ---- CC1101 register addresses ----
 enum {
@@ -146,6 +147,17 @@ bool CC1101Compustar::begin(uint8_t txPower) {
   return _ready;
 }
 
+uint8_t CC1101Compustar::peekReg(uint8_t addr) { return readReg(addr); }
+
+void CC1101Compustar::readPatable(uint8_t out[8]) {
+  _spi->beginTransaction(_spiSettings);
+  csLow();
+  _spi->transfer(HDR_READ | HDR_BURST | 0x3E);   // PATABLE burst read
+  for (int i = 0; i < 8; i++) out[i] = _spi->transfer(0x00);
+  csHigh();
+  _spi->endTransaction();
+}
+
 uint8_t CC1101Compustar::partnum() { return readReg(REG_PARTNUM); }
 uint8_t CC1101Compustar::version() { return readReg(REG_VERSION); }
 
@@ -202,6 +214,56 @@ CC1101SelfTest CC1101Compustar::selfTest() {
 
   t.ok = t.spiOk && t.regsOk && t.txEntered && t.gdo0Ok;
   return t;
+}
+
+// --- crystal frequency measurement (no SDR needed) ---
+// Uses the ESP32 PCNT hardware counter, NOT a software interrupt: at 135 kHz a
+// software ISR loses edges whenever a WiFi ISR preempts it, which reads ~1.7 %
+// low and would frame a real 26 MHz part as a bogus ~25.5 MHz. PCNT counts in
+// silicon with zero misses.
+uint32_t CC1101Compustar::measureXtalHz() {
+  if (!_ready) return 0;
+  strobe(STR_SIDLE);
+  uint8_t savedIocfg0 = readReg(REG_IOCFG0);
+
+  pinMode(_gdo0, INPUT);
+  writeReg(REG_IOCFG0, 0x3F);        // GDO0 = CLK_XOSC / 192 (~135 kHz @ 26 MHz)
+  delay(2);                          // settle
+
+  uint32_t xtal = 0;
+  pcnt_unit_config_t uc = {};
+  uc.high_limit = 32000; uc.low_limit = -1;
+  pcnt_unit_handle_t unit = nullptr;
+  if (pcnt_new_unit(&uc, &unit) == ESP_OK) {
+    pcnt_chan_config_t cc = {};
+    cc.edge_gpio_num = _gdo0; cc.level_gpio_num = -1;
+    pcnt_channel_handle_t ch = nullptr;
+    if (pcnt_new_channel(unit, &cc, &ch) == ESP_OK) {
+      pcnt_channel_set_edge_action(ch, PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                       PCNT_CHANNEL_EDGE_ACTION_HOLD);   // count rising edges
+      pcnt_unit_enable(unit);
+      pcnt_unit_clear_count(unit);
+      uint32_t t0 = micros();
+      pcnt_unit_start(unit);
+      delay(100);                    // ~13.5k edges @ 26 MHz -> under the 32k limit
+      pcnt_unit_stop(unit);
+      uint32_t dt = micros() - t0;
+      int cnt = 0;
+      pcnt_unit_get_count(unit, &cnt);
+      pcnt_unit_disable(unit);
+      pcnt_del_channel(ch);
+      if (dt > 0 && cnt > 0) {
+        double gdo0Hz = (double)cnt * 1e6 / (double)dt;   // edges/sec
+        xtal = (uint32_t)(gdo0Hz * 192.0 + 0.5);          // xtal = GDO0 * 192
+      }
+    }
+    pcnt_del_unit(unit);
+  }
+
+  writeReg(REG_IOCFG0, savedIocfg0);
+  pinMode(_gdo0, OUTPUT);
+  digitalWrite(_gdo0, LOW);
+  return xtal;
 }
 
 bool CC1101Compustar::gdo0Continuity() {

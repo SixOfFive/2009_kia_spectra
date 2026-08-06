@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "3.1";             // 3.0 = AP fallback retries the home WiFi instead of latching
+const char* FW_VERSION = "3.4";             // 3.0 = AP fallback retries the home WiFi instead of latching
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -1304,6 +1304,58 @@ void handleTransmit() {
   Serial.printf("RF TX: %s x%d\n", btn.c_str(), RF_REPEATS);
 }
 
+// GET /xtaltest -- measure the CC1101 crystal (no SDR). Our frequency words
+// assume a 26 MHz xtal to hit 433.92 MHz; a 27 MHz part actually radiates near
+// 450 MHz and the car can't hear it, while every register readback still passes.
+void handleXtalTest() {
+  trackReq();
+  if (!RF_ENABLED || !rfReady) {
+    const char* m = "{\"ok\":false,\"detail\":\"RF disabled or CC1101 absent\"}";
+    g_out_total += strlen(m); server.send(503, "application/json", m); return;
+  }
+  uint32_t xtal = radio.measureXtalHz();
+  double actualMHz = 433.92 * ((double)xtal / 26.0e6);
+  const char* verdict;
+  if      (xtal >= 25.7e6 && xtal <= 26.3e6) verdict = "26MHz-ok";
+  else if (xtal >= 26.7e6 && xtal <= 27.3e6) verdict = "27MHz-OFFBAND";
+  else                                       verdict = "unexpected";
+  char j[256];
+  snprintf(j, sizeof(j),
+    "{\"ok\":true,\"xtal_hz\":%lu,\"xtal_mhz\":%.3f,\"actual_tx_mhz\":%.2f,\"verdict\":\"%s\"}",
+    (unsigned long)xtal, xtal / 1.0e6, actualMHz, verdict);
+  g_out_total += strlen(j);
+  server.send(200, "application/json", j);
+  Serial.printf("xtal test: %.3f MHz -> actual TX ~%.2f MHz (%s)\n",
+                xtal / 1.0e6, actualMHz, verdict);
+}
+
+// GET /rfregs -- dump the CC1101 config registers the self-test doesn't check
+// (IOCFG0 = async data-pin config; PATABLE = actual PA output level). A wrong
+// PATABLE[1] or IOCFG0 means MARCSTATE reaches TX but little/no RF is modulated.
+void handleRfRegs() {
+  trackReq();
+  if (!RF_ENABLED || !rfReady) {
+    const char* m = "{\"ok\":false,\"detail\":\"RF disabled or CC1101 absent\"}";
+    g_out_total += strlen(m); server.send(503, "application/json", m); return;
+  }
+  uint8_t pat[8];
+  radio.readPatable(pat);
+  char j[420];
+  snprintf(j, sizeof(j),
+    "{\"ok\":true,"
+    "\"IOCFG2\":\"0x%02X\",\"IOCFG0\":\"0x%02X\",\"PKTCTRL0\":\"0x%02X\","
+    "\"FREQ2\":\"0x%02X\",\"FREQ1\":\"0x%02X\",\"FREQ0\":\"0x%02X\","
+    "\"MDMCFG2\":\"0x%02X\",\"DEVIATN\":\"0x%02X\",\"MCSM0\":\"0x%02X\",\"FREND0\":\"0x%02X\","
+    "\"PATABLE0\":\"0x%02X\",\"PATABLE1\":\"0x%02X\","
+    "\"expect\":\"IOCFG0=2D PKTCTRL0=32 FREND0=11 PATABLE0=00 PATABLE1=C0\"}",
+    radio.peekReg(0x00), radio.peekReg(0x02), radio.peekReg(0x08),
+    radio.peekReg(0x0D), radio.peekReg(0x0E), radio.peekReg(0x0F),
+    radio.peekReg(0x12), radio.peekReg(0x15), radio.peekReg(0x18), radio.peekReg(0x22),
+    pat[0], pat[1]);
+  g_out_total += strlen(j);
+  server.send(200, "application/json", j);
+}
+
 // GET /rftest -- non-transmitting CC1101 health check (see CC1101::selfTest).
 // Confirms SPI/power, config register read-back, and TX-state entry WITHOUT
 // radiating a carrier. Cannot start the car. Safe to hit any time.
@@ -1594,6 +1646,8 @@ void setup() {
     });
   server.on("/transmit", HTTP_POST, handleTransmit);
   server.on("/rftest", HTTP_GET, handleRfTest);
+  server.on("/xtaltest", HTTP_GET, handleXtalTest);
+  server.on("/rfregs", HTTP_GET, handleRfRegs);
   server.on("/cpu", HTTP_POST, handleCpu);
   server.on("/wifips", HTTP_POST, handleWifiPs);
   server.on("/autostart", HTTP_POST, handleAutoStart);

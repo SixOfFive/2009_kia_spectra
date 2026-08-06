@@ -123,4 +123,17 @@ class CC1101Compustar {
   // Strobe into TX and poll MARCSTATE until the PA is really up (the
   // IDLE->TX calibration takes ~721 us and radiates nothing). false = timeout.
   bool enterTxAndWait(uint32_t timeoutUs);
+
+public:
+  // Measure the module's crystal frequency in Hz, with no SDR: the CC1101
+  // outputs CLK_XOSC/192 on GDO0 and the ESP32 counts edges. This decides
+  // whether our 433.92 MHz frequency words are actually on-target -- a 27 MHz
+  // part configured as if 26 MHz transmits near 450 MHz and the car never
+  // hears it, while every register readback still passes.
+  uint32_t measureXtalHz();
+
+  // Read any config register (debug). Wraps the private readReg.
+  uint8_t  peekReg(uint8_t addr);
+  // Read the 8-byte PATABLE (PA power ramp). out[] must hold 8 bytes.
+  void     readPatable(uint8_t out[8]);
 };

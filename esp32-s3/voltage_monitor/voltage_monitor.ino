@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.6";             // 4.6 = drain tile shows honest partial progress (was bare "0 of 30")
+const char* FW_VERSION = "4.7";             // 4.7 = voltage min/max lines, uptime + combined CPU load in hero
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -944,6 +944,8 @@ table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 <div class="hero">
 <div class="metric"><div class="lbl">Voltage</div><span class="big" id="vbatt">--</span><span class="u"> V</span></div>
 <div class="metric"><div class="lbl">Chip temp</div><span class="big" id="temp">--</span><span class="u"> &deg;C</span></div>
+<div class="metric"><div class="lbl">CPU load (avg)</div><span class="big" id="cpuavg">--</span><span class="u"> %</span></div>
+<div class="metric"><div class="lbl">Uptime</div><span class="big" id="up" style="font-size:26px">--</span></div>
 </div>
 <div class="sub" id="sub">waiting for data&hellip;</div>
 <div class="clbl">Voltage (24 h)</div><canvas id="c0" width="800" height="104"></canvas>
@@ -966,7 +968,6 @@ table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 <div class="grid">
 <div class="card"><div class="k">ADC node</div><div class="v"><span id="adc">--</span> mV</div></div>
 <div class="card"><div class="k">WiFi RSSI</div><div class="v"><span id="rssi">--</span> dBm</div></div>
-<div class="card"><div class="k">Uptime</div><div class="v" id="up">--</div></div>
 <div class="card"><div class="k">Disk</div><div class="v"><span id="disk">--</span></div></div>
 <div class="card"><div class="k">Free heap</div><div class="v"><span id="heap">--</span></div></div>
 <div class="card"><div class="k">Free PSRAM</div><div class="v"><span id="psram">--</span></div></div>
@@ -1074,9 +1075,15 @@ function drawChart(id){
   var c=$(id),x=c.getContext("2d"),W=c.width,H=c.height;x.clearRect(0,0,W,H);
   var data=ch.data,N=data.length;if(N<2)return;var lo=ch.lo,hi=ch.hi;
   function gx(i){return PAD+i*(W-2*PAD)/(N-1)}function gy(v){return H-PAD-(v-lo)/(hi-lo)*(H-2*PAD)}
+  // min/max reference lines (voltage graph): a dashed line + labelled value at the data extremes, always visible
+  if(ch.minmax){x.setLineDash([4,3]);x.lineWidth=1;x.font="11px system-ui";
+    [["max",ch.mx,-4],["min",ch.mn,12]].forEach(function(m){var yy=gy(m[1]);
+      x.strokeStyle="#6e7681";x.beginPath();x.moveTo(PAD,yy);x.lineTo(W-PAD,yy);x.stroke();
+      x.fillStyle="#8b949e";x.fillText(m[0]+" "+m[1].toFixed(ch.dec)+" "+ch.unit,W-118,yy+m[2])});
+    x.setLineDash([])}
   x.strokeStyle=ch.color;x.lineWidth=1.5;x.beginPath();
   data.forEach(function(v,i){i?x.lineTo(gx(i),gy(v)):x.moveTo(gx(i),gy(v))});x.stroke();
-  x.fillStyle="#8b949e";x.font="11px system-ui";x.fillText(hi.toFixed(ch.dec),6,13);x.fillText(lo.toFixed(ch.dec),6,H-5);
+  if(!ch.minmax){x.fillStyle="#8b949e";x.font="11px system-ui";x.fillText(hi.toFixed(ch.dec),6,13);x.fillText(lo.toFixed(ch.dec),6,H-5);}
   if(hoverIdx>=0&&hoverIdx<N){var hx=gx(hoverIdx),hy=gy(data[hoverIdx]);
     x.strokeStyle="#6e7681";x.lineWidth=1;x.beginPath();x.moveTo(hx,PAD);x.lineTo(hx,H-PAD);x.stroke();
     x.fillStyle=ch.color;x.beginPath();x.arc(hx,hy,3.5,0,6.2832);x.fill();}
@@ -1107,9 +1114,11 @@ TS=rows.map(function(r){return r[0]});
 for(var col=0;col<10;col++){(function(col){
   var data=rows.map(function(r){return r[col+1]});           // data cols 1..10
   var lo=Math.min.apply(null,data),hi=Math.max.apply(null,data);if(hi-lo<1e-6){hi+=1;lo-=1}
+  var mn=lo,mx=hi;                                           // true data extremes (before padding)
+  if(col==0){var pad=Math.max((hi-lo)*0.18,0.03);lo-=pad;hi+=pad}  // voltage: headroom so min/max lines sit inside
   if(col==7||col==8){lo=0;hi=Math.max(10,hi)}                // CPU %: always anchor at 0
   if(col==9){lo=Math.min(0,lo);hi=Math.max(0,hi);if(hi-lo<1e-6){hi+=1;lo-=1}}  // drain: keep 0 in view
-  CHARTS["c"+col]={data:data,lo:lo,hi:hi,color:COLS[col],dec:DEC[col],unit:UNITS[col]};
+  CHARTS["c"+col]={data:data,lo:lo,hi:hi,color:COLS[col],dec:DEC[col],unit:UNITS[col],mn:mn,mx:mx,minmax:(col==0)};
 })(col)}
 drawAll();
 }).catch(function(e){})}
@@ -1148,7 +1157,7 @@ var RF={armed:"armed",blocked:"present, no patterns",absent:"not detected",off:"
 $("rfstat").textContent=RF[d.rf]||d.rf||"?";
 $("rfstat").style.color=(d.rf=="armed")?"#3fb950":(d.rf=="blocked"?"#d29922":"#8b949e");
 $("cpu").textContent=d.cpu_mhz;
-if(d.cpu0!==undefined){$("cpu0").textContent=d.cpu0.toFixed(1);$("cpu1").textContent=d.cpu1.toFixed(1);}
+if(d.cpu0!==undefined){$("cpu0").textContent=d.cpu0.toFixed(1);$("cpu1").textContent=d.cpu1.toFixed(1);$("cpuavg").textContent=Math.round((d.cpu0+d.cpu1)/2);}
 document.querySelectorAll("button.seg").forEach(function(b){b.classList.toggle("on",+b.getAttribute("data-mhz")===d.cpu_mhz)});
 var ps=!!d.wifi_ps;
 $("psbadge").innerHTML='<span class="badge '+(ps?"on":"off")+'">'+(ps?"ON":"OFF")+'</span>';

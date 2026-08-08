@@ -58,7 +58,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.7";             // 4.7 = voltage min/max lines, uptime + combined CPU load in hero
+const char* FW_VERSION = "4.8";             // 4.8 = min/max lines on temp, RSSI, both CPU cores, drain (like voltage)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -1115,10 +1115,11 @@ for(var col=0;col<10;col++){(function(col){
   var data=rows.map(function(r){return r[col+1]});           // data cols 1..10
   var lo=Math.min.apply(null,data),hi=Math.max.apply(null,data);if(hi-lo<1e-6){hi+=1;lo-=1}
   var mn=lo,mx=hi;                                           // true data extremes (before padding)
-  if(col==0){var pad=Math.max((hi-lo)*0.18,0.03);lo-=pad;hi+=pad}  // voltage: headroom so min/max lines sit inside
-  if(col==7||col==8){lo=0;hi=Math.max(10,hi)}                // CPU %: always anchor at 0
+  var mmx=(col==0||col==1||col==6||col==7||col==8||col==9);  // graphs that show dashed min/max lines
+  if(col==7||col==8){lo=0;hi=Math.max(10,hi)}                // CPU %: anchor at 0
   if(col==9){lo=Math.min(0,lo);hi=Math.max(0,hi);if(hi-lo<1e-6){hi+=1;lo-=1}}  // drain: keep 0 in view
-  CHARTS["c"+col]={data:data,lo:lo,hi:hi,color:COLS[col],dec:DEC[col],unit:UNITS[col],mn:mn,mx:mx,minmax:(col==0)};
+  if(mmx){var pad=Math.max((hi-lo)*0.15,0.02);lo-=pad;hi+=pad}  // headroom so the min/max lines sit inside the plot
+  CHARTS["c"+col]={data:data,lo:lo,hi:hi,color:COLS[col],dec:DEC[col],unit:UNITS[col],mn:mn,mx:mx,minmax:mmx};
 })(col)}
 drawAll();
 }).catch(function(e){})}

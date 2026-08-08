@@ -24,6 +24,8 @@
 #include <time.h>
 #include <Preferences.h>   // NVS-backed persistence for CPU clock + WiFi power-save
 #include "esp_task_wdt.h"   // task watchdog -- auto-reboot if the loop or safety task stalls
+#include "esp_system.h"     // esp_reset_reason() -- why the last boot happened
+#include "esp_sntp.h"       // NTP sync notification callback
 #include <stdarg.h>         // logLine() variadic formatting
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
@@ -60,7 +62,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.12";            // 4.12 = event log lines carry full date+time (was time-only)
+const char* FW_VERSION = "4.14";            // 4.14 = verbose logs (WiFi/NTP/reset/heap) + debounced disconnect spam
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -260,6 +262,79 @@ void logLine(const char* fmt, ...) {
   if (g_logCount < LOG_LINES) g_logCount++;
   portEXIT_CRITICAL(&g_logMux);
   Serial.println(line);                 // keep the USB console too
+}
+
+// Human name for a WiFi disconnect reason code (esp_wifi_types wifi_err_reason_t).
+static const char* wifiReason(uint8_t r) {
+  switch (r) {
+    case 1:   return "unspecified";
+    case 2:   return "auth-expire";
+    case 3:   return "auth-leave";
+    case 4:   return "assoc-expire";
+    case 5:   return "assoc-toomany";
+    case 8:   return "assoc-leave";
+    case 15:  return "4way-handshake-timeout";
+    case 200: return "beacon-timeout";
+    case 201: return "no-AP-found";
+    case 202: return "auth-fail";
+    case 203: return "assoc-fail";
+    case 204: return "handshake-timeout";
+    case 205: return "connection-fail";
+    default:  return "other";
+  }
+}
+
+// Verbose WiFi diagnostics into the event log: association, IP, and -- most
+// usefully for the drop-out hunt -- the disconnect REASON code every time it
+// falls off. (Per-request / SNMP-poll traffic is deliberately NOT logged.)
+void onWiFiEvent(WiFiEvent_t ev, WiFiEventInfo_t info) {
+  switch (ev) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      logLine("WiFi assoc to AP (channel %d)", info.wifi_sta_connected.channel);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      logLine("WiFi got IP %s @ %d dBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+      // Debounce: the driver retries every few seconds while out of range, each
+      // firing this event. Log the first, then suppress identical repeats for
+      // 2 min so a prolonged outage can't flood the ring -- and report the count.
+      uint8_t r = info.wifi_sta_disconnected.reason;
+      static uint8_t lastR = 255; static uint32_t lastMs = 0; static uint16_t supp = 0;
+      uint32_t now = millis();
+      if (r != lastR || (now - lastMs) > 120000UL) {
+        if (supp) logLine("WiFi DISCONNECT: reason %u (%s) [+%u more suppressed]", r, wifiReason(r), supp);
+        else      logLine("WiFi DISCONNECT: reason %u (%s)", r, wifiReason(r));
+        lastR = r; lastMs = now; supp = 0;
+      } else if (supp < 60000) supp++;
+      break; }
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+      logLine("WiFi lost IP");
+      break;
+    default: break;
+  }
+}
+
+// Why the last boot happened -- brownout / watchdog / panic are the ones that
+// would silently make it "go unusable", so surface them at boot.
+static const char* resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "PANIC/exception";
+    case ESP_RST_INT_WDT:   return "interrupt-watchdog";
+    case ESP_RST_TASK_WDT:  return "TASK-WATCHDOG";
+    case ESP_RST_WDT:       return "other-watchdog";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep";
+    case ESP_RST_EXT:       return "external-pin";
+    default:                return "unknown";
+  }
+}
+
+// NTP sync notification (initial + each periodic re-sync).
+void onNtpSync(struct timeval* tv) {
+  logLine("NTP sync: clock updated");
 }
 
 // ----- time sync state -----
@@ -628,6 +703,13 @@ void recordSample() {
   histHead = (histHead + 1) % HIST_N;
   if (histCount < HIST_N) histCount++;
   g_drain = computeDrain();     // refresh once per sample, not per HTTP poll
+
+  // Board-health warning: log if free heap crosses below a floor (a leak or
+  // memory pressure would show here) -- latched so it fires once per crossing.
+  static bool heapWarned = false;
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (!heapWarned && freeHeap < 40000)      { logLine("WARNING: low heap %lu bytes", (unsigned long)freeHeap); heapWarned = true; }
+  else if (heapWarned && freeHeap > 60000)  { logLine("heap recovered (%lu bytes)", (unsigned long)freeHeap); heapWarned = false; }
 }
 
 void saveHistory() {
@@ -1889,6 +1971,12 @@ void setup() {
   Serial.printf("Loaded %d prior start events from flash.\n", g_startCount);
   g_dashLen = strlen_P(DASH_HTML);
 
+  setenv("TZ", TZ_INFO, 1); tzset();               // local time for logs even before NTP replies
+  sntp_set_time_sync_notification_cb(onNtpSync);   // log each NTP sync
+  WiFi.onEvent(onWiFiEvent);                        // verbose WiFi diagnostics -> event log
+  logLine("boot: fw %s, CPU %u MHz, reset=%s",
+          FW_VERSION, (unsigned)getCpuFrequencyMhz(), resetReasonName());
+
   Serial.printf("Connecting to WiFi '%s' ", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
@@ -1898,7 +1986,6 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(400); Serial.print("."); }
   Serial.println();
 
-  logLine("boot: fw %s, CPU %u MHz", FW_VERSION, (unsigned)getCpuFrequencyMhz());
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("WiFi OK in %lu ms. IP = %s   RSSI = %d dBm\n",
                   (unsigned long)(millis() - t0), WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
@@ -1906,7 +1993,6 @@ void setup() {
       Serial.printf("Reachable at: http://%s.local/  or  http://%s/\n", HOSTNAME, WiFi.localIP().toString().c_str()); }
     syncTimeNow();   // kick off NTP now that STA is up
     Serial.printf("NTP sync requested (%s / %s)\n", NTP_SERVER1, NTP_SERVER2);
-    logLine("WiFi up: %s @ %d dBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
   } else {
     startAP();   // boot-time failure -> AP immediately (no NTP in AP mode)
   }

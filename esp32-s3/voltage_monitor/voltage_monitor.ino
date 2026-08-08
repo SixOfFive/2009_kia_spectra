@@ -62,7 +62,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.14";            // 4.14 = verbose logs (WiFi/NTP/reset/heap) + debounced disconnect spam
+const char* FW_VERSION = "4.16";            // 4.16 = min/max lines on ALL graphs; engine on/off + 1000-line PSRAM log ring
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -237,9 +237,9 @@ DrainFit g_drain = {false, 0, 0, 0, 0, -1, 0};   // refreshed once per history s
 // A fixed ring of the most recent lines -- can't grow, so it can't fill RAM or
 // the drive. Viewable at /logs (auto-refreshing page) and /logtext (raw). Written
 // from both the loop and the safety task, so the ring update is under a spinlock.
-static const int LOG_LINES = 120;
+static const int LOG_LINES = 1000;          // capacity; rarely full (events are sparse + debounced)
 static const int LOG_LEN   = 108;
-static char g_log[LOG_LINES][LOG_LEN];
+static char (*g_log)[LOG_LEN] = nullptr;    // ring in PSRAM (8 MB, like the history buffer) -- no DRAM cost
 static int  g_logHead = 0, g_logCount = 0;
 static portMUX_TYPE g_logMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -257,9 +257,11 @@ void logLine(const char* fmt, ...) {
     snprintf(line, sizeof(line), "+%lus %s", (unsigned long)(millis() / 1000), msg);
   }
   portENTER_CRITICAL(&g_logMux);
-  strncpy(g_log[g_logHead], line, LOG_LEN - 1); g_log[g_logHead][LOG_LEN - 1] = 0;
-  g_logHead = (g_logHead + 1) % LOG_LINES;
-  if (g_logCount < LOG_LINES) g_logCount++;
+  if (g_log) {
+    strncpy(g_log[g_logHead], line, LOG_LEN - 1); g_log[g_logHead][LOG_LEN - 1] = 0;
+    g_logHead = (g_logHead + 1) % LOG_LINES;
+    if (g_logCount < LOG_LINES) g_logCount++;
+  }
   portEXIT_CRITICAL(&g_logMux);
   Serial.println(line);                 // keep the USB console too
 }
@@ -374,6 +376,8 @@ uint32_t  g_as_cool  = AS_DEF_COOL_S;      // cooldown seconds       NVS "as_coo
 uint32_t  g_lowSince    = 0;               // millis() when V first went below threshold (0 = not low)
 uint32_t  g_lastStartMs = 0;               // millis() of the last auto-start this session
 uint32_t  g_lastStartTs = 0;               // epoch of the last auto-start  NVS "as_last"
+uint32_t  g_lastRunTs   = 0;               // epoch the engine was last seen RUNNING (charging),
+                                           // whoever started it -- key/FOB/board.  NVS "last_run"
 float     g_lastV       = 0.0f;            // most recent voltage reading (owned by the safety task)
 float     g_lastTemp    = 0.0f;            // most recent chip temp C (owned by the safety task)
 
@@ -856,6 +860,21 @@ void evalAutoStart(float v) {
   if (valid && v < AS_ALT_V) { if (g_parkS < 1000000UL) g_parkS += dt; }
   else                         g_parkS = 0;
 
+  // Engine on/off from voltage -- ground truth regardless of who started it (key,
+  // FOB, or the board). Alternator charging (>= AS_ALT_V) == running. Log both
+  // edges and remember the last run, so "Last charge" is real even when the board
+  // never issued a start. 0.3 V hysteresis so it can't chatter at the threshold.
+  static bool engRunning = false;
+  bool nowRun = engRunning ? (v >= AS_ALT_V - 0.3f) : (valid && v >= AS_ALT_V);
+  if (nowRun && !engRunning) {
+    g_lastRunTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
+    if (g_lastRunTs) prefs.putUInt("last_run", g_lastRunTs);
+    logLine("ENGINE ON: alternator charging at %.2f V", v);
+  } else if (!nowRun && engRunning) {
+    logLine("ENGINE OFF: charging ended at %.2f V", v);
+  }
+  engRunning = nowRun;
+
   // Re-arm hysteresis. Without this, a battery that recovers to just above the
   // trigger re-fires every cooldown, forever, until the tank is empty.
   if (valid && v >= (g_as_volts + AS_REARM_MARGIN)) { if (g_rearmS < 1000000UL) g_rearmS += dt; }
@@ -1215,8 +1234,10 @@ the engine clearly isn't catching and it latches off until you clear it.
 <div class="card"><div class="k">Fail streak</div><div class="v"><span id="asfail">--</span></div></div>
 <div class="card"><div class="k">Lockout</div><div class="v"><span id="aslock">--</span></div></div>
 <div class="card"><div class="k">Starts logged</div><div class="v"><span id="asn">--</span></div></div>
-<div class="card"><div class="k">Last start</div><div class="v" style="font-size:13px" id="aslast">--</div></div>
+<div class="card"><div class="k">Last start (cmd)</div><div class="v" style="font-size:13px" id="aslast">--</div></div>
 <div class="card"><div class="k">Since last start</div><div class="v"><span id="assince">--</span></div></div>
+<div class="card"><div class="k">Last charge (ran)</div><div class="v" style="font-size:13px" id="lastrun">--</div></div>
+<div class="card"><div class="k">Since last charge</div><div class="v"><span id="runsince">--</span></div></div>
 </div>
 </div>
 <div class="wrap" style="padding-top:0">
@@ -1290,9 +1311,9 @@ if(!rows.length)return;
 TS=rows.map(function(r){return r[0]});
 for(var col=0;col<10;col++){(function(col){
   var data=rows.map(function(r){return r[col+1]});           // data cols 1..10
-  var lo=Math.min.apply(null,data),hi=Math.max.apply(null,data);if(hi-lo<1e-6){hi+=1;lo-=1}
-  var mn=lo,mx=hi;                                           // true data extremes (before padding)
-  var mmx=(col==0||col==1||col==6||col==7||col==8||col==9);  // graphs that show dashed min/max lines
+  var mn=Math.min.apply(null,data),mx=Math.max.apply(null,data);  // true data extremes (even if flat)
+  var lo=mn,hi=mx;if(hi-lo<1e-6){hi+=1;lo-=1}
+  var mmx=true;                                              // dashed min/max lines on ALL graphs
   if(col==7||col==8){lo=0;hi=Math.max(10,hi)}                // CPU %: anchor at 0
   if(col==9){lo=Math.min(0,lo);hi=Math.max(0,hi);if(hi-lo<1e-6){hi+=1;lo-=1}}  // drain: keep 0 in view
   if(mmx){var pad=Math.max((hi-lo)*0.15,0.02);lo-=pad;hi+=pad}  // headroom so the min/max lines sit inside the plot
@@ -1379,6 +1400,8 @@ $("aslock").style.color=d.as_lock?"#f85149":"#3fb950";
 $("asn").textContent=d.as_n;
 $("aslast").textContent=(d.as_last>1700000000)?new Date(d.as_last*1000).toLocaleString():"never";
 $("assince").textContent=(d.as_last>1700000000&&d.epoch>d.as_last)?(fmtUp(d.epoch-d.as_last)+" ago"):"--";
+$("lastrun").textContent=(d.last_run>1700000000)?new Date(d.last_run*1000).toLocaleString():"never";
+$("runsince").textContent=(d.last_run>1700000000&&d.epoch>d.last_run)?(fmtUp(d.epoch-d.last_run)+" ago"):"--";
 var af=document.activeElement?document.activeElement.id:"";
 if(af!="asv")$("asv").value=(d.as_volts||0).toFixed(1);
 if(af!="ash")$("ash").value=d.as_hold;
@@ -1475,7 +1498,7 @@ void handleJson() {
     "\"as_state\":\"%s\",\"as_low_s\":%lu,\"as_cool_s\":%lu,\"as_n\":%d,"
     "\"as_lock\":%s,\"as_fails\":%u,\"as_park_s\":%lu,\"as_park_need\":%lu,\"as_f24\":%u,"
     "\"as_max24\":%d,\"as_eta_s\":%ld,\"cpu0\":%.1f,\"cpu1\":%.1f,"
-    "\"net_in\":%lu,\"net_out\":%lu,\"as_last\":%lu,"
+    "\"net_in\":%lu,\"net_out\":%lu,\"as_last\":%lu,\"last_run\":%lu,"
     "\"drain_ok\":%s,\"drain_mvph\":%.2f,\"drain_r2\":%.3f,\"drain_n\":%d,"
     "\"drain_win_s\":%lu,\"drain_days\":%.2f,\"drain_mvpc\":%.1f}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
@@ -1494,7 +1517,7 @@ void handleJson() {
     (unsigned long)g_parkS, (unsigned long)AS_PARK_S, g_fires24,
     g_as_max24, autoStartEtaS(v), g_cpu0, g_cpu1,
     (unsigned long)g_in_total, (unsigned long)g_out_total,
-    (unsigned long)g_lastStartTs,
+    (unsigned long)g_lastStartTs, (unsigned long)g_lastRunTs,
     g_drain.ok ? "true" : "false", g_drain.mvph, g_drain.r2, g_drain.n,
     (unsigned long)g_drain.win_s, g_drain.days, g_drain.mv_per_c);
   g_out_total += strlen(json);
@@ -1942,6 +1965,7 @@ void setup() {
   g_as_hold     = prefs.getUInt("as_hold", AS_DEF_HOLD_S);
   g_as_cool     = prefs.getUInt("as_cool", AS_DEF_COOL_S);
   g_lastStartTs = prefs.getUInt("as_last", 0);
+  g_lastRunTs   = prefs.getUInt("last_run", 0);
   g_asLock      = prefs.getBool("as_lock", false);
   g_asFails     = prefs.getUChar("as_fails", 0);
   g_as_max24    = prefs.getInt("as_max24", AS_DEF_MAX24);
@@ -1965,6 +1989,9 @@ void setup() {
   hist = (Sample*) ps_malloc(sizeof(Sample) * HIST_N);   // history lives in PSRAM
   Serial.printf("History buffer: %u bytes in %s\n", (unsigned)(sizeof(Sample) * HIST_N),
                 hist ? "PSRAM" : "FAILED");
+  g_log = (char(*)[LOG_LEN]) ps_malloc((size_t)LOG_LINES * LOG_LEN);   // event-log ring in PSRAM
+  Serial.printf("Event log: %d lines (%u bytes) in %s\n", LOG_LINES,
+                (unsigned)((size_t)LOG_LINES * LOG_LEN), g_log ? "PSRAM" : "FAILED");
   loadHistory();
   Serial.printf("Loaded %d prior samples from flash.\n", histCount);
   loadStarts();

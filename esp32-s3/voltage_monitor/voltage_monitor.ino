@@ -59,7 +59,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.9";             // 4.9 = safety task (sampling+auto-start off-loop) + task watchdog
+const char* FW_VERSION = "4.10";            // 4.10 = /powerup endpoint (WiFi PS off + CPU 240 MHz, one-shot)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -1083,7 +1083,7 @@ the engine clearly isn't catching and it latches off until you clear it.
 <div style="margin-top:10px"><button class="tx" id="asclear">Clear log</button></div>
 </div>
 </div>
-<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span> &middot; <a href="/update">update</a> &middot; <a href="#" id="rebootbtn">reboot</a></footer>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span> &middot; <a href="/update">update</a> &middot; <a href="#" id="powerbtn">power-up</a> &middot; <a href="#" id="rebootbtn">reboot</a></footer>
 <script>
 function $(i){return document.getElementById(i)}
 function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
@@ -1295,6 +1295,11 @@ if(!confirm("Reboot the board now?\n\nIt drops off WiFi for a few seconds, then 
 $("dot").style.background="#d29922";$("stxt").textContent="rebooting...";
 fetch("/reboot",{method:"POST"}).catch(function(){});   // connection drops as it restarts -- expected
 setTimeout(poll,9000);});
+$("powerbtn").addEventListener("click",function(e){e.preventDefault();
+if(!confirm("Power-up mode?\n\nDisables WiFi power-save and sets the CPU to 240 MHz (both persist across reboot). Snappier + more reliable link, at a bit more current draw."))return;
+fetch("/powerup",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+$("pwrmsg").textContent="power-up: CPU "+d.cpu_mhz+" MHz, WiFi PS "+(d.wifi_ps?"on":"off");poll();})
+.catch(function(){$("pwrmsg").textContent="power-up request error"})});
 setupHover();setInterval(poll,2000);setInterval(loadHistory,30000);setInterval(loadStarts,15000);
 poll();loadHistory();loadStarts();
 </script></body></html>
@@ -1568,6 +1573,27 @@ void handleWifiPs() {
   Serial.printf("WiFi power-save %s\n", WiFi.getSleep() ? "ON" : "OFF");
 }
 
+// POST /powerup -- one-shot "max performance": WiFi power-save OFF + CPU 240 MHz,
+// both persisted to NVS. Same net effect as /wifips?on=0 then /cpu?mhz=240, but
+// parameterless so it can be fired automatically (like /reboot). Trades a bit
+// of current draw for lowest latency + fastest response.
+void handlePowerup() {
+  trackReq();
+  WiFi.setSleep(false);                          // radio always on -- lowest latency
+  g_wifi_ps = WiFi.getSleep();
+  prefs.putBool("wifi_ps", g_wifi_ps);
+  setCpuFrequencyMhz(240);                        // max clock
+  g_cpu_mhz = getCpuFrequencyMhz();
+  prefs.putUInt("cpu_mhz", g_cpu_mhz);
+  char j[96];
+  snprintf(j, sizeof(j), "{\"ok\":true,\"cpu_mhz\":%u,\"wifi_ps\":%s}",
+           (unsigned)g_cpu_mhz, g_wifi_ps ? "true" : "false");
+  g_out_total += strlen(j);
+  server.send(200, "application/json", j);
+  Serial.printf("POWERUP: CPU %u MHz, WiFi power-save %s\n",
+                (unsigned)g_cpu_mhz, g_wifi_ps ? "ON" : "OFF");
+}
+
 // POST /autostart?en=0|1&volts=12.2&hold=60&cool=7200
 // Any subset of params. Arming (en=1) is what makes the car able to start
 // itself; it ships disabled and the setting persists in NVS.
@@ -1801,6 +1827,7 @@ void setup() {
   server.on("/rftune", HTTP_POST, handleRfTune);
   server.on("/cpu", HTTP_POST, handleCpu);
   server.on("/wifips", HTTP_POST, handleWifiPs);
+  server.on("/powerup", HTTP_POST, handlePowerup);
   server.on("/autostart", HTTP_POST, handleAutoStart);
   server.on("/starts", HTTP_GET, handleStarts);
   server.on("/starts", HTTP_POST, handleStartsClear);

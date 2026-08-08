@@ -13,8 +13,9 @@ enough enclosure + wiring to live behind the OBD-II port. **No Pi, no
 display, no MQTT** in the shipped v1 build (see "v2 — optional
 telematics" below).
 
-**Status (2026-08-07): remote start + stop verified working** on the car
-(firmware 4.9). Confirmed end-to-end via the OBD-II battery tap — a board-fired
+**Status (2026-08-08): remote start + stop verified working** on the car
+(firmware 4.10; `/powerup` one-shot sets max CPU + Wi-Fi power-save off).
+Confirmed end-to-end via the OBD-II battery tap — a board-fired
 Start produces the same crank-dip → 14.3 V charging signature as the real FOB.
 Low-voltage **auto-start is armed** on the installed unit (threshold + hold are
 user-settable); the dashboard shows a live **ETA to the next auto-start** and a

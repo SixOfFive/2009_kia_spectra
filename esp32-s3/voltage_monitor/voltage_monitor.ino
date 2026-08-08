@@ -23,6 +23,7 @@
 #include <SPI.h>
 #include <time.h>
 #include <Preferences.h>   // NVS-backed persistence for CPU clock + WiFi power-save
+#include "esp_task_wdt.h"   // task watchdog -- auto-reboot if the loop or safety task stalls
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <XPT2046_Touchscreen.h>
@@ -58,7 +59,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.8";             // 4.8 = min/max lines on temp, RSSI, both CPU cores, drain (like voltage)
+const char* FW_VERSION = "4.9";             // 4.9 = safety task (sampling+auto-start off-loop) + task watchdog
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -263,7 +264,14 @@ uint32_t  g_as_cool  = AS_DEF_COOL_S;      // cooldown seconds       NVS "as_coo
 uint32_t  g_lowSince    = 0;               // millis() when V first went below threshold (0 = not low)
 uint32_t  g_lastStartMs = 0;               // millis() of the last auto-start this session
 uint32_t  g_lastStartTs = 0;               // epoch of the last auto-start  NVS "as_last"
-float     g_lastV       = 0.0f;            // most recent voltage reading
+float     g_lastV       = 0.0f;            // most recent voltage reading (owned by the safety task)
+float     g_lastTemp    = 0.0f;            // most recent chip temp C (owned by the safety task)
+
+// Safety task + watchdog (definitions in setup / after evalAutoStart). Declared
+// here so evalAutoStart() and handleTransmit() can see g_rfMutex.
+TaskHandle_t      g_safetyTask   = nullptr;
+SemaphoreHandle_t g_rfMutex      = nullptr;
+const uint32_t    WDT_TIMEOUT_MS = 30000;  // reboot if a watched task stalls this long
 
 // Extra restraint state. These stop the three ways an automatic starter
 // misbehaves: firing while you're driving, firing over and over on a battery
@@ -543,7 +551,7 @@ void recordSample() {
   Sample s;
   s.ts      = timeIsValid() ? (uint32_t)time(nullptr) : 0;
   s.vbatt   = readBatteryVolts();
-  s.temp    = temperatureRead();
+  s.temp    = g_lastTemp;            // refreshed by the safety task just before this call
   s.heap_kb = (uint16_t)(ESP.getFreeHeap() / 1024);
   s.disk_kb = (uint16_t)(LittleFS.usedBytes() / 1024);
   s.net_in  = g_in_total  - lastInSnap;   lastInSnap  = g_in_total;
@@ -774,11 +782,15 @@ void evalAutoStart(float v) {
   if (autoStartCooldownLeft() > 0) return;              // too soon after the last one
 
   // ---- every guard passed: fire the starter ----
+  // Serialize with any manual /transmit on the loop task: the CC1101 SPI and the
+  // start log must never be touched by both tasks at once (prevents a double-fire).
+  xSemaphoreTake(g_rfMutex, portMAX_DELAY);
   bool sent = radio.transmitButtonWakeup(COMPUSTAR_START, RF_WAKEUP_MS,
                                          RF_TRAIN_CELLS, RF_START_DATAREPS,
                                          RF_START_BURSTS, RF_GUARD_MS,
                                          RF_START_PKT_GAP_MS, RF_TAIL_CARRIER_MS);
   int idx = recordStart(v, 0, sent);
+  xSemaphoreGive(g_rfMutex);
   g_lastStartMs = now;
   g_lastStartTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
   prefs.putUInt("as_last", g_lastStartTs);
@@ -789,6 +801,28 @@ void evalAutoStart(float v) {
   Serial.printf("*** AUTO-START FIRED at %.2f V (tx %s) -- cooldown %lu s, fire %u today (cap %s) ***\n",
                 v, sent ? "ok" : "FAILED", (unsigned long)g_as_cool, g_fires24,
                 g_as_max24 > 0 ? String(g_as_max24).c_str() : "none");
+}
+
+// ---------- safety task + watchdog ----------
+// The battery sampling and the low-voltage auto-start decision run in their OWN
+// FreeRTOS task on core 0, independent of the loop() on core 1 that services
+// WiFi/HTTP/SNMP. A weak-signal WiFi reassociation (or any HTTP stall) can no
+// longer starve the safety check -- the whole reason the board is in the car.
+// This task OWNS the ADC (readBatteryVolts): everything else reads the cached
+// g_lastV, so there is no cross-core ADC contention. RF transmits are serialized
+// with the loop's manual /transmit via g_rfMutex. (Globals declared near g_lastV.)
+void safetyTaskFn(void*) {
+  esp_task_wdt_add(nullptr);               // this task is watched too
+  uint32_t lastSample = 0, lastEval = 0;
+  for (;;) {
+    esp_task_wdt_reset();
+    uint32_t now = millis();
+    readBatteryVolts();                    // ADC owner -> refreshes g_lastV / g_last_mv
+    g_lastTemp = temperatureRead();        // temp-sensor owner -> refreshes g_lastTemp
+    if (now - lastEval   >= 1000)      { lastEval   = now; evalAutoStart(g_lastV); }
+    if (now - lastSample >= SAMPLE_MS) { lastSample = now; recordSample(); }
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
 }
 
 // ---------- SNMP OID table ----------
@@ -805,7 +839,7 @@ static void oidIp(SnmpValue& v)       { v.type = SNMP_OCTET;     v.s = apMode ? 
 static void oidUptime(SnmpValue& v)   { v.type = SNMP_TIMETICKS; v.u = millis() / 10; }
 static void oidVbattMv(SnmpValue& v)  { v.type = SNMP_GAUGE32;   v.u = (uint32_t)(g_lastV * 1000.0f + 0.5f); }
 static void oidAdcMv(SnmpValue& v)    { v.type = SNMP_GAUGE32;   v.u = (uint32_t)g_last_mv; }
-static void oidTempDc(SnmpValue& v)   { v.type = SNMP_INT;       v.i = (int32_t)(temperatureRead() * 10.0f); }
+static void oidTempDc(SnmpValue& v)   { v.type = SNMP_INT;       v.i = (int32_t)(g_lastTemp * 10.0f); }
 static void oidVstatus(SnmpValue& v)  { v.type = SNMP_OCTET;     v.s = voltStatus(g_lastV); }
 static void oidRssi(SnmpValue& v)     { v.type = SNMP_INT;       v.i = apMode ? 0 : (int32_t)WiFi.RSSI(); }
 static void oidHeapFree(SnmpValue& v) { v.type = SNMP_GAUGE32;   v.u = ESP.getFreeHeap(); }
@@ -1049,7 +1083,7 @@ the engine clearly isn't catching and it latches off until you clear it.
 <div style="margin-top:10px"><button class="tx" id="asclear">Clear log</button></div>
 </div>
 </div>
-<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span> &middot; <a href="/update">update</a></footer>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span> &middot; <a href="/update">update</a> &middot; <a href="#" id="rebootbtn">reboot</a></footer>
 <script>
 function $(i){return document.getElementById(i)}
 function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
@@ -1256,6 +1290,11 @@ $("asclear").addEventListener("click",function(){
 if(!confirm("Clear the entire start history?"))return;
 fetch("/starts",{method:"POST"}).then(function(){loadStarts();$("asmsg").textContent="start log cleared"})
 .catch(function(e){$("asmsg").textContent="clear error"})});
+$("rebootbtn").addEventListener("click",function(e){e.preventDefault();
+if(!confirm("Reboot the board now?\n\nIt drops off WiFi for a few seconds, then the dashboard reconnects. Auto-start protection resumes on boot."))return;
+$("dot").style.background="#d29922";$("stxt").textContent="rebooting...";
+fetch("/reboot",{method:"POST"}).catch(function(){});   // connection drops as it restarts -- expected
+setTimeout(poll,9000);});
 setupHover();setInterval(poll,2000);setInterval(loadHistory,30000);setInterval(loadStarts,15000);
 poll();loadHistory();loadStarts();
 </script></body></html>
@@ -1271,8 +1310,8 @@ void handleDash() {
 
 void handleJson() {
   trackReq();
-  float v  = readBatteryVolts();
-  float tC = temperatureRead();
+  float v  = g_lastV;                // cached by the safety task (it owns the ADC)
+  float tC = g_lastTemp;             // cached by the safety task (it owns the temp sensor)
   String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   int    rssi = apMode ? 0 : (int)WiFi.RSSI();
   char json[1450];
@@ -1370,6 +1409,7 @@ void handleTransmit() {
   // START needs the wake-up carrier (duty-cycled receiver); lock/unlock/trunk
   // are short taps the receiver catches without it.
   bool sent;
+  xSemaphoreTake(g_rfMutex, portMAX_DELAY);   // serialize with the safety task's auto-fire
   if (btn == "START") {
     sent = radio.transmitButtonWakeup(pattern, RF_WAKEUP_MS, RF_TRAIN_CELLS,
                                       RF_START_DATAREPS, RF_START_BURSTS, RF_GUARD_MS,
@@ -1378,6 +1418,7 @@ void handleTransmit() {
   } else {
     sent = radio.transmitButton(pattern, RF_REPEATS, RF_GUARD_MS);
   }
+  xSemaphoreGive(g_rfMutex);
   if (!sent) { fail(500, "bad pattern or TX failed"); return; }
 
   char j[128];
@@ -1746,6 +1787,7 @@ void setup() {
         Serial.printf("OTA start: %s\n", u.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
       } else if (u.status == UPLOAD_FILE_WRITE) {
+        esp_task_wdt_reset();   // a 1.1 MB OTA over weak WiFi can span many seconds; keep the WDT fed
         if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
       } else if (u.status == UPLOAD_FILE_END) {
         if (Update.end(true)) Serial.printf("OTA done: %u bytes, rebooting\n", (unsigned)u.totalSize);
@@ -1762,6 +1804,12 @@ void setup() {
   server.on("/autostart", HTTP_POST, handleAutoStart);
   server.on("/starts", HTTP_GET, handleStarts);
   server.on("/starts", HTTP_POST, handleStartsClear);
+  server.on("/reboot", HTTP_POST, []() {          // manual reboot from the dashboard
+    trackReq();
+    server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
+    delay(300);
+    ESP.restart();
+  });
   server.onNotFound(handleDash);
   server.begin();
   Serial.println("HTTP up. / dashboard, /json data, /history CSV, /transmit RF.");
@@ -1793,8 +1841,19 @@ void setup() {
       Serial.printf("SNMP failed to bind udp/%u\n", SNMP_PORT);
   }
 
+  g_lastTemp = temperatureRead();    // seed the caches before the safety task exists
   recordSample();                    // seed one sample now
   updateLed(readBatteryVolts());     // set the LED immediately
+
+  // Watchdog + safety task. Create the RF mutex first (both fire paths need it),
+  // arm the task watchdog (reboot if the loop or the safety task stalls > 30 s),
+  // subscribe the loop task, then launch the safety task on core 0 (loop is core 1).
+  g_rfMutex = xSemaphoreCreateMutex();
+  esp_task_wdt_config_t wdtc = { .timeout_ms = WDT_TIMEOUT_MS, .idle_core_mask = 0, .trigger_panic = true };
+  if (esp_task_wdt_init(&wdtc) == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdtc);  // Arduino may have pre-inited it
+  esp_task_wdt_add(nullptr);         // watch loopTask
+  xTaskCreatePinnedToCore(safetyTaskFn, "safety", 8192, nullptr, 3, &g_safetyTask, 0);
+  Serial.println("safety task started (core 0); task watchdog armed @30s");
 
   if (DISPLAY_ENABLED) {
     pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);    // backlight on
@@ -1812,6 +1871,7 @@ void setup() {
 uint32_t lastSample = 0, lastSave = 0, lastPrint = 0, downSince = 0, lastDisp = 0;
 uint32_t lastApRetry = 0;      // millis() of the last AP->STA reconnect attempt
 void loop() {
+  esp_task_wdt_reset();                            // loop serviced a pass -> healthy
   if (apMode) dnsServer.processNextRequest();
   server.handleClient();
   if (SNMP_ENABLED) snmp.poll();
@@ -1843,6 +1903,7 @@ void loop() {
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < AP_RETRY_WAIT_MS) {
       server.handleClient();                       // stay responsive while waiting
+      esp_task_wdt_reset();                         // legit retry -- don't let the WDT trip
       delay(100);
     }
     if (WiFi.status() == WL_CONNECTED) {
@@ -1879,16 +1940,17 @@ void loop() {
     }
   }
 
-  if (now - lastSample >= SAMPLE_MS) { lastSample = now; recordSample(); }
-  if (now - lastSave   >= SAVE_MS)   { lastSave   = now; saveHistory(); }
-  if (now - lastPrint  >= 2000) {
+  // Sampling + the low-voltage auto-start decision now run in safetyTaskFn on
+  // core 0, so a WiFi/HTTP stall in this loop can no longer starve them. The loop
+  // keeps history persistence, the LED, CPU-load sampling, and the heartbeat.
+  if (now - lastSave  >= SAVE_MS) { lastSave = now; saveHistory(); }
+  if (now - lastPrint >= 2000) {
     lastPrint = now;
-    float v = readBatteryVolts();
+    float v = g_lastV;         // sampled by the safety task (ADC owner)
     updateLed(v);
     sampleCpuLoad();           // per-core utilisation over the last 2 s
-    evalAutoStart(v);          // low-voltage auto-start (no-op unless armed)
     Serial.printf("Vbatt=%6.2f V  temp=%4.1f C  heap=%uKB  disk=%uKB  samples=%d  %s\n",
-                  v, temperatureRead(), (unsigned)(ESP.getFreeHeap() / 1024),
+                  v, g_lastTemp, (unsigned)(ESP.getFreeHeap() / 1024),
                   (unsigned)(LittleFS.usedBytes() / 1024), histCount, apMode ? "[AP]" : "[STA]");
   }
 }

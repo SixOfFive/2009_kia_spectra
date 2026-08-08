@@ -24,6 +24,7 @@
 #include <time.h>
 #include <Preferences.h>   // NVS-backed persistence for CPU clock + WiFi power-save
 #include "esp_task_wdt.h"   // task watchdog -- auto-reboot if the loop or safety task stalls
+#include <stdarg.h>         // logLine() variadic formatting
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <XPT2046_Touchscreen.h>
@@ -59,7 +60,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.10";            // 4.10 = /powerup endpoint (WiFi PS off + CPU 240 MHz, one-shot)
+const char* FW_VERSION = "4.11";            // 4.11 = temp-compensated drain fit, since-last-start, rolling /logs viewer
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -219,13 +220,44 @@ const uint32_t DRAIN_GAP_S  = 600;     // a >10 min hole ends the window (board 
 
 struct DrainFit {
   bool     ok;
-  float    mvph;    // signed millivolts/hour; negative = discharging
-  float    r2;      // 0..1 fit quality
+  float    mvph;    // signed millivolts/hour; negative = discharging. Temperature-
+                    // compensated: the true depletion rate with the diurnal thermal
+                    // swing regressed out (falls back to raw slope if temp is flat).
+  float    r2;      // 0..1 fit quality (of the two-variable model)
   int      n;       // samples in the fit
   uint32_t win_s;   // span covered
   float    days;    // days until DRAIN_FLAT_V at this rate; <0 = n/a
+  float    mv_per_c;// temperature coefficient the fit found, mV/degC (diagnostic)
 };
-DrainFit g_drain = {false, 0, 0, 0, 0, -1};   // refreshed once per history sample
+DrainFit g_drain = {false, 0, 0, 0, 0, -1, 0};   // refreshed once per history sample
+
+// ---------- rolling event log (bounded RAM ring; never touches flash) ----------
+// A fixed ring of the most recent lines -- can't grow, so it can't fill RAM or
+// the drive. Viewable at /logs (auto-refreshing page) and /logtext (raw). Written
+// from both the loop and the safety task, so the ring update is under a spinlock.
+static const int LOG_LINES = 120;
+static const int LOG_LEN   = 108;
+static char g_log[LOG_LINES][LOG_LEN];
+static int  g_logHead = 0, g_logCount = 0;
+static portMUX_TYPE g_logMux = portMUX_INITIALIZER_UNLOCKED;
+
+void logLine(const char* fmt, ...) {
+  char msg[LOG_LEN];
+  va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
+  char line[LOG_LEN];
+  time_t tt = time(nullptr);
+  if (tt > 1700000000L) { struct tm* lt = localtime(&tt);
+    snprintf(line, sizeof(line), "%02d:%02d:%02d %s", lt->tm_hour, lt->tm_min, lt->tm_sec, msg);
+  } else {
+    snprintf(line, sizeof(line), "+%lus %s", (unsigned long)(millis() / 1000), msg);
+  }
+  portENTER_CRITICAL(&g_logMux);
+  strncpy(g_log[g_logHead], line, LOG_LEN - 1); g_log[g_logHead][LOG_LEN - 1] = 0;
+  g_logHead = (g_logHead + 1) % LOG_LINES;
+  if (g_logCount < LOG_LINES) g_logCount++;
+  portEXIT_CRITICAL(&g_logMux);
+  Serial.println(line);                 // keep the USB console too
+}
 
 // ----- time sync state -----
 uint32_t lastNtpSyncMs = 0;     // millis() of the last configTzTime() kick
@@ -495,29 +527,52 @@ DrainFit computeDrain() {
   f.n = n;
   if (n < DRAIN_MIN_N) return f;
 
-  // Pass 2 -- accumulate the regression sums over exactly that window.
-  double sx = 0, sy = 0, sxy = 0, sxx = 0, syy = 0;
+  // Pass 2 -- two-variable least squares: V = a*x + b*T + c, x = time (s),
+  // T = chip temperature. Temperature explains roughly half the parked voltage
+  // wobble (diurnal warming/cooling), so a plain V-vs-time slope is noisy. The a
+  // term here is the true discharge rate with that thermal swing regressed out;
+  // b is the temperature coefficient (mV/degC). Falls back to a plain V-vs-time
+  // fit when the window shows no temperature variation.
+  double sx = 0, sy = 0, st = 0, sxx = 0, stt = 0, sxt = 0, sxy = 0, sty = 0, syy = 0;
   int i = 0;
   for (int k = histCount - 1; k >= 0 && i < n; k--, i++) {
     Sample& s = hist[(oldest + k) % HIST_N];
-    // x in seconds, measured from the oldest sample in the window.
     double x = useTs ? (double)(s.ts - oldTs)
                      : (double)((n - 1 - i) * (SAMPLE_MS / 1000));
     double y = s.vbatt;
-    sx += x; sy += y; sxy += x * y; sxx += x * x; syy += y * y;
+    double T = s.temp;
+    sx += x; sy += y; st += T;
+    sxx += x * x; stt += T * T; sxt += x * T;
+    sxy += x * y; sty += T * y; syy += y * y;
   }
-  double den = (double)n * sxx - sx * sx;
-  if (den <= 0) return f;
-  double slope = ((double)n * sxy - sx * sy) / den;        // volts per second
-  double num   = (double)n * sxy - sx * sy;
-  double dd    = den * ((double)n * syy - sy * sy);
-  f.r2    = (dd > 0) ? (float)((num * num) / dd) : 0.0f;
-  f.mvph  = (float)(slope * 1000.0 * 3600.0);
-  f.n     = n;
-  f.win_s = (useTs && newTs > oldTs) ? (uint32_t)(newTs - oldTs)
-                                     : (uint32_t)((n - 1) * (SAMPLE_MS / 1000));
-  f.ok    = true;
-  if (slope < 0) {                                          // project time to flat
+  double N = (double)n;
+  double Sxx = sxx - sx * sx / N;      // centered cross-products
+  double Stt = stt - st * st / N;
+  double Sxt = sxt - sx * st / N;
+  double Sxy = sxy - sx * sy / N;
+  double Sty = sty - st * sy / N;
+  double Syy = syy - sy * sy / N;
+  if (Sxx <= 0 || Syy <= 0) return f;
+  double slope, ssr, tempCoef = 0.0;
+  double D = Sxx * Stt - Sxt * Sxt;
+  if (Stt > 1e-9 && D > 1e-9) {                 // temperature varies -> 2-var fit
+    slope    = (Sxy * Stt - Sty * Sxt) / D;     // V/s, thermal effect removed
+    tempCoef = (Sty * Sxx - Sxy * Sxt) / D;     // V/degC
+    ssr      = slope * Sxy + tempCoef * Sty;    // regression sum of squares
+  } else {                                       // flat temp -> plain V-vs-time
+    slope = Sxy / Sxx;
+    ssr   = slope * Sxy;
+  }
+  f.r2 = (float)(ssr / Syy);
+  if (f.r2 < 0) f.r2 = 0;
+  if (f.r2 > 1) f.r2 = 1;
+  f.mvph     = (float)(slope * 1000.0 * 3600.0);
+  f.mv_per_c = (float)(tempCoef * 1000.0);
+  f.n        = n;
+  f.win_s    = (useTs && newTs > oldTs) ? (uint32_t)(newTs - oldTs)
+                                        : (uint32_t)((n - 1) * (SAMPLE_MS / 1000));
+  f.ok       = true;
+  if (slope < 0) {                               // project time to flat at the true rate
     double perDay = -slope * 86400.0;
     if (perDay > 1e-9) f.days = (float)((vNow - DRAIN_FLAT_V) / perDay);
   }
@@ -647,6 +702,8 @@ int recordStart(float v, uint8_t src, bool ok) {
   g_startHead = (g_startHead + 1) % START_N;
   if (g_startCount < START_N) g_startCount++;
   saveStarts();                                 // write through -- don't risk losing it
+  logLine("ENGINE START (%s) at %.2f V, tx=%s",
+          src ? "manual" : "AUTO", v, ok ? "ok" : "FAILED");
   return idx;
 }
 
@@ -1074,6 +1131,7 @@ the engine clearly isn't catching and it latches off until you clear it.
 <div class="card"><div class="k">Lockout</div><div class="v"><span id="aslock">--</span></div></div>
 <div class="card"><div class="k">Starts logged</div><div class="v"><span id="asn">--</span></div></div>
 <div class="card"><div class="k">Last start</div><div class="v" style="font-size:13px" id="aslast">--</div></div>
+<div class="card"><div class="k">Since last start</div><div class="v"><span id="assince">--</span></div></div>
 </div>
 </div>
 <div class="wrap" style="padding-top:0">
@@ -1083,7 +1141,7 @@ the engine clearly isn't catching and it latches off until you clear it.
 <div style="margin-top:10px"><button class="tx" id="asclear">Clear log</button></div>
 </div>
 </div>
-<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span> &middot; <a href="/update">update</a> &middot; <a href="#" id="powerbtn">power-up</a> &middot; <a href="#" id="rebootbtn">reboot</a></footer>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span> &middot; <a href="/logs">logs</a> &middot; <a href="/update">update</a> &middot; <a href="#" id="powerbtn">power-up</a> &middot; <a href="#" id="rebootbtn">reboot</a></footer>
 <script>
 function $(i){return document.getElementById(i)}
 function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
@@ -1182,6 +1240,7 @@ if(!d.drain_ok){
   $("dproj").textContent=(d.drain_days>0)?(d.drain_days<1?(Math.round(d.drain_days*24)+" h"):(d.drain_days.toFixed(1)+" days")):"n/a";
   var trust=r2>=0.9?"solid":(r2>=0.6?"usable":"too noisy to trust yet");
   $("dmeta").textContent="fit r^2="+r2.toFixed(2)+" ("+trust+") | "+hrs.toFixed(1)+" h window | "+d.drain_n+" samples"
+    +((d.drain_mvpc!==undefined&&d.drain_mvpc!=0)?" | temp-comp "+d.drain_mvpc.toFixed(1)+" mV/degC":"")
     +(r2<0.6?" -- leave it sitting longer before comparing":"");
   $("dmeta").style.color=(r2<0.6)?"#d29922":"#8b949e";
 }
@@ -1234,6 +1293,7 @@ $("aslock").textContent=d.as_lock?"LOCKED":"no";
 $("aslock").style.color=d.as_lock?"#f85149":"#3fb950";
 $("asn").textContent=d.as_n;
 $("aslast").textContent=(d.as_last>1700000000)?new Date(d.as_last*1000).toLocaleString():"never";
+$("assince").textContent=(d.as_last>1700000000&&d.epoch>d.as_last)?(fmtUp(d.epoch-d.as_last)+" ago"):"--";
 var af=document.activeElement?document.activeElement.id:"";
 if(af!="asv")$("asv").value=(d.as_volts||0).toFixed(1);
 if(af!="ash")$("ash").value=d.as_hold;
@@ -1332,7 +1392,7 @@ void handleJson() {
     "\"as_max24\":%d,\"as_eta_s\":%ld,\"cpu0\":%.1f,\"cpu1\":%.1f,"
     "\"net_in\":%lu,\"net_out\":%lu,\"as_last\":%lu,"
     "\"drain_ok\":%s,\"drain_mvph\":%.2f,\"drain_r2\":%.3f,\"drain_n\":%d,"
-    "\"drain_win_s\":%lu,\"drain_days\":%.2f}",
+    "\"drain_win_s\":%lu,\"drain_days\":%.2f,\"drain_mvpc\":%.1f}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
@@ -1351,7 +1411,7 @@ void handleJson() {
     (unsigned long)g_in_total, (unsigned long)g_out_total,
     (unsigned long)g_lastStartTs,
     g_drain.ok ? "true" : "false", g_drain.mvph, g_drain.r2, g_drain.n,
-    (unsigned long)g_drain.win_s, g_drain.days);
+    (unsigned long)g_drain.win_s, g_drain.days, g_drain.mv_per_c);
   g_out_total += strlen(json);
   server.send(200, "application/json", json);
 }
@@ -1554,6 +1614,7 @@ void handleCpu() {
   g_out_total += strlen(j);
   server.send(200, "application/json", j);
   Serial.printf("CPU clock set to %u MHz (requested %ld)\n", (unsigned)getCpuFrequencyMhz(), mhz);
+  logLine("CPU clock -> %u MHz", (unsigned)getCpuFrequencyMhz());
 }
 
 // POST /wifips?on=0|1 -- enable/disable WiFi modem-sleep power saving.
@@ -1571,6 +1632,7 @@ void handleWifiPs() {
   g_out_total += strlen(j);
   server.send(200, "application/json", j);
   Serial.printf("WiFi power-save %s\n", WiFi.getSleep() ? "ON" : "OFF");
+  logLine("WiFi power-save %s", WiFi.getSleep() ? "ON" : "OFF");
 }
 
 // POST /powerup -- one-shot "max performance": WiFi power-save OFF + CPU 240 MHz,
@@ -1592,6 +1654,53 @@ void handlePowerup() {
   server.send(200, "application/json", j);
   Serial.printf("POWERUP: CPU %u MHz, WiFi power-save %s\n",
                 (unsigned)g_cpu_mhz, g_wifi_ps ? "ON" : "OFF");
+  logLine("POWERUP: CPU 240 MHz, WiFi power-save OFF");
+}
+
+// GET /logtext -- the rolling event log as plain text, oldest line first.
+void handleLogText() {
+  trackReq();
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/plain", "");
+  int cnt = g_logCount;
+  int start = (g_logCount < LOG_LINES) ? 0 : g_logHead;
+  String chunk; chunk.reserve(1600);
+  for (int k = 0; k < cnt; k++) {
+    chunk += g_log[(start + k) % LOG_LINES]; chunk += '\n';
+    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; }
+  }
+  if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
+  server.sendContent("");
+}
+
+// GET /logs -- a small self-contained viewer that auto-refreshes /logtext at a
+// user-settable interval (persisted per-browser in localStorage).
+void handleLogsPage() {
+  trackReq();
+  static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>vroom logs</title>
+<style>body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:12px}
+h1{font:600 15px system-ui;margin:0 0 8px}#bar{margin-bottom:8px;font:12px system-ui;color:#8b949e}
+select{background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:3px 6px}
+pre{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-word;max-height:82vh;overflow:auto;margin:0}
+a{color:#58a6ff;text-decoration:none}</style></head><body>
+<h1>&#9889; vroom event log</h1>
+<div id="bar">auto-refresh <select id="iv">
+<option value="0">off</option><option value="2">2s</option><option value="5">5s</option>
+<option value="10">10s</option><option value="30">30s</option><option value="60">60s</option></select>
+<span id="st"></span> &middot; <a href="/">dashboard</a> &middot; <a href="/logtext">raw</a></div>
+<pre id="log">loading&hellip;</pre>
+<script>
+var iv=document.getElementById("iv"),st=document.getElementById("st"),log=document.getElementById("log"),tm=null;
+function load(){fetch("/logtext",{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
+var atBottom=log.scrollTop+log.clientHeight>=log.scrollHeight-24;
+log.textContent=t||"(empty)";if(atBottom)log.scrollTop=log.scrollHeight;
+st.textContent="updated "+new Date().toLocaleTimeString();}).catch(function(){st.textContent="(unreachable)"})}
+function apply(){if(tm){clearInterval(tm);tm=null}var s=+iv.value;localStorage.vroomLogIv=s;if(s>0)tm=setInterval(load,s*1000)}
+iv.value=localStorage.vroomLogIv||"5";iv.addEventListener("change",apply);apply();load();
+</script></body></html>)HTML";
+  g_out_total += strlen_P(PAGE);
+  server.send_P(200, "text/html", PAGE);
 }
 
 // POST /autostart?en=0|1&volts=12.2&hold=60&cool=7200
@@ -1724,6 +1833,7 @@ void startAP() {
   Serial.println("---- starting fallback ACCESS POINT ----");
   Serial.printf("  Join WiFi \"%s\" %s, then browse http://192.168.4.1/\n",
                 AP_SSID, secured ? "(password set)" : "(OPEN)");
+  logLine("home WiFi lost >5 min -> fallback AP '%s' (192.168.4.1)", AP_SSID);
 }
 
 void setup() {
@@ -1785,6 +1895,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(400); Serial.print("."); }
   Serial.println();
 
+  logLine("boot: fw %s, CPU %u MHz", FW_VERSION, (unsigned)getCpuFrequencyMhz());
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("WiFi OK in %lu ms. IP = %s   RSSI = %d dBm\n",
                   (unsigned long)(millis() - t0), WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
@@ -1792,6 +1903,7 @@ void setup() {
       Serial.printf("Reachable at: http://%s.local/  or  http://%s/\n", HOSTNAME, WiFi.localIP().toString().c_str()); }
     syncTimeNow();   // kick off NTP now that STA is up
     Serial.printf("NTP sync requested (%s / %s)\n", NTP_SERVER1, NTP_SERVER2);
+    logLine("WiFi up: %s @ %d dBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
   } else {
     startAP();   // boot-time failure -> AP immediately (no NTP in AP mode)
   }
@@ -1828,11 +1940,14 @@ void setup() {
   server.on("/cpu", HTTP_POST, handleCpu);
   server.on("/wifips", HTTP_POST, handleWifiPs);
   server.on("/powerup", HTTP_POST, handlePowerup);
+  server.on("/logs", HTTP_GET, handleLogsPage);
+  server.on("/logtext", HTTP_GET, handleLogText);
   server.on("/autostart", HTTP_POST, handleAutoStart);
   server.on("/starts", HTTP_GET, handleStarts);
   server.on("/starts", HTTP_POST, handleStartsClear);
   server.on("/reboot", HTTP_POST, []() {          // manual reboot from the dashboard
     trackReq();
+    logLine("reboot requested via /reboot");
     server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
     delay(300);
     ESP.restart();
@@ -1944,6 +2059,7 @@ void loop() {
       syncTimeNow();
       Serial.printf("rejoined '%s' as %s - AP torn down\n",
                     WIFI_SSID, WiFi.localIP().toString().c_str());
+      logLine("WiFi rejoined home as %s (AP torn down)", WiFi.localIP().toString().c_str());
     } else {
       WiFi.mode(WIFI_AP);                          // give up for now; AP-only draws less
       Serial.println("home WiFi still unavailable; staying in AP mode");

@@ -14,13 +14,18 @@ display, no MQTT** in the shipped v1 build (see "v2 — optional
 telematics" below).
 
 **Status (2026-08-08): remote start + stop verified working** on the car
-(firmware 4.10; `/powerup` one-shot sets max CPU + Wi-Fi power-save off).
-Confirmed end-to-end via the OBD-II battery tap — a board-fired
+(firmware 4.20). Confirmed end-to-end via the OBD-II battery tap — a board-fired
 Start produces the same crank-dip → 14.3 V charging signature as the real FOB.
 Low-voltage **auto-start is armed** on the installed unit (threshold + hold are
 user-settable); the dashboard shows a live **ETA to the next auto-start** and a
 **battery-drain-rate graph**, both projected/plotted from the parked drain
-regression, plus min/max lines, uptime, and combined CPU load.
+regression, plus min/max lines on every graph, uptime, and combined CPU load.
+The dashboard is split into **lazy-loaded tabbed pages** (Main / WiFi-Net /
+Voltage / CPU / Mem-Disk / Log / Update) sharing cached CSS/JS, so a weak Wi-Fi
+link only fetches the tab in view. The **event log is persisted to flash**
+(rolling, survives reboots) and shown newest-first with pagination, and there's
+rich Wi-Fi telemetry (SSID/BSSID/channel/PHY/TX-power) plus a link-rate graph.
+`/powerup` one-shot sets max CPU + Wi-Fi power-save off.
 
 For the deployed unit, the sampling and low-voltage safety decision run in a
 **dedicated FreeRTOS task on a separate core** from the Wi-Fi/HTTP loop, guarded

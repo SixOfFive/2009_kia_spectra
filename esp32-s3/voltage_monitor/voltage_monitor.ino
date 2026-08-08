@@ -26,6 +26,7 @@
 #include "esp_task_wdt.h"   // task watchdog -- auto-reboot if the loop or safety task stalls
 #include "esp_system.h"     // esp_reset_reason() -- why the last boot happened
 #include "esp_sntp.h"       // NTP sync notification callback
+#include "esp_wifi.h"       // esp_wifi_set_protocol() -- force 802.11b for range/stability
 #include <stdarg.h>         // logLine() variadic formatting
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
@@ -62,7 +63,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.16";            // 4.16 = min/max lines on ALL graphs; engine on/off + 1000-line PSRAM log ring
+const char* FW_VERSION = "4.20";            // 4.20 = dashboard split into tabbed pages (WiFi/Volt/CPU/Mem/Log); WiFi link-rate graph; paginated newest-first log
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -211,6 +212,7 @@ struct Sample {
   uint8_t  cpu0;        // core 0 load %, averaged across the interval
   uint8_t  cpu1;        // core 1 load %, averaged across the interval
   int16_t  drain;       // battery drain rate at this sample, mV/h (signed; <0 = discharging, 0 = not fitted yet)
+  uint16_t link_mbps;   // WiFi link rate at this sample (nominal Mbps from the negotiated PHY; 0 if not associated)
 };
 
 // Battery-drain regression result. Declared up here with Sample because the
@@ -242,6 +244,12 @@ static const int LOG_LEN   = 108;
 static char (*g_log)[LOG_LEN] = nullptr;    // ring in PSRAM (8 MB, like the history buffer) -- no DRAM cost
 static int  g_logHead = 0, g_logCount = 0;
 static portMUX_TYPE g_logMux = portMUX_INITIALIZER_UNLOCKED;
+// Flash-persistence cursor. logLine() (called from BOTH cores) only bumps the
+// ring + g_logSeq under the spinlock; the loop drains new lines to LittleFS via
+// flushLogToFlash(), so all file I/O stays single-threaded on the loop core and
+// never runs inside the critical section.
+static volatile uint32_t g_logSeq = 0;          // total lines ever pushed (monotonic)
+static volatile uint32_t g_logPersistedSeq = 0; // how many have reached flash
 
 void logLine(const char* fmt, ...) {
   char msg[LOG_LEN];
@@ -261,6 +269,7 @@ void logLine(const char* fmt, ...) {
     strncpy(g_log[g_logHead], line, LOG_LEN - 1); g_log[g_logHead][LOG_LEN - 1] = 0;
     g_logHead = (g_logHead + 1) % LOG_LINES;
     if (g_logCount < LOG_LINES) g_logCount++;
+    g_logSeq++;                         // loop will persist anything past g_logPersistedSeq
   }
   portEXIT_CRITICAL(&g_logMux);
   Serial.println(line);                 // keep the USB console too
@@ -286,6 +295,44 @@ static const char* wifiReason(uint8_t r) {
   }
 }
 
+// Human name for the negotiated PHY mode (the closest thing to "what speed are
+// we linked at" -- 11b/g are single rates, HT20/40 are the 11n widths).
+static const char* phyModeName(wifi_phy_mode_t m) {
+  switch (m) {
+    case WIFI_PHY_MODE_LR:   return "LR";
+    case WIFI_PHY_MODE_11B:  return "11b";
+    case WIFI_PHY_MODE_11G:  return "11g";
+    case WIFI_PHY_MODE_HT20: return "11n-HT20";
+    case WIFI_PHY_MODE_HT40: return "11n-HT40";
+    case WIFI_PHY_MODE_HE20: return "11ax-HE20";
+    default: return "?";
+  }
+}
+
+// Negotiated PHY mode as a string, or "n/a" if not currently associated.
+static const char* staPhyMode() {
+  wifi_phy_mode_t pm;
+  if (WiFi.status() == WL_CONNECTED && esp_wifi_sta_get_negotiated_phymode(&pm) == ESP_OK)
+    return phyModeName(pm);
+  return "n/a";
+}
+
+// Nominal link rate (Mbps) for the negotiated PHY -- a graphable "speed": drops
+// when the AP downshifts us on a weak link. 0 when not associated.
+static uint16_t staLinkMbps() {
+  wifi_phy_mode_t pm;
+  if (WiFi.status() != WL_CONNECTED || esp_wifi_sta_get_negotiated_phymode(&pm) != ESP_OK) return 0;
+  switch (pm) {
+    case WIFI_PHY_MODE_11B:  return 11;
+    case WIFI_PHY_MODE_11G:  return 54;
+    case WIFI_PHY_MODE_HT20: return 72;
+    case WIFI_PHY_MODE_HT40: return 150;
+    case WIFI_PHY_MODE_HE20: return 143;
+    case WIFI_PHY_MODE_LR:   return 1;
+    default: return 0;
+  }
+}
+
 // Verbose WiFi diagnostics into the event log: association, IP, and -- most
 // usefully for the drop-out hunt -- the disconnect REASON code every time it
 // falls off. (Per-request / SNMP-poll traffic is deliberately NOT logged.)
@@ -295,7 +342,9 @@ void onWiFiEvent(WiFiEvent_t ev, WiFiEventInfo_t info) {
       logLine("WiFi assoc to AP (channel %d)", info.wifi_sta_connected.channel);
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      logLine("WiFi got IP %s @ %d dBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+      logLine("WiFi got IP %s @ %d dBm, ch %d, %s, SSID '%s'",
+              WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(),
+              WiFi.channel(), staPhyMode(), WiFi.SSID().c_str());
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
       // Debounce: the driver retries every few seconds while out of range, each
@@ -423,7 +472,6 @@ int       histCount = 0;                     // valid samples (<= HIST_N)
 int       histHead  = 0;                     // next write index
 uint32_t  g_in_total = 0, g_out_total = 0;   // cumulative HTTP byte counters
 uint32_t  lastInSnap = 0, lastOutSnap = 0;
-size_t    g_dashLen = 0;
 
 SPIClass  tftSPI(HSPI);
 Adafruit_ILI9341 tft(&tftSPI, TFT_DC, TFT_CS, TFT_RST);
@@ -702,6 +750,7 @@ void recordSample() {
   if (mv >  32000.0f) mv =  32000.0f;
   if (mv < -32000.0f) mv = -32000.0f;
   s.drain   = (int16_t)lroundf(mv);
+  s.link_mbps = staLinkMbps();
   g_cpuAcc0 = 0; g_cpuAcc1 = 0; g_cpuN = 0;      // start a fresh interval average
   hist[histHead] = s;
   histHead = (histHead + 1) % HIST_N;
@@ -720,7 +769,7 @@ void saveHistory() {
   if (!hist) return;
   File f = LittleFS.open("/history.bin", FILE_WRITE);
   if (!f) return;
-  uint32_t magic = 0x564F4C35;                 // "VOL5" (adds per-sample drain rate)
+  uint32_t magic = 0x564F4C36;                 // "VOL6" (adds per-sample WiFi link rate)
   f.write((uint8_t*)&magic, 4);
   f.write((uint8_t*)&histCount, 4);
   f.write((uint8_t*)&histHead, 4);
@@ -734,7 +783,7 @@ void loadHistory() {
   if (!f) return;
   uint32_t magic = 0;
   f.read((uint8_t*)&magic, 4);
-  if (magic == 0x564F4C35) {           // older formats are discarded (layout changed)
+  if (magic == 0x564F4C36) {           // older formats are discarded (layout changed)
     f.read((uint8_t*)&histCount, 4);
     f.read((uint8_t*)&histHead, 4);
     f.read((uint8_t*)hist, sizeof(Sample) * HIST_N);
@@ -770,6 +819,80 @@ void loadStarts() {
         g_startHead  < 0 || g_startHead  >= START_N) { g_startCount = 0; g_startHead = 0; }
   }
   f.close();
+}
+
+// ---------- event-log persistence (LittleFS, survives reboot/brownout) ----------
+// The event-log ring lives in PSRAM and is wiped on reboot -- useless for
+// answering "what happened right before it rebooted". So we mirror it to a small
+// rolling file: append new lines to /log.txt, and once it passes LOG_FILE_CAP
+// rotate it to /log.old (one prior generation kept), bounding disk to ~2x the
+// cap. On boot the tail of both files is replayed back into the ring. Every
+// flash write happens from the loop via flushLogToFlash(); logLine() itself
+// never touches the filesystem, so file I/O stays off the critical section and
+// off the safety-task core.
+static const char*  LOG_FILE     = "/log.txt";
+static const char*  LOG_OLD      = "/log.old";
+static const size_t LOG_FILE_CAP = 49152;      // 48 KB -> rotate; ~96 KB max on disk (of ~10 MB)
+
+// Push a pre-formatted line straight into the ring, keeping its original
+// timestamp and WITHOUT re-persisting it. Used only to replay flash on boot.
+static void logRingPush(const char* line) {
+  if (!g_log) return;
+  strncpy(g_log[g_logHead], line, LOG_LEN - 1); g_log[g_logHead][LOG_LEN - 1] = 0;
+  g_logHead = (g_logHead + 1) % LOG_LINES;
+  if (g_logCount < LOG_LINES) g_logCount++;
+}
+
+// Append any ring lines not yet on flash. LOOP-CORE ONLY (single-threaded file
+// I/O). Cheap when idle -- the fast path returns before taking the lock.
+void flushLogToFlash() {
+  if (g_logSeq == g_logPersistedSeq) return;         // nothing pending (unlocked read, benign)
+  static char pend[16][LOG_LEN];                      // loop-only -> static is safe, keeps it off the stack
+  int np = 0;
+  portENTER_CRITICAL(&g_logMux);
+  uint32_t behind = g_logSeq - g_logPersistedSeq;
+  if (behind && g_log) {
+    if (behind > 16) { g_logPersistedSeq = g_logSeq - 16; behind = 16; }  // fell behind: keep newest 16
+    int idx = (g_logHead - (int)behind + LOG_LINES) % LOG_LINES;
+    for (uint32_t k = 0; k < behind; k++) {
+      strncpy(pend[np++], g_log[idx], LOG_LEN); idx = (idx + 1) % LOG_LINES;
+    }
+    g_logPersistedSeq = g_logSeq;
+  }
+  portEXIT_CRITICAL(&g_logMux);
+  if (!np) return;
+
+  File f = LittleFS.open(LOG_FILE, FILE_APPEND);
+  if (!f) return;
+  for (int k = 0; k < np; k++) { f.print(pend[k]); f.print('\n'); }
+  size_t sz = f.size();
+  f.close();
+  if (sz >= LOG_FILE_CAP) {                    // keep exactly one prior generation
+    LittleFS.remove(LOG_OLD);
+    LittleFS.rename(LOG_FILE, LOG_OLD);
+  }
+}
+
+// Replay the persisted tail (old generation first, then current) into the ring
+// so /logtext shows history from before the reboot. Only the newest LOG_LINES
+// survive the ring -- a naturally bounded tail. Everything read is already on
+// flash, so the persist cursor is set caught-up.
+void loadLogFromFlash() {
+  const char* files[2] = { LOG_OLD, LOG_FILE };
+  for (int i = 0; i < 2; i++) {
+    if (!LittleFS.exists(files[i])) continue;
+    File f = LittleFS.open(files[i], FILE_READ);
+    if (!f) continue;
+    while (f.available()) {
+      String ln = f.readStringUntil('\n');
+      ln.trim();                                // drop a trailing \r if present
+      if (ln.length()) logRingPush(ln.c_str());
+    }
+    f.close();
+  }
+  portENTER_CRITICAL(&g_logMux);
+  g_logSeq = g_logCount; g_logPersistedSeq = g_logSeq;   // loaded lines are already on flash
+  portEXIT_CRITICAL(&g_logMux);
 }
 
 // Append a start event and flush it to flash right away. Called for BOTH the
@@ -1089,19 +1212,19 @@ static const SnmpEntry SNMP_OIDS[] = {
   { 44, oidAsEtaS,    "autoStartEtaSec"  },
 };
 
-const char DASH_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-S3 Voltage Monitor</title>
-<style>
+const char APP_CSS[] PROGMEM = R"CSS(
 :root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#8b949e}
 *{box-sizing:border-box}
 body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
-header{padding:16px 20px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;align-items:center}
-h1{font-size:16px;margin:0;font-weight:600}
+header{padding:12px 20px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+h1{font-size:15px;margin:0;font-weight:600}
 #dot{width:10px;height:10px;border-radius:50%;background:var(--mut);display:inline-block;margin-right:6px}
 #status{font-size:13px;color:var(--mut)}
-.wrap{max-width:820px;margin:0 auto;padding:20px}
+nav.tabs{display:flex;gap:2px;flex-wrap:wrap;background:var(--card);border-bottom:1px solid #21262d;padding:0 8px;position:sticky;top:0;z-index:20}
+nav.tabs a{color:var(--mut);text-decoration:none;padding:11px 13px;font-size:14px;border-bottom:2px solid transparent;white-space:nowrap}
+nav.tabs a:hover{color:var(--fg)}
+nav.tabs a.on{color:var(--fg);border-bottom-color:#1f6feb;font-weight:600}
+.wrap{max-width:820px;margin:0 auto;padding:18px 20px}
 .hero{display:flex;gap:16px;flex-wrap:wrap}
 .metric{flex:1;min-width:150px;text-align:center;background:var(--card);border:1px solid #21262d;border-radius:10px;padding:16px}
 .metric .lbl{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
@@ -1113,7 +1236,7 @@ canvas{width:100%;height:104px;background:var(--card);border:1px solid #21262d;b
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin:18px 0}
 .card{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px}
 .card .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
-.card .v{font-size:18px;font-weight:600;margin-top:4px}
+.card .v{font-size:18px;font-weight:600;margin-top:4px;word-break:break-word}
 footer{text-align:center;color:var(--mut);font-size:12px;padding:16px}
 button.tx{background:#21262d;color:var(--fg);border:1px solid #30363d;border-radius:8px;padding:10px 16px;font-size:14px;cursor:pointer}
 button.tx:active{background:#30363d}
@@ -1131,60 +1254,243 @@ table.st th{text-align:left;color:var(--mut);font-weight:600;font-size:11px;text
 table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 .pill{display:inline-block;padding:1px 9px;border-radius:12px;font-size:11px;font-weight:600}
 .pill.auto{background:#1f6feb;color:#fff}.pill.man{background:#30363d;color:#c9d1d9}
-</style></head><body>
+)CSS";
+const char APP_JS[] PROGMEM = R"JS(
+// Shared engine for all vroom dashboard tabs. Each page sets window.PAGE
+// (its graph config) before loading this; every DOM update is null-guarded so
+// the same poll()/handlers run on any page regardless of which ids it contains.
+function $(i){return document.getElementById(i)}
+function T(id,v){var e=$(id);if(e!=null)e.textContent=v}                 // safe textContent
+function C(id,c){var e=$(id);if(e!=null)e.style.color=c}                 // safe color
+function H(id,h){var e=$(id);if(e!=null)e.innerHTML=h}                   // safe innerHTML
+function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
+function fmtB(b){if(b===undefined||b===null)return "--";if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(1)+" KB";return (b/1048576).toFixed(2)+" MB"}
+function fmtEta(s){if(s===undefined||s===null||s<0)return null;if(s<3600)return "~"+Math.max(1,Math.round(s/60))+" min";if(s<86400)return "~"+(s/3600).toFixed(1)+" h";return "~"+(s/86400).toFixed(1)+" days"}
+
+// ---- graph engine (mirrors the original single-page one; min/max lines on all) ----
+var PAD=8, CHARTS={}, TS=[], hoverIdx=-1;
+var IDS=(window.PAGE&&window.PAGE.charts||[]).map(function(c){return c.id});
+function fmtWhen(i){var t=TS[i];if(t&&t>1700000000){return new Date(t*1000).toLocaleString();}
+  var m=(TS.length-1-i);return m>=60?(Math.floor(m/60)+"h "+(m%60)+"m ago"):(m+"m ago");}
+function drawChart(id){
+  var ch=CHARTS[id];if(!ch)return;var c=$(id);if(!c)return;
+  var x=c.getContext("2d"),W=c.width,Ht=c.height;x.clearRect(0,0,W,Ht);
+  var data=ch.data,N=data.length;if(N<2)return;var lo=ch.lo,hi=ch.hi;
+  function gx(i){return PAD+i*(W-2*PAD)/(N-1)}function gy(v){return Ht-PAD-(v-lo)/(hi-lo)*(Ht-2*PAD)}
+  if(ch.minmax){x.setLineDash([4,3]);x.lineWidth=1;x.font="11px system-ui";
+    [["max",ch.mx,-4],["min",ch.mn,12]].forEach(function(m){var yy=gy(m[1]);
+      x.strokeStyle="#6e7681";x.beginPath();x.moveTo(PAD,yy);x.lineTo(W-PAD,yy);x.stroke();
+      x.fillStyle="#8b949e";x.fillText(m[0]+" "+m[1].toFixed(ch.dec)+" "+ch.unit,W-118,yy+m[2])});
+    x.setLineDash([])}
+  x.strokeStyle=ch.color;x.lineWidth=1.5;x.beginPath();
+  data.forEach(function(v,i){i?x.lineTo(gx(i),gy(v)):x.moveTo(gx(i),gy(v))});x.stroke();
+  if(hoverIdx>=0&&hoverIdx<N){var hx=gx(hoverIdx),hy=gy(data[hoverIdx]);
+    x.strokeStyle="#6e7681";x.lineWidth=1;x.beginPath();x.moveTo(hx,PAD);x.lineTo(hx,Ht-PAD);x.stroke();
+    x.fillStyle=ch.color;x.beginPath();x.arc(hx,hy,3.5,0,6.2832);x.fill();}
+}
+function drawAll(){IDS.forEach(drawChart)}
+function idxFromEvent(ev,id){var ch=CHARTS[id];if(!ch||ch.data.length<2)return -1;
+  var c=$(id),r=c.getBoundingClientRect(),W=c.width,N=ch.data.length;
+  var xint=(ev.clientX-r.left)/r.width*W;var i=Math.round((xint-PAD)/((W-2*PAD)/(N-1)));
+  return Math.max(0,Math.min(N-1,i));}
+function showTip(ev,id){var ch=CHARTS[id];if(!ch||hoverIdx<0)return;
+  H("tip","<b>"+ch.data[hoverIdx].toFixed(ch.dec)+" "+ch.unit+"</b><br>"+fmtWhen(hoverIdx));
+  var tp=$("tip");if(!tp)return;tp.style.display="block";
+  var tx=ev.clientX+12;if(tx+170>window.innerWidth)tx=ev.clientX-160;
+  tp.style.left=tx+"px";tp.style.top=(ev.clientY+12)+"px";}
+function setupHover(){IDS.forEach(function(id){var c=$(id);if(!c)return;
+  c.addEventListener("mousemove",function(ev){hoverIdx=idxFromEvent(ev,id);drawAll();showTip(ev,id)});
+  c.addEventListener("mouseleave",function(){hoverIdx=-1;drawAll();var tp=$("tip");if(tp)tp.style.display="none"});})}
+function loadHistory(){
+  if(!window.PAGE||!window.PAGE.charts||!window.PAGE.charts.length)return;
+  fetch("/history?cols="+window.PAGE.cols.join(","),{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
+    var ln=t.trim().split("\n");if(ln.length<2)return;
+    var hdr=ln[0].split(","),idx={};hdr.forEach(function(h,i){idx[h]=i});
+    var rows=[];for(var i=1;i<ln.length;i++){rows.push(ln[i].split(",").map(Number))}
+    if(!rows.length)return;TS=rows.map(function(r){return r[idx.ts]});
+    window.PAGE.charts.forEach(function(cfg){var ci=idx[cfg.col];if(ci===undefined)return;
+      var data=rows.map(function(r){return r[ci]});
+      var mn=Math.min.apply(null,data),mx=Math.max.apply(null,data);
+      var lo=mn,hi=mx;if(hi-lo<1e-6){hi+=1;lo-=1}
+      if(cfg.anchor0){lo=0;hi=Math.max(cfg.floor||10,hi)}
+      if(cfg.keep0){lo=Math.min(0,lo);hi=Math.max(0,hi);if(hi-lo<1e-6){hi+=1;lo-=1}}
+      var pad=Math.max((hi-lo)*0.15,0.02);lo-=pad;hi+=pad;
+      CHARTS[cfg.id]={data:data,lo:lo,hi:hi,color:cfg.color,dec:cfg.dec,unit:cfg.unit,mn:mn,mx:mx,minmax:true};});
+    drawAll();
+  }).catch(function(e){});
+}
+
+// ---- live values (every assignment guarded; a page only has some of these) ----
+function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+  var vcol={red:"#f85149",blue:"#58a6ff",green:"#3fb950"};
+  T("vbatt",d.vbatt.toFixed(2));C("vbatt",vcol[d.led]||"#e6edf3");
+  T("temp",d.temp_c.toFixed(1));T("adc",d.adc_mv);
+  T("rssi",d.rssi);T("up",fmtUp(d.uptime_s));
+  T("ssid",d.ssid||"--");T("bssid",d.bssid||"--");T("ch",d.ch);
+  T("phy",d.phy||"--");T("txpwr",(d.txpwr_dbm!==undefined?d.txpwr_dbm.toFixed(1):"--"));T("proto",d.proto||"--");
+  T("heap",Math.floor(d.heap_free/1024)+"/"+Math.floor(d.heap_total/1024)+" KB");
+  T("psram",(d.psram_free/1048576).toFixed(2)+"/"+(d.psram_total/1048576).toFixed(2)+" MB");
+  T("disk",Math.floor(d.disk_used/1024)+"/"+Math.floor(d.disk_total/1024)+" KB");
+  T("vstat",d.led);C("vstat",vcol[d.led]||"#e6edf3");
+  T("ntp",d.time_ok?"synced":"not synced");C("ntp",d.time_ok?"#3fb950":"#d29922");
+  T("nin",fmtB(d.net_in));T("nout",fmtB(d.net_out));
+  if(!d.drain_ok){T("drate","--");C("drate","#8b949e");T("dproj","--");
+    T("dmeta","settling: "+(d.drain_n||0)+" of 30 min needed. The window restarts at every reboot and at any gap in the log, so a slope is never fitted across a hole.");
+  }else{var mv=d.drain_mvph,r2=d.drain_r2,hrs=(d.drain_win_s/3600);
+    T("drate",(mv>0?"+":"")+mv.toFixed(1)+" mV/h");
+    C("drate",(mv>=0)?"#3fb950":(mv>-3?"#e6edf3":(mv>-10?"#d29922":"#f85149")));
+    T("dproj",(d.drain_days>0)?(d.drain_days<1?(Math.round(d.drain_days*24)+" h"):(d.drain_days.toFixed(1)+" days")):"n/a");
+    var trust=r2>=0.9?"solid":(r2>=0.6?"usable":"too noisy to trust yet");
+    T("dmeta","fit r^2="+r2.toFixed(2)+" ("+trust+") | "+hrs.toFixed(1)+" h window | "+d.drain_n+" samples"
+      +((d.drain_mvpc!==undefined&&d.drain_mvpc!=0)?" | temp-comp "+d.drain_mvpc.toFixed(1)+" mV/degC":"")
+      +(r2<0.6?" -- leave it sitting longer before comparing":""));
+    C("dmeta",(r2<0.6)?"#d29922":"#8b949e");}
+  T("sub","divider x"+d.divider+" | cal "+d.cal+" | ADC "+d.adc_mv+" mV | 1 sample/"+d.interval_s+"s");
+  T("net",(d.mode?d.mode.toUpperCase():"")+" | "+(d.ip||""));T("ns",d.samples);T("fw",d.fw||"?");
+  T("clk",d.time_ok?new Date(d.epoch*1000).toLocaleTimeString():"no NTP");
+  var RF={armed:"armed",blocked:"present, no patterns",absent:"not detected",off:"disabled"};
+  T("rfstat",RF[d.rf]||d.rf||"?");C("rfstat",(d.rf=="armed")?"#3fb950":(d.rf=="blocked"?"#d29922":"#8b949e"));
+  T("cpu",d.cpu_mhz);
+  if(d.cpu0!==undefined){T("cpu0",d.cpu0.toFixed(1));T("cpu1",d.cpu1.toFixed(1));T("cpuavg",Math.round((d.cpu0+d.cpu1)/2));}
+  document.querySelectorAll("button.seg").forEach(function(b){b.classList.toggle("on",+b.getAttribute("data-mhz")===d.cpu_mhz)});
+  var ps=!!d.wifi_ps;H("psbadge",'<span class="badge '+(ps?"on":"off")+'">'+(ps?"ON":"OFF")+'</span>');
+  var pb=$("psbtn");if(pb){pb.textContent=ps?"Turn OFF":"Turn ON";pb.setAttribute("data-next",ps?"0":"1");}
+  var ae=!!d.as_en,eta=fmtEta(d.as_eta_s);
+  T("aseta",ae?(eta||(d.drain_ok?"holding":"settling")):"--");
+  C("aseta",(!ae||d.as_eta_s<0)?"#8b949e":(d.drain_r2<0.6?"#d29922":"#3fb950"));
+  H("asbadge",'<span class="badge '+(ae?"arm":"off")+'">'+(ae?"ARMED":"OFF")+'</span>');
+  var ab=$("asbtn");if(ab){ab.textContent=ae?"Disable":"Enable";ab.setAttribute("data-next",ae?"0":"1");}
+  var ST={off:"disabled -- the car will not start itself",
+    lockout:"LOCKED OUT -- "+d.as_fails+" starts in a row drew no charge. Check the car, then clear the lockout.",
+    "not-armed":"cannot fire -- RF not armed (check CC1101 / patterns)",
+    warmup:"warming up after boot -- holding off",
+    "no-battery":"sensor is not across a battery ("+d.vbatt.toFixed(2)+" V) -- will not fire",
+    verifying:"just started -- watching for the alternator to come up",
+    recovering:"waiting for the battery to recover and hold before it may fire again",
+    "daily-cap":"24 h cap reached ("+d.as_f24+" of "+d.as_max24+") -- holding off",
+    "park-wait":"confirming the car is parked ("+d.as_park_s+"s of "+d.as_park_need+"s below 13.2 V)",
+    watching:"armed | watching -- above "+(d.as_volts||0).toFixed(1)+" V"+(fmtEta(d.as_eta_s)?" ("+fmtEta(d.as_eta_s)+" to auto-start)":"")};
+  var s=ST[d.as_state]||d.as_state;
+  if(d.as_state=="counting")s="voltage low "+d.as_low_s+"s of "+d.as_hold+"s -- starts in "+Math.max(0,d.as_hold-d.as_low_s)+"s";
+  if(d.as_state=="cooldown")s="cooldown -- "+fmtUp(d.as_cool_s)+" before it can fire again";
+  T("asstate",s);C("asstate",(d.as_state=="counting"||d.as_state=="lockout")?"#f85149":(ae?"#3fb950":"#8b949e"));
+  var au=$("asunlock");if(au)au.style.display=d.as_lock?"inline-block":"none";
+  T("aslow",d.as_low_s?(d.as_low_s+" / "+d.as_hold+" s"):"--");C("aslow",d.as_low_s?"#f85149":"#e6edf3");
+  T("ascool",d.as_cool_s?fmtUp(d.as_cool_s):"clear");
+  T("aspark",d.as_park_s>=d.as_park_need?"confirmed":(d.as_park_s+" / "+d.as_park_need+" s"));
+  C("aspark",(d.as_park_s>=d.as_park_need)?"#3fb950":"#8b949e");
+  T("asf24",d.as_f24+(d.as_max24>0?(" / "+d.as_max24):" (no cap)"));
+  T("asfail",d.as_fails+" / 2");C("asfail",d.as_fails?"#d29922":"#e6edf3");
+  T("aslock",d.as_lock?"LOCKED":"no");C("aslock",d.as_lock?"#f85149":"#3fb950");
+  T("asn",d.as_n);
+  T("aslast",(d.as_last>1700000000)?new Date(d.as_last*1000).toLocaleString():"never");
+  T("assince",(d.as_last>1700000000&&d.epoch>d.as_last)?(fmtUp(d.epoch-d.as_last)+" ago"):"--");
+  T("lastrun",(d.last_run>1700000000)?new Date(d.last_run*1000).toLocaleString():"never");
+  T("runsince",(d.last_run>1700000000&&d.epoch>d.last_run)?(fmtUp(d.epoch-d.last_run)+" ago"):"--");
+  var af=document.activeElement?document.activeElement.id:"";
+  if(af!="asv"&&$("asv"))$("asv").value=(d.as_volts||0).toFixed(1);
+  if(af!="ash"&&$("ash"))$("ash").value=d.as_hold;
+  if(af!="asc"&&$("asc"))$("asc").value=d.as_cool;
+  if(af!="asm"&&$("asm"))$("asm").value=d.as_max24;
+  C("dot","#3fb950");T("stxt","live");
+}).catch(function(e){C("dot","#d29922");T("stxt","reconnecting...")})}
+
+function loadStarts(){if(!$("startbox"))return;
+  fetch("/starts",{cache:"no-store"}).then(function(r){return r.json()}).then(function(a){
+    if(!a||!a.length){H("startbox",'<div class="k">no starts recorded</div>');return}
+    var h='<table class="st"><tr><th>When</th><th>Voltage</th><th>Trigger</th><th>TX</th><th>Engine</th></tr>';
+    var VER=['<span style="color:#8b949e">unknown</span>','<span style="color:#3fb950">ran</span>','<span style="color:#f85149">no charge</span>'];
+    a.forEach(function(e){var w=(e.ts>1700000000)?new Date(e.ts*1000).toLocaleString():("uptime "+fmtUp(e.up_s)+" | no clock");
+      h+='<tr><td>'+w+'</td><td>'+e.v.toFixed(2)+' V</td><td><span class="pill '+(e.src=="auto"?"auto":"man")+'">'+e.src+'</span></td><td>'+(e.ok?"sent":"<span style=\"color:#f85149\">failed</span>")+'</td><td>'+(VER[e.ver]||VER[0])+'</td></tr>';});
+    H("startbox",h+'</table>');
+  }).catch(function(e){})}
+
+// ---- controls (all on the Main page; guarded so other pages skip them) ----
+function attachHandlers(){
+  document.querySelectorAll("button.tx[data-b]").forEach(function(btn){btn.addEventListener("click",function(){
+    var b=btn.getAttribute("data-b");
+    if(b=="START"&&!confirm("Start the engine now? This transmits the real remote-start code and CRANKS THE ENGINE if the car is in range."))return;
+    T("rfmsg",b+" ...");
+    fetch("/transmit?button="+b,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+      T("rfmsg",d.ok?(b+" sent x"+d.repeats):(b+" failed: "+(d.detail||"error")));
+    }).catch(function(e){T("rfmsg",b+" request error")})})});
+  document.querySelectorAll("button.seg").forEach(function(b){b.addEventListener("click",function(){
+    var m=b.getAttribute("data-mhz");T("pwrmsg","setting CPU to "+m+" MHz...");
+    fetch("/cpu?mhz="+m,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+      T("pwrmsg",d.ok?("CPU now "+d.cpu_mhz+" MHz"):("CPU change failed: "+(d.detail||"error")));poll();
+    }).catch(function(e){T("pwrmsg","CPU request error")})})});
+  var psb=$("psbtn");if(psb)psb.addEventListener("click",function(){
+    var nx=psb.getAttribute("data-next")||"0";T("pwrmsg","updating WiFi power saving...");
+    fetch("/wifips?on="+nx,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+      T("pwrmsg","WiFi power saving "+(d.wifi_ps?"ON":"OFF"));poll();
+    }).catch(function(e){T("pwrmsg","WiFi power-save request error")})});
+  var asb=$("asbtn");if(asb)asb.addEventListener("click",function(){
+    var nx=asb.getAttribute("data-next")||"0";
+    if(nx=="1"&&!confirm("ARM low-voltage auto-start?\n\nThe car will CRANK BY ITSELF, unattended, whenever battery voltage stays at or below the threshold for the hold time.\n\nNever leave this armed while the car is parked indoors or in an attached garage -- engine exhaust in an enclosed space is lethal."))return;
+    T("asmsg","updating...");
+    fetch("/autostart?en="+nx,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+      T("asmsg","auto-start "+(d.as_en?"ARMED":"disabled"));poll();
+    }).catch(function(e){T("asmsg","request error")})});
+  var ass=$("assave");if(ass)ass.addEventListener("click",function(){
+    var q="volts="+$("asv").value+"&hold="+$("ash").value+"&cool="+$("asc").value+"&max24="+$("asm").value;
+    T("asmsg","saving...");
+    fetch("/autostart?"+q,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+      T("asmsg",d.ok?("saved -- start below "+d.as_volts.toFixed(1)+" V held "+d.as_hold+" s"):("save failed: "+(d.detail||"error")));poll();
+    }).catch(function(e){T("asmsg","save error")})});
+  var asu=$("asunlock");if(asu)asu.addEventListener("click",function(){
+    if(!confirm("Clear the auto-start lockout?\n\nIt latched because starts drew no charge -- the engine did not catch. Make sure you know why before re-enabling."))return;
+    fetch("/autostart?unlock=1",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+      T("asmsg","lockout cleared");poll();}).catch(function(e){T("asmsg","unlock error")})});
+  var asc=$("asclear");if(asc)asc.addEventListener("click",function(){
+    if(!confirm("Clear the entire start history?"))return;
+    fetch("/starts",{method:"POST"}).then(function(){loadStarts();T("asmsg","start log cleared")})
+    .catch(function(e){T("asmsg","clear error")})});
+  var rb=$("rebootbtn");if(rb)rb.addEventListener("click",function(e){e.preventDefault();
+    if(!confirm("Reboot the board now?\n\nIt drops off WiFi for a few seconds, then the dashboard reconnects. Auto-start protection resumes on boot."))return;
+    C("dot","#d29922");T("stxt","rebooting...");
+    fetch("/reboot",{method:"POST"}).catch(function(){});setTimeout(poll,9000);});
+  var pw=$("powerbtn");if(pw)pw.addEventListener("click",function(e){e.preventDefault();
+    if(!confirm("Power-up mode?\n\nDisables WiFi power-save and sets the CPU to 240 MHz (both persist across reboot). Snappier + more reliable link, at a bit more current draw."))return;
+    fetch("/powerup",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+      T("pwrmsg","power-up: CPU "+d.cpu_mhz+" MHz, WiFi PS "+(d.wifi_ps?"on":"off"));poll();})
+    .catch(function(){T("pwrmsg","power-up request error")})});
+}
+
+// ---- init ----
+(function(){
+  // highlight the active tab by pathname
+  var p=location.pathname;document.querySelectorAll("nav.tabs a").forEach(function(a){
+    if(a.getAttribute("data-p")===p)a.classList.add("on");});
+  attachHandlers();setupHover();
+  poll();setInterval(poll,2000);
+  if(window.PAGE&&window.PAGE.charts&&window.PAGE.charts.length){loadHistory();setInterval(loadHistory,30000);}
+  if($("startbox")){loadStarts();setInterval(loadStarts,15000);}
+})();
+)JS";
+const char MAIN_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
+<nav class="tabs">
+<a href="/" data-p="/">Main</a>
+<a href="/wifi" data-p="/wifi">WiFi / Net</a>
+<a href="/voltage" data-p="/voltage">Voltage</a>
+<a href="/cpu" data-p="/cpu">CPU</a>
+<a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
+<a href="/logs" data-p="/logs">Log</a>
+<a href="/update" data-p="/update">Update</a>
+</nav>
 <div class="wrap">
 <div class="hero">
 <div class="metric"><div class="lbl">Voltage</div><span class="big" id="vbatt">--</span><span class="u"> V</span></div>
 <div class="metric"><div class="lbl">Chip temp</div><span class="big" id="temp">--</span><span class="u"> &deg;C</span></div>
-<div class="metric"><div class="lbl">CPU load (avg)</div><span class="big" id="cpuavg">--</span><span class="u"> %</span></div>
 <div class="metric"><div class="lbl">Uptime</div><span class="big" id="up" style="font-size:26px">--</span></div>
 </div>
 <div class="sub" id="sub">waiting for data&hellip;</div>
-<div class="clbl">Voltage (24 h)</div><canvas id="c0" width="800" height="104"></canvas>
-<div class="card" style="margin-top:8px">
-<div class="pwrrow">
-<div><div class="k">Battery drain rate</div><div class="v" style="font-size:24px"><span id="drate">--</span></div></div>
-<div style="text-align:right"><div class="k">Projected to 11.8 V</div><div class="v" id="dproj">--</div></div>
-</div>
-<div class="k" id="dmeta" style="margin-top:8px;text-transform:none;letter-spacing:0">&nbsp;</div>
-</div>
-<div class="clbl">Temperature &deg;C (24 h)</div><canvas id="c1" width="800" height="104"></canvas>
-<div class="clbl">Free memory KB (24 h)</div><canvas id="c2" width="800" height="104"></canvas>
-<div class="clbl">Disk used KB (24 h)</div><canvas id="c3" width="800" height="104"></canvas>
-<div class="clbl">Network in B/min (24 h)</div><canvas id="c4" width="800" height="104"></canvas>
-<div class="clbl">Network out B/min (24 h)</div><canvas id="c5" width="800" height="104"></canvas>
-<div class="clbl">WiFi RSSI dBm (24 h)</div><canvas id="c6" width="800" height="104"></canvas>
-<div class="clbl">CPU core 0 load % (24 h)</div><canvas id="c7" width="800" height="104"></canvas>
-<div class="clbl">CPU core 1 load % (24 h)</div><canvas id="c8" width="800" height="104"></canvas>
-<div class="clbl">Battery drain rate mV/h (24 h) &mdash; below 0 = discharging</div><canvas id="c9" width="800" height="104"></canvas>
-<div class="grid">
-<div class="card"><div class="k">ADC node</div><div class="v"><span id="adc">--</span> mV</div></div>
-<div class="card"><div class="k">WiFi RSSI</div><div class="v"><span id="rssi">--</span> dBm</div></div>
-<div class="card"><div class="k">Disk</div><div class="v"><span id="disk">--</span></div></div>
-<div class="card"><div class="k">Free heap</div><div class="v"><span id="heap">--</span></div></div>
-<div class="card"><div class="k">Free PSRAM</div><div class="v"><span id="psram">--</span></div></div>
-<div class="card"><div class="k">CPU core 0</div><div class="v"><span id="cpu0">--</span> %</div></div>
-<div class="card"><div class="k">CPU core 1</div><div class="v"><span id="cpu1">--</span> %</div></div>
-<div class="card"><div class="k">Voltage status</div><div class="v" id="vstat">--</div></div>
-<div class="card"><div class="k">Clock (NTP)</div><div class="v" id="ntp">--</div></div>
-<div class="card"><div class="k">HTTP in total</div><div class="v"><span id="nin">--</span></div></div>
-<div class="card"><div class="k">HTTP out total</div><div class="v"><span id="nout">--</span></div></div>
-</div>
-<div class="clbl">Power &amp; performance</div>
-<div class="card" style="margin-bottom:10px">
-<div class="pwrrow">
-<div><div class="k">CPU clock</div><div class="v"><span id="cpu">--</span> MHz</div></div>
-<div style="display:flex;gap:6px"><button class="tx seg" data-mhz="80">80 MHz</button><button class="tx seg" data-mhz="240">240 MHz</button></div>
-</div>
-<div class="pwrrow" style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d">
-<div><div class="k">WiFi power saving</div><div class="v"><span id="psbadge">--</span></div></div>
-<button class="tx" id="psbtn">&hellip;</button>
-</div>
-<div class="k" id="pwrmsg" style="margin-top:10px">&nbsp;</div>
-</div>
+
 <div class="clbl">Remote start &mdash; 433 MHz</div>
 <div class="card" style="margin-bottom:10px">
 <div class="k">CC1101 &middot; <span id="rfstat">&hellip;</span></div>
@@ -1196,6 +1502,7 @@ table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 </div>
 <div class="k" id="rfmsg" style="margin-top:10px">&nbsp;</div>
 </div>
+
 <div class="clbl">Low-voltage auto-start</div>
 <div class="card" style="margin-bottom:10px">
 <div class="pwrrow">
@@ -1212,16 +1519,10 @@ table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 </div>
 <div class="k" style="margin-top:12px;line-height:1.7;text-transform:none;letter-spacing:0">
 <b>12.4 V</b> is the suggested trigger for a cold climate &mdash; about 75&nbsp;% charge, where the engine
-still cranks easily. Two reasons not to wait for 12.2 V here: near &minus;20&nbsp;&deg;C the engine wants
-roughly double the torque while the battery delivers about half its power, and a battery down at
-12.2&nbsp;V has electrolyte that slushes up around &minus;26&nbsp;&deg;C. In a mild climate 12.2&nbsp;V is fine.
-Below about <b>11.8 V</b> it likely won't crank at all.<br>
-The hold time ignores the brief dip while the engine is <i>actually cranking</i> (down to ~9&ndash;10 V for a
-second or two). <b>60 s</b> is far longer than any crank or momentary load.<br>
-It also won't fire while you're driving and won't re-fire until the battery recovers and holds.
-<b>Max per 24 h</b> is off by default (<b>0</b> or <b>&minus;1</b> = unlimited) &mdash; set a number only if you
-want a hard ceiling. The real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge,
-the engine clearly isn't catching and it latches off until you clear it.
+still cranks easily. Below about <b>11.8 V</b> it likely won't crank at all. The hold time ignores the brief dip
+while the engine is <i>actually cranking</i>. It won't fire while you're driving and won't re-fire until the
+battery recovers and holds. <b>Max per 24 h</b> is off by default (<b>0</b>/<b>&minus;1</b> = unlimited). The
+real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, it latches off until you clear it.
 </div>
 <div class="k" id="asmsg" style="margin-top:8px">&nbsp;</div>
 </div>
@@ -1239,247 +1540,216 @@ the engine clearly isn't catching and it latches off until you clear it.
 <div class="card"><div class="k">Last charge (ran)</div><div class="v" style="font-size:13px" id="lastrun">--</div></div>
 <div class="card"><div class="k">Since last charge</div><div class="v"><span id="runsince">--</span></div></div>
 </div>
-</div>
-<div class="wrap" style="padding-top:0">
+
 <div class="clbl">Start history</div>
 <div class="card" style="margin-bottom:10px">
 <div id="startbox"><div class="k">no starts recorded</div></div>
 <div style="margin-top:10px"><button class="tx" id="asclear">Clear log</button></div>
 </div>
+
+<div class="clbl">Power &amp; performance</div>
+<div class="card" style="margin-bottom:10px">
+<div class="pwrrow">
+<div><div class="k">CPU clock</div><div class="v"><span id="cpu">--</span> MHz</div></div>
+<div style="display:flex;gap:6px"><button class="tx seg" data-mhz="80">80 MHz</button><button class="tx seg" data-mhz="240">240 MHz</button></div>
 </div>
-<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span> &middot; <a href="/logs">logs</a> &middot; <a href="/update">update</a> &middot; <a href="#" id="powerbtn">power-up</a> &middot; <a href="#" id="rebootbtn">reboot</a></footer>
-<script>
-function $(i){return document.getElementById(i)}
-function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
-function fmtB(b){if(b===undefined||b===null)return "--";if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(1)+" KB";return (b/1048576).toFixed(2)+" MB"}
-function fmtEta(s){if(s===undefined||s===null||s<0)return null;if(s<3600)return "~"+Math.max(1,Math.round(s/60))+" min";if(s<86400)return "~"+(s/3600).toFixed(1)+" h";return "~"+(s/86400).toFixed(1)+" days"}
-// 10 graphs, in canvas order c0..c9, mapped to /history data columns 1..10.
-var COLS=["#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f778ba","#ffa657","#7ee787","#e3b341","#ff7b72"];
-var DEC=[2,1,0,0,0,0,0,0,0,0];
-var UNITS=["V","degC","KB","KB","B/min","B/min","dBm","%","%","mV/h"];
-var PAD=8;
-var CHARTS={};      // id -> {data, lo, hi, color, dec, unit}
-var TS=[];          // per-sample epoch seconds (0 if NTP not synced), parallel to data
-var hoverIdx=-1;
-var IDS=["c0","c1","c2","c3","c4","c5","c6","c7","c8","c9"];
-function fmtWhen(i){
-  var t=TS[i];
-  if(t&&t>1700000000){return new Date(t*1000).toLocaleString();}   // absolute (browser-local)
-  var m=Math.floor((TS.length-1-i)*60/60);                          // fallback: relative from index
-  return m>=60?(Math.floor(m/60)+"h "+(m%60)+"m ago"):(m+"m ago");
-}
-function drawChart(id){
-  var ch=CHARTS[id];if(!ch)return;
-  var c=$(id),x=c.getContext("2d"),W=c.width,H=c.height;x.clearRect(0,0,W,H);
-  var data=ch.data,N=data.length;if(N<2)return;var lo=ch.lo,hi=ch.hi;
-  function gx(i){return PAD+i*(W-2*PAD)/(N-1)}function gy(v){return H-PAD-(v-lo)/(hi-lo)*(H-2*PAD)}
-  // min/max reference lines (voltage graph): a dashed line + labelled value at the data extremes, always visible
-  if(ch.minmax){x.setLineDash([4,3]);x.lineWidth=1;x.font="11px system-ui";
-    [["max",ch.mx,-4],["min",ch.mn,12]].forEach(function(m){var yy=gy(m[1]);
-      x.strokeStyle="#6e7681";x.beginPath();x.moveTo(PAD,yy);x.lineTo(W-PAD,yy);x.stroke();
-      x.fillStyle="#8b949e";x.fillText(m[0]+" "+m[1].toFixed(ch.dec)+" "+ch.unit,W-118,yy+m[2])});
-    x.setLineDash([])}
-  x.strokeStyle=ch.color;x.lineWidth=1.5;x.beginPath();
-  data.forEach(function(v,i){i?x.lineTo(gx(i),gy(v)):x.moveTo(gx(i),gy(v))});x.stroke();
-  if(!ch.minmax){x.fillStyle="#8b949e";x.font="11px system-ui";x.fillText(hi.toFixed(ch.dec),6,13);x.fillText(lo.toFixed(ch.dec),6,H-5);}
-  if(hoverIdx>=0&&hoverIdx<N){var hx=gx(hoverIdx),hy=gy(data[hoverIdx]);
-    x.strokeStyle="#6e7681";x.lineWidth=1;x.beginPath();x.moveTo(hx,PAD);x.lineTo(hx,H-PAD);x.stroke();
-    x.fillStyle=ch.color;x.beginPath();x.arc(hx,hy,3.5,0,6.2832);x.fill();}
-}
-function drawAll(){IDS.forEach(drawChart)}
-function idxFromEvent(ev,id){
-  var ch=CHARTS[id];if(!ch||ch.data.length<2)return -1;
-  var c=$(id),r=c.getBoundingClientRect(),W=c.width,N=ch.data.length;
-  var xint=(ev.clientX-r.left)/r.width*W;
-  var i=Math.round((xint-PAD)/((W-2*PAD)/(N-1)));
-  return Math.max(0,Math.min(N-1,i));
-}
-function showTip(ev,id){
-  var ch=CHARTS[id];if(!ch||hoverIdx<0)return;
-  $("tip").innerHTML="<b>"+ch.data[hoverIdx].toFixed(ch.dec)+" "+ch.unit+"</b><br>"+fmtWhen(hoverIdx);
-  $("tip").style.display="block";
-  var tx=ev.clientX+12;if(tx+170>window.innerWidth)tx=ev.clientX-160;
-  $("tip").style.left=tx+"px";$("tip").style.top=(ev.clientY+12)+"px";
-}
-function setupHover(){IDS.forEach(function(id){var c=$(id);
-  c.addEventListener("mousemove",function(ev){hoverIdx=idxFromEvent(ev,id);drawAll();showTip(ev,id)});
-  c.addEventListener("mouseleave",function(){hoverIdx=-1;drawAll();$("tip").style.display="none"});
-})}
-function loadHistory(){fetch("/history",{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
-var ln=t.trim().split("\n"),rows=[];for(var i=1;i<ln.length;i++){rows.push(ln[i].split(",").map(Number))}
-if(!rows.length)return;
-TS=rows.map(function(r){return r[0]});
-for(var col=0;col<10;col++){(function(col){
-  var data=rows.map(function(r){return r[col+1]});           // data cols 1..10
-  var mn=Math.min.apply(null,data),mx=Math.max.apply(null,data);  // true data extremes (even if flat)
-  var lo=mn,hi=mx;if(hi-lo<1e-6){hi+=1;lo-=1}
-  var mmx=true;                                              // dashed min/max lines on ALL graphs
-  if(col==7||col==8){lo=0;hi=Math.max(10,hi)}                // CPU %: anchor at 0
-  if(col==9){lo=Math.min(0,lo);hi=Math.max(0,hi);if(hi-lo<1e-6){hi+=1;lo-=1}}  // drain: keep 0 in view
-  if(mmx){var pad=Math.max((hi-lo)*0.15,0.02);lo-=pad;hi+=pad}  // headroom so the min/max lines sit inside the plot
-  CHARTS["c"+col]={data:data,lo:lo,hi:hi,color:COLS[col],dec:DEC[col],unit:UNITS[col],mn:mn,mx:mx,minmax:mmx};
-})(col)}
-drawAll();
-}).catch(function(e){})}
-function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
-$("vbatt").textContent=d.vbatt.toFixed(2);$("temp").textContent=d.temp_c.toFixed(1);
-$("vbatt").style.color={red:"#f85149",blue:"#58a6ff",green:"#3fb950"}[d.led]||"#e6edf3";
-$("adc").textContent=d.adc_mv;$("rssi").textContent=d.rssi;$("up").textContent=fmtUp(d.uptime_s);
-$("heap").textContent=Math.floor(d.heap_free/1024)+"/"+Math.floor(d.heap_total/1024)+" KB";
-$("psram").textContent=(d.psram_free/1048576).toFixed(2)+"/"+(d.psram_total/1048576).toFixed(2)+" MB";
-$("disk").textContent=Math.floor(d.disk_used/1024)+"/"+Math.floor(d.disk_total/1024)+" KB";
-$("vstat").textContent=d.led;
-$("vstat").style.color={red:"#f85149",blue:"#58a6ff",green:"#3fb950"}[d.led]||"#e6edf3";
-$("ntp").textContent=d.time_ok?"synced":"not synced";
-$("ntp").style.color=d.time_ok?"#3fb950":"#d29922";
-$("nin").textContent=fmtB(d.net_in);$("nout").textContent=fmtB(d.net_out);
-// battery drain: slope of the parked window. r2 says whether to believe it yet.
-if(!d.drain_ok){
-  $("drate").textContent="--";$("drate").style.color="#8b949e";
-  $("dproj").textContent="--";
-  $("dmeta").textContent="settling: "+(d.drain_n||0)+" of 30 min needed. The window restarts at every"
-    +" reboot and at any gap in the log, so a slope is never fitted across a hole.";
-}else{
-  var mv=d.drain_mvph, r2=d.drain_r2, hrs=(d.drain_win_s/3600);
-  $("drate").textContent=(mv>0?"+":"")+mv.toFixed(1)+" mV/h";
-  $("drate").style.color=(mv>=0)?"#3fb950":(mv>-3?"#e6edf3":(mv>-10?"#d29922":"#f85149"));
-  $("dproj").textContent=(d.drain_days>0)?(d.drain_days<1?(Math.round(d.drain_days*24)+" h"):(d.drain_days.toFixed(1)+" days")):"n/a";
-  var trust=r2>=0.9?"solid":(r2>=0.6?"usable":"too noisy to trust yet");
-  $("dmeta").textContent="fit r^2="+r2.toFixed(2)+" ("+trust+") | "+hrs.toFixed(1)+" h window | "+d.drain_n+" samples"
-    +((d.drain_mvpc!==undefined&&d.drain_mvpc!=0)?" | temp-comp "+d.drain_mvpc.toFixed(1)+" mV/degC":"")
-    +(r2<0.6?" -- leave it sitting longer before comparing":"");
-  $("dmeta").style.color=(r2<0.6)?"#d29922":"#8b949e";
-}
-$("sub").textContent="divider x"+d.divider+" | cal "+d.cal+" | ADC "+d.adc_mv+" mV | 1 sample/"+d.interval_s+"s";
-$("net").textContent=(d.mode?d.mode.toUpperCase():"")+" | "+(d.ip||"");$("ns").textContent=d.samples;$("fw").textContent=d.fw||"?";
-$("clk").textContent=d.time_ok?new Date(d.epoch*1000).toLocaleTimeString():"no NTP";
-var RF={armed:"armed",blocked:"present, no patterns",absent:"not detected",off:"disabled"};
-$("rfstat").textContent=RF[d.rf]||d.rf||"?";
-$("rfstat").style.color=(d.rf=="armed")?"#3fb950":(d.rf=="blocked"?"#d29922":"#8b949e");
-$("cpu").textContent=d.cpu_mhz;
-if(d.cpu0!==undefined){$("cpu0").textContent=d.cpu0.toFixed(1);$("cpu1").textContent=d.cpu1.toFixed(1);$("cpuavg").textContent=Math.round((d.cpu0+d.cpu1)/2);}
-document.querySelectorAll("button.seg").forEach(function(b){b.classList.toggle("on",+b.getAttribute("data-mhz")===d.cpu_mhz)});
-var ps=!!d.wifi_ps;
-$("psbadge").innerHTML='<span class="badge '+(ps?"on":"off")+'">'+(ps?"ON":"OFF")+'</span>';
-$("psbtn").textContent=ps?"Turn OFF":"Turn ON";$("psbtn").setAttribute("data-next",ps?"0":"1");
-var ae=!!d.as_en;
-// est. time until auto-start fires: parked-drain projection to the threshold + hold
-var eta=fmtEta(d.as_eta_s);
-$("aseta").textContent=ae?(eta||(d.drain_ok?"holding":"settling")):"--";
-$("aseta").style.color=(!ae||d.as_eta_s<0)?"#8b949e":(d.drain_r2<0.6?"#d29922":"#3fb950");
-$("asbadge").innerHTML='<span class="badge '+(ae?"arm":"off")+'">'+(ae?"ARMED":"OFF")+'</span>';
-$("asbtn").textContent=ae?"Disable":"Enable";$("asbtn").setAttribute("data-next",ae?"0":"1");
-var ST={off:"disabled -- the car will not start itself",
-lockout:"LOCKED OUT -- "+d.as_fails+" starts in a row drew no charge. Check the car, then clear the lockout.",
-"not-armed":"cannot fire -- RF not armed (check CC1101 / patterns)",
-warmup:"warming up after boot -- holding off",
-"no-battery":"sensor is not across a battery ("+d.vbatt.toFixed(2)+" V) -- will not fire",
-verifying:"just started -- watching for the alternator to come up",
-recovering:"waiting for the battery to recover and hold before it may fire again",
-"daily-cap":"24 h cap reached ("+d.as_f24+" of "+d.as_max24+") -- holding off",
-"park-wait":"confirming the car is parked ("+d.as_park_s+"s of "+d.as_park_need+"s below 13.2 V)",
-watching:"armed | watching -- above "+(d.as_volts||0).toFixed(1)+" V"+(fmtEta(d.as_eta_s)?" ("+fmtEta(d.as_eta_s)+" to auto-start)":"")};
-var s=ST[d.as_state]||d.as_state;
-if(d.as_state=="counting")s="voltage low "+d.as_low_s+"s of "+d.as_hold+"s -- starts in "+Math.max(0,d.as_hold-d.as_low_s)+"s";
-if(d.as_state=="cooldown")s="cooldown -- "+fmtUp(d.as_cool_s)+" before it can fire again";
-$("asstate").textContent=s;
-$("asstate").style.color=(d.as_state=="counting"||d.as_state=="lockout")?"#f85149":(ae?"#3fb950":"#8b949e");
-$("asunlock").style.display=d.as_lock?"inline-block":"none";
-// always-visible auto-start counters (these were previously only readable
-// via SNMP, or only surfaced in one particular state's status line)
-$("aslow").textContent=d.as_low_s?(d.as_low_s+" / "+d.as_hold+" s"):"--";
-$("aslow").style.color=d.as_low_s?"#f85149":"#e6edf3";
-$("ascool").textContent=d.as_cool_s?fmtUp(d.as_cool_s):"clear";
-$("aspark").textContent=d.as_park_s>=d.as_park_need?"confirmed":(d.as_park_s+" / "+d.as_park_need+" s");
-$("aspark").style.color=(d.as_park_s>=d.as_park_need)?"#3fb950":"#8b949e";
-$("asf24").textContent=d.as_f24+(d.as_max24>0?(" / "+d.as_max24):" (no cap)");
-$("asfail").textContent=d.as_fails+" / 2";
-$("asfail").style.color=d.as_fails?"#d29922":"#e6edf3";
-$("aslock").textContent=d.as_lock?"LOCKED":"no";
-$("aslock").style.color=d.as_lock?"#f85149":"#3fb950";
-$("asn").textContent=d.as_n;
-$("aslast").textContent=(d.as_last>1700000000)?new Date(d.as_last*1000).toLocaleString():"never";
-$("assince").textContent=(d.as_last>1700000000&&d.epoch>d.as_last)?(fmtUp(d.epoch-d.as_last)+" ago"):"--";
-$("lastrun").textContent=(d.last_run>1700000000)?new Date(d.last_run*1000).toLocaleString():"never";
-$("runsince").textContent=(d.last_run>1700000000&&d.epoch>d.last_run)?(fmtUp(d.epoch-d.last_run)+" ago"):"--";
-var af=document.activeElement?document.activeElement.id:"";
-if(af!="asv")$("asv").value=(d.as_volts||0).toFixed(1);
-if(af!="ash")$("ash").value=d.as_hold;
-if(af!="asc")$("asc").value=d.as_cool;
-if(af!="asm")$("asm").value=d.as_max24;
-$("dot").style.background="#3fb950";$("stxt").textContent="live";
-}).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnecting..."})}
-document.querySelectorAll("button.tx[data-b]").forEach(function(btn){btn.addEventListener("click",function(){
-var b=btn.getAttribute("data-b");
-if(b=="START"&&!confirm("Start the engine now? This transmits the real remote-start code and CRANKS THE ENGINE if the car is in range."))return;
-$("rfmsg").textContent=b+" ...";
-fetch("/transmit?button="+b,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
-$("rfmsg").textContent=d.ok?(b+" sent x"+d.repeats):(b+" failed: "+(d.detail||"error"));
-}).catch(function(e){$("rfmsg").textContent=b+" request error"})})});
-document.querySelectorAll("button.seg").forEach(function(b){b.addEventListener("click",function(){
-var m=b.getAttribute("data-mhz");$("pwrmsg").textContent="setting CPU to "+m+" MHz...";
-fetch("/cpu?mhz="+m,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
-$("pwrmsg").textContent=d.ok?("CPU now "+d.cpu_mhz+" MHz"):("CPU change failed: "+(d.detail||"error"));poll();
-}).catch(function(e){$("pwrmsg").textContent="CPU request error"})})});
-$("psbtn").addEventListener("click",function(){
-var nx=$("psbtn").getAttribute("data-next")||"0";$("pwrmsg").textContent="updating WiFi power saving...";
-fetch("/wifips?on="+nx,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
-$("pwrmsg").textContent="WiFi power saving "+(d.wifi_ps?"ON":"OFF");poll();
-}).catch(function(e){$("pwrmsg").textContent="WiFi power-save request error"})});
-function loadStarts(){fetch("/starts",{cache:"no-store"}).then(function(r){return r.json()}).then(function(a){
-if(!a||!a.length){$("startbox").innerHTML='<div class="k">no starts recorded</div>';return}
-var h='<table class="st"><tr><th>When</th><th>Voltage</th><th>Trigger</th><th>TX</th><th>Engine</th></tr>';
-var VER=['<span style="color:#8b949e">unknown</span>','<span style="color:#3fb950">ran</span>','<span style="color:#f85149">no charge</span>'];
-a.forEach(function(e){
-var w=(e.ts>1700000000)?new Date(e.ts*1000).toLocaleString():("uptime "+fmtUp(e.up_s)+" | no clock");
-h+='<tr><td>'+w+'</td><td>'+e.v.toFixed(2)+' V</td><td><span class="pill '+(e.src=="auto"?"auto":"man")+'">'+e.src+'</span></td><td>'+(e.ok?"sent":"<span style=\"color:#f85149\">failed</span>")+'</td><td>'+(VER[e.ver]||VER[0])+'</td></tr>';
-});
-$("startbox").innerHTML=h+'</table>';
-}).catch(function(e){})}
-$("asbtn").addEventListener("click",function(){
-var nx=$("asbtn").getAttribute("data-next")||"0";
-if(nx=="1"&&!confirm("ARM low-voltage auto-start?\n\nThe car will CRANK BY ITSELF, unattended, whenever battery voltage stays at or below the threshold for the hold time.\n\nNever leave this armed while the car is parked indoors or in an attached garage -- engine exhaust in an enclosed space is lethal."))return;
-$("asmsg").textContent="updating...";
-fetch("/autostart?en="+nx,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
-$("asmsg").textContent="auto-start "+(d.as_en?"ARMED":"disabled");poll();
-}).catch(function(e){$("asmsg").textContent="request error"})});
-$("assave").addEventListener("click",function(){
-var q="volts="+$("asv").value+"&hold="+$("ash").value+"&cool="+$("asc").value+"&max24="+$("asm").value;
-$("asmsg").textContent="saving...";
-fetch("/autostart?"+q,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
-$("asmsg").textContent=d.ok?("saved -- start below "+d.as_volts.toFixed(1)+" V held "+d.as_hold+" s"):("save failed: "+(d.detail||"error"));poll();
-}).catch(function(e){$("asmsg").textContent="save error"})});
-$("asunlock").addEventListener("click",function(){
-if(!confirm("Clear the auto-start lockout?\n\nIt latched because starts drew no charge -- the engine did not catch. Make sure you know why before re-enabling."))return;
-fetch("/autostart?unlock=1",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
-$("asmsg").textContent="lockout cleared";poll();
-}).catch(function(e){$("asmsg").textContent="unlock error"})});
-$("asclear").addEventListener("click",function(){
-if(!confirm("Clear the entire start history?"))return;
-fetch("/starts",{method:"POST"}).then(function(){loadStarts();$("asmsg").textContent="start log cleared"})
-.catch(function(e){$("asmsg").textContent="clear error"})});
-$("rebootbtn").addEventListener("click",function(e){e.preventDefault();
-if(!confirm("Reboot the board now?\n\nIt drops off WiFi for a few seconds, then the dashboard reconnects. Auto-start protection resumes on boot."))return;
-$("dot").style.background="#d29922";$("stxt").textContent="rebooting...";
-fetch("/reboot",{method:"POST"}).catch(function(){});   // connection drops as it restarts -- expected
-setTimeout(poll,9000);});
-$("powerbtn").addEventListener("click",function(e){e.preventDefault();
-if(!confirm("Power-up mode?\n\nDisables WiFi power-save and sets the CPU to 240 MHz (both persist across reboot). Snappier + more reliable link, at a bit more current draw."))return;
-fetch("/powerup",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
-$("pwrmsg").textContent="power-up: CPU "+d.cpu_mhz+" MHz, WiFi PS "+(d.wifi_ps?"on":"off");poll();})
-.catch(function(){$("pwrmsg").textContent="power-up request error"})});
-setupHover();setInterval(poll,2000);setInterval(loadHistory,30000);setInterval(loadStarts,15000);
-poll();loadHistory();loadStarts();
-</script></body></html>
+<div class="pwrrow" style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d">
+<div><div class="k">WiFi power saving</div><div class="v"><span id="psbadge">--</span></div></div>
+<button class="tx" id="psbtn">&hellip;</button>
+</div>
+<div class="pwrrow" style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d">
+<div><div class="k">Board</div><div class="v" style="font-size:13px">power-up = 240 MHz + PS off</div></div>
+<div style="display:flex;gap:8px"><button class="tx" id="powerbtn">Power-up</button><button class="tx" id="rebootbtn" style="border-color:#8957e5">Reboot</button></div>
+</div>
+<div class="k" id="pwrmsg" style="margin-top:10px">&nbsp;</div>
+</div>
+</div>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
+<script src="/app.js?v=420"></script>
+</body></html>
+)HTML";
+const char WIFI_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<div id="tip"></div>
+<header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
+<span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
+<nav class="tabs">
+<a href="/" data-p="/">Main</a>
+<a href="/wifi" data-p="/wifi">WiFi / Net</a>
+<a href="/voltage" data-p="/voltage">Voltage</a>
+<a href="/cpu" data-p="/cpu">CPU</a>
+<a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
+<a href="/logs" data-p="/logs">Log</a>
+<a href="/update" data-p="/update">Update</a>
+</nav>
+<div class="wrap">
+<div class="hero">
+<div class="metric"><div class="lbl">RSSI</div><span class="big" id="rssi">--</span><span class="u"> dBm</span></div>
+<div class="metric"><div class="lbl">PHY / link</div><span class="big" id="phy" style="font-size:26px">--</span></div>
+<div class="metric"><div class="lbl">TX power</div><span class="big" id="txpwr" style="font-size:30px">--</span><span class="u"> dBm</span></div>
+</div>
+<div class="grid">
+<div class="card"><div class="k">SSID</div><div class="v" id="ssid">--</div></div>
+<div class="card"><div class="k">BSSID (AP)</div><div class="v" style="font-size:14px" id="bssid">--</div></div>
+<div class="card"><div class="k">Channel</div><div class="v"><span id="ch">--</span></div></div>
+<div class="card"><div class="k">Protocol</div><div class="v" id="proto">--</div></div>
+<div class="card"><div class="k">Mode / IP</div><div class="v" style="font-size:13px" id="net">--</div></div>
+<div class="card"><div class="k">Clock (NTP)</div><div class="v" id="ntp">--</div></div>
+<div class="card"><div class="k">HTTP in total</div><div class="v"><span id="nin">--</span></div></div>
+<div class="card"><div class="k">HTTP out total</div><div class="v"><span id="nout">--</span></div></div>
+</div>
+<div class="clbl">WiFi RSSI dBm (24 h)</div><canvas id="g_rssi" width="800" height="104"></canvas>
+<div class="clbl">WiFi link rate Mbps (24 h) &mdash; from negotiated PHY</div><canvas id="g_link" width="800" height="104"></canvas>
+<div class="clbl">Network in B/min (24 h)</div><canvas id="g_nin" width="800" height="104"></canvas>
+<div class="clbl">Network out B/min (24 h)</div><canvas id="g_nout" width="800" height="104"></canvas>
+</div>
+<footer>fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
+<script>window.PAGE={cols:["rssi","link","net_in","net_out"],charts:[
+{id:"g_rssi",col:"rssi",dec:0,unit:"dBm",color:"#f778ba"},
+{id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
+{id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
+{id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
+<script src="/app.js?v=420"></script>
+</body></html>
+)HTML";
+const char VOLT_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<div id="tip"></div>
+<header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
+<span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
+<nav class="tabs">
+<a href="/" data-p="/">Main</a>
+<a href="/wifi" data-p="/wifi">WiFi / Net</a>
+<a href="/voltage" data-p="/voltage">Voltage</a>
+<a href="/cpu" data-p="/cpu">CPU</a>
+<a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
+<a href="/logs" data-p="/logs">Log</a>
+<a href="/update" data-p="/update">Update</a>
+</nav>
+<div class="wrap">
+<div class="hero">
+<div class="metric"><div class="lbl">Voltage</div><span class="big" id="vbatt">--</span><span class="u"> V</span></div>
+<div class="metric"><div class="lbl">Status</div><span class="big" id="vstat" style="font-size:26px">--</span></div>
+<div class="metric"><div class="lbl">Chip temp</div><span class="big" id="temp">--</span><span class="u"> &deg;C</span></div>
+</div>
+<div class="sub" id="sub">waiting for data&hellip;</div>
+<div class="card" style="margin:6px 0 8px">
+<div class="pwrrow">
+<div><div class="k">Battery drain rate</div><div class="v" style="font-size:24px"><span id="drate">--</span></div></div>
+<div style="text-align:right"><div class="k">Projected to 11.8 V</div><div class="v" id="dproj">--</div></div>
+</div>
+<div class="k" id="dmeta" style="margin-top:8px;text-transform:none;letter-spacing:0">&nbsp;</div>
+</div>
+<div class="clbl">Voltage (24 h)</div><canvas id="g_v" width="800" height="104"></canvas>
+<div class="clbl">Temperature &deg;C (24 h)</div><canvas id="g_t" width="800" height="104"></canvas>
+<div class="clbl">Battery drain rate mV/h (24 h) &mdash; below 0 = discharging</div><canvas id="g_d" width="800" height="104"></canvas>
+<div class="grid">
+<div class="card"><div class="k">ADC node</div><div class="v"><span id="adc">--</span> mV</div></div>
+<div class="card"><div class="k">Voltage status</div><div class="v" id="vstat2">--</div></div>
+</div>
+</div>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
+<script>window.PAGE={cols:["vbatt","temp","drain"],charts:[
+{id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
+{id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
+{id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
+<script src="/app.js?v=420"></script>
+</body></html>
+)HTML";
+const char CPU_HTML[]  PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<div id="tip"></div>
+<header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
+<span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
+<nav class="tabs">
+<a href="/" data-p="/">Main</a>
+<a href="/wifi" data-p="/wifi">WiFi / Net</a>
+<a href="/voltage" data-p="/voltage">Voltage</a>
+<a href="/cpu" data-p="/cpu">CPU</a>
+<a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
+<a href="/logs" data-p="/logs">Log</a>
+<a href="/update" data-p="/update">Update</a>
+</nav>
+<div class="wrap">
+<div class="hero">
+<div class="metric"><div class="lbl">CPU load (avg)</div><span class="big" id="cpuavg">--</span><span class="u"> %</span></div>
+<div class="metric"><div class="lbl">Clock</div><span class="big" id="cpu">--</span><span class="u"> MHz</span></div>
+<div class="metric"><div class="lbl">Uptime</div><span class="big" id="up" style="font-size:26px">--</span></div>
+</div>
+<div class="grid">
+<div class="card"><div class="k">CPU core 0</div><div class="v"><span id="cpu0">--</span> %</div></div>
+<div class="card"><div class="k">CPU core 1</div><div class="v"><span id="cpu1">--</span> %</div></div>
+<div class="card"><div class="k">Chip temp</div><div class="v"><span id="temp">--</span> &deg;C</div></div>
+<div class="card"><div class="k">Clock (NTP)</div><div class="v" id="ntp">--</div></div>
+</div>
+<div class="clbl">CPU core 0 load % (24 h)</div><canvas id="g_c0" width="800" height="104"></canvas>
+<div class="clbl">CPU core 1 load % (24 h)</div><canvas id="g_c1" width="800" height="104"></canvas>
+</div>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
+<script>window.PAGE={cols:["cpu0","cpu1"],charts:[
+{id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
+{id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
+<script src="/app.js?v=420"></script>
+</body></html>
+)HTML";
+const char MEM_HTML[]  PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<div id="tip"></div>
+<header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
+<span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
+<nav class="tabs">
+<a href="/" data-p="/">Main</a>
+<a href="/wifi" data-p="/wifi">WiFi / Net</a>
+<a href="/voltage" data-p="/voltage">Voltage</a>
+<a href="/cpu" data-p="/cpu">CPU</a>
+<a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
+<a href="/logs" data-p="/logs">Log</a>
+<a href="/update" data-p="/update">Update</a>
+</nav>
+<div class="wrap">
+<div class="grid">
+<div class="card"><div class="k">Free heap</div><div class="v"><span id="heap">--</span></div></div>
+<div class="card"><div class="k">Free PSRAM</div><div class="v"><span id="psram">--</span></div></div>
+<div class="card"><div class="k">Disk used</div><div class="v"><span id="disk">--</span></div></div>
+</div>
+<div class="clbl">Free memory KB (24 h)</div><canvas id="g_heap" width="800" height="104"></canvas>
+<div class="clbl">Disk used KB (24 h)</div><canvas id="g_disk" width="800" height="104"></canvas>
+</div>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
+<script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
+{id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
+{id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
+<script src="/app.js?v=420"></script>
+</body></html>
 )HTML";
 
-void handleDash() {
-  trackReq();
-  g_out_total += g_dashLen;
-  // charset declared on the header, not just the <meta> tag ??? belt and braces
-  // so the page can never be rendered as Latin-1 and show mojibake.
-  server.send_P(200, "text/html; charset=utf-8", DASH_HTML);
+// Shared assets are cacheable (versioned via ?v= in each page's tags) so tab
+// switches over a weak link don't re-download the CSS/JS every time.
+static void sendCached(const char* ctype, const char* body) {
+  server.sendHeader("Cache-Control", "max-age=86400");
+  g_out_total += strlen_P(body);
+  server.send_P(200, ctype, body);
 }
+static void sendPage(const char* body) {
+  g_out_total += strlen_P(body);
+  server.send_P(200, "text/html; charset=utf-8", body);
+}
+void handleAppCss()      { trackReq(); sendCached("text/css; charset=utf-8", APP_CSS); }
+void handleAppJs()       { trackReq(); sendCached("application/javascript; charset=utf-8", APP_JS); }
+void handleDash()        { trackReq(); sendPage(MAIN_HTML); }   // "/" = Main tab
+void handleWifiPage()    { trackReq(); sendPage(WIFI_HTML); }
+void handleVoltagePage() { trackReq(); sendPage(VOLT_HTML); }
+void handleCpuPage()     { trackReq(); sendPage(CPU_HTML); }
+void handleMemPage()     { trackReq(); sendPage(MEM_HTML); }
+
 
 void handleJson() {
   trackReq();
@@ -1487,12 +1757,25 @@ void handleJson() {
   float tC = g_lastTemp;             // cached by the safety task (it owns the temp sensor)
   String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   int    rssi = apMode ? 0 : (int)WiFi.RSSI();
-  char json[1450];
+  // WiFi link detail (kept in locals so the String temporaries survive snprintf).
+  String ssid  = apMode ? String(AP_SSID) : WiFi.SSID();
+  String bssid = apMode ? String("")      : WiFi.BSSIDstr();
+  int    chan  = WiFi.channel();
+  int8_t txq = 0; esp_wifi_get_max_tx_power(&txq);        // 0.25 dBm units
+  uint8_t proto = 0; esp_wifi_get_protocol(WIFI_IF_STA, &proto);
+  char pbuf[8]; int pi = 0;
+  if (proto & WIFI_PROTOCOL_11B) pbuf[pi++] = 'b';
+  if (proto & WIFI_PROTOCOL_11G) pbuf[pi++] = 'g';
+  if (proto & WIFI_PROTOCOL_11N) pbuf[pi++] = 'n';
+  if (proto & WIFI_PROTOCOL_LR)  pbuf[pi++] = 'L';
+  pbuf[pi] = 0;
+  char json[1650];
   snprintf(json, sizeof(json),
     "{\"vbatt\":%.2f,\"temp_c\":%.1f,\"adc_mv\":%d,\"divider\":%.3f,\"cal\":%.3f,"
     "\"rssi\":%d,\"uptime_s\":%lu,\"heap_free\":%u,\"heap_total\":%u,"
     "\"psram_free\":%u,\"psram_total\":%u,\"disk_used\":%u,\"disk_total\":%u,"
     "\"mode\":\"%s\",\"ip\":\"%s\",\"interval_s\":%d,\"samples\":%d,\"led\":\"%s\",\"fw\":\"%s\",\"rf\":\"%s\","
+    "\"ssid\":\"%s\",\"bssid\":\"%s\",\"ch\":%d,\"phy\":\"%s\",\"txpwr_dbm\":%.2f,\"proto\":\"%s\","
     "\"epoch\":%lu,\"time_ok\":%s,\"cpu_mhz\":%u,\"wifi_ps\":%s,"
     "\"as_en\":%s,\"as_volts\":%.2f,\"as_hold\":%lu,\"as_cool\":%lu,"
     "\"as_state\":\"%s\",\"as_low_s\":%lu,\"as_cool_s\":%lu,\"as_n\":%d,"
@@ -1507,6 +1790,7 @@ void handleJson() {
     (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes(),
     apMode ? "ap" : "sta", ip.c_str(), (int)(SAMPLE_MS / 1000), histCount, voltStatus(v), FW_VERSION,
     rfStatusStr(),
+    ssid.c_str(), bssid.c_str(), chan, apMode ? "AP" : staPhyMode(), txq / 4.0f, pbuf,
     (unsigned long)(timeIsValid() ? (uint32_t)time(nullptr) : 0), timeIsValid() ? "true" : "false",
     (unsigned)getCpuFrequencyMhz(), WiFi.getSleep() ? "true" : "false",
     g_as_en ? "true" : "false", g_as_volts,
@@ -1525,29 +1809,45 @@ void handleJson() {
 }
 
 // Streams the ring buffer oldest->newest as CSV (one line per sample).
+// GET /history[?cols=a,b,c] -- the ring buffer oldest->newest as CSV. ts is
+// always the first column; ?cols= selects a subset by name so each dashboard
+// page downloads only the columns it graphs (a weak link isn't asked to move
+// every column). No cols= returns all. Column names:
+//   vbatt temp heap_kb disk_kb net_in net_out rssi cpu0 cpu1 drain link
 void handleHistory() {
   trackReq();
+  static const char* NM[] = {"vbatt","temp","heap_kb","disk_kb","net_in",
+                             "net_out","rssi","cpu0","cpu1","drain","link"};
+  const int NC = 11;
+  bool sel[NC];
+  String want = server.arg("cols");
+  for (int i = 0; i < NC; i++) sel[i] = want.length() ? (want.indexOf(NM[i]) >= 0) : true;
+
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  const char* hdr = "ts,vbatt,temp,heap_kb,disk_kb,net_in,net_out,rssi,cpu0,cpu1,drain_mvph\n";
-  g_out_total += strlen(hdr);
-  server.sendContent(hdr);
+  String hdr = "ts";
+  for (int i = 0; i < NC; i++) if (sel[i]) { hdr += ','; hdr += NM[i]; }
+  hdr += '\n';
+  g_out_total += hdr.length(); server.sendContent(hdr);
+
   if (hist) {
     int oldest = (histCount < HIST_N) ? 0 : histHead;
     String chunk; chunk.reserve(2048);
     for (int n = 0; n < histCount; n++) {
       Sample& s = hist[(oldest + n) % HIST_N];
-      chunk += s.ts;               chunk += ',';
-      chunk += String(s.vbatt, 2); chunk += ',';
-      chunk += String(s.temp, 1);  chunk += ',';
-      chunk += s.heap_kb; chunk += ',';
-      chunk += s.disk_kb; chunk += ',';
-      chunk += s.net_in;  chunk += ',';
-      chunk += s.net_out; chunk += ',';
-      chunk += s.rssi;    chunk += ',';
-      chunk += s.cpu0;    chunk += ',';
-      chunk += s.cpu1;    chunk += ',';
-      chunk += s.drain;   chunk += '\n';
+      chunk += s.ts;
+      if (sel[0])  { chunk += ','; chunk += String(s.vbatt, 2); }
+      if (sel[1])  { chunk += ','; chunk += String(s.temp, 1); }
+      if (sel[2])  { chunk += ','; chunk += s.heap_kb; }
+      if (sel[3])  { chunk += ','; chunk += s.disk_kb; }
+      if (sel[4])  { chunk += ','; chunk += s.net_in; }
+      if (sel[5])  { chunk += ','; chunk += s.net_out; }
+      if (sel[6])  { chunk += ','; chunk += s.rssi; }
+      if (sel[7])  { chunk += ','; chunk += s.cpu0; }
+      if (sel[8])  { chunk += ','; chunk += s.cpu1; }
+      if (sel[9])  { chunk += ','; chunk += s.drain; }
+      if (sel[10]) { chunk += ','; chunk += s.link_mbps; }
+      chunk += '\n';
       if (chunk.length() > 1500) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; }
     }
     if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
@@ -1781,34 +2081,91 @@ void handleLogText() {
   server.sendContent("");
 }
 
-// GET /logs -- a small self-contained viewer that auto-refreshes /logtext at a
-// user-settable interval (persisted per-browser in localStorage).
+// GET /logs -- the event log as a tab: newest-first, paginated 25 lines/page,
+// with a settable auto-refresh. Reads /logtext (oldest-first) and reverses it
+// client-side, so /logtext stays raw-chronological for any tooling.
 void handleLogsPage() {
   trackReq();
-  static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>vroom logs</title>
-<style>body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:12px}
-h1{font:600 15px system-ui;margin:0 0 8px}#bar{margin-bottom:8px;font:12px system-ui;color:#8b949e}
-select{background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:3px 6px}
-pre{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-word;max-height:82vh;overflow:auto;margin:0}
-a{color:#58a6ff;text-decoration:none}</style></head><body>
-<h1>&#9889; vroom event log</h1>
-<div id="bar">auto-refresh <select id="iv">
-<option value="0">off</option><option value="2">2s</option><option value="5">5s</option>
-<option value="10">10s</option><option value="30">30s</option><option value="60">60s</option></select>
-<span id="st"></span> &middot; <a href="/">dashboard</a> &middot; <a href="/logtext">raw</a></div>
-<pre id="log">loading&hellip;</pre>
+  static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=420">
+<style>
+#log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
+#log div{padding:1px 0;border-bottom:1px solid #12161c}
+.pg{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}
+.pg button{background:#21262d;color:var(--fg);border:1px solid #30363d;border-radius:8px;padding:8px 14px;font-size:14px;cursor:pointer}
+.pg button:disabled{opacity:.4;cursor:default}
+.pg .k{color:var(--mut);font-size:13px}
+select.inp{width:auto}
+</style></head><body>
+<header><h1>&#9889; ESP32-S3 &middot; Event Log</h1>
+<span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
+<nav class="tabs">
+<a href="/" data-p="/">Main</a>
+<a href="/wifi" data-p="/wifi">WiFi / Net</a>
+<a href="/voltage" data-p="/voltage">Voltage</a>
+<a href="/cpu" data-p="/cpu">CPU</a>
+<a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
+<a href="/logs" data-p="/logs">Log</a>
+<a href="/update" data-p="/update">Update</a>
+</nav>
+<div class="wrap">
+<div class="pg">
+<button id="prev">&larr; Newer</button>
+<span class="k" id="pginfo">--</span>
+<button id="next">Older &rarr;</button>
+<span class="k">refresh</span>
+<select id="iv" class="inp">
+<option value="0">off</option><option value="5">5 s</option><option value="10">10 s</option>
+<option value="30">30 s</option><option value="60">60 s</option>
+</select>
+<button id="refresh">Refresh now</button>
+<a href="/logtext" style="color:#58a6ff;margin-left:auto">raw</a>
+</div>
+<div id="log">loading&hellip;</div>
+<div class="pg">
+<button id="prev2">&larr; Newer</button>
+<span class="k" id="pginfo2">--</span>
+<button id="next2">Older &rarr;</button>
+</div>
+</div>
+<footer>newest first &middot; 25 lines/page &middot; persisted to flash, survives reboot</footer>
 <script>
-var iv=document.getElementById("iv"),st=document.getElementById("st"),log=document.getElementById("log"),tm=null;
-function load(){fetch("/logtext",{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
-var atBottom=log.scrollTop+log.clientHeight>=log.scrollHeight-24;
-log.textContent=t||"(empty)";if(atBottom)log.scrollTop=log.scrollHeight;
-st.textContent="updated "+new Date().toLocaleTimeString();}).catch(function(){st.textContent="(unreachable)"})}
-function apply(){if(tm){clearInterval(tm);tm=null}var s=+iv.value;localStorage.vroomLogIv=s;if(s>0)tm=setInterval(load,s*1000)}
-iv.value=localStorage.vroomLogIv||"5";iv.addEventListener("change",apply);apply();load();
-</script></body></html>)HTML";
+function $(i){return document.getElementById(i)}
+var PS=25, page=0, lines=[], timer=null;
+function render(){
+  var tot=lines.length, pages=Math.max(1,Math.ceil(tot/PS));
+  if(page>=pages)page=pages-1; if(page<0)page=0;
+  var start=page*PS, slice=lines.slice(start,start+PS);
+  $("log").innerHTML = slice.length? slice.map(function(l){
+    return "<div>"+l.replace(/&/g,"&amp;").replace(/</g,"&lt;")+"</div>";}).join("") : '<div class="k">no log lines</div>';
+  var info="page "+(page+1)+" / "+pages+" &middot; "+tot+" lines";
+  $("pginfo").innerHTML=info; $("pginfo2").innerHTML=info;
+  var atNew=page<=0, atOld=page>=pages-1;
+  $("prev").disabled=atNew; $("prev2").disabled=atNew;
+  $("next").disabled=atOld; $("next2").disabled=atOld;
+}
+function load(){
+  fetch("/logtext",{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
+    var a=t.replace(/\s+$/,"").split("\n");
+    lines = a.filter(function(s){return s.length}).reverse();
+    $("dot").style.background="#3fb950";$("stxt").textContent="live";
+    render();
+  }).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnecting..."});
+}
+function setIv(v){ if(timer){clearInterval(timer);timer=null;} if(v>0)timer=setInterval(load,v*1000);
+  try{localStorage.vroomLogIv=v;}catch(e){} }
+$("prev").onclick=$("prev2").onclick=function(){page--;render();window.scrollTo(0,0)};
+$("next").onclick=$("next2").onclick=function(){page++;render();window.scrollTo(0,0)};
+$("refresh").onclick=load;
+$("iv").onchange=function(){setIv(+this.value)};
+document.querySelectorAll("nav.tabs a").forEach(function(a){if(a.getAttribute("data-p")===location.pathname)a.classList.add("on")});
+var iv=5; try{if(localStorage.vroomLogIv!==undefined)iv=+localStorage.vroomLogIv;}catch(e){}
+$("iv").value=iv; setIv(iv); load();
+</script>
+</body></html>)HTML";
   g_out_total += strlen_P(PAGE);
-  server.send_P(200, "text/html", PAGE);
+  server.send_P(200, "text/html; charset=utf-8", PAGE);
 }
 
 // POST /autostart?en=0|1&volts=12.2&hold=60&cool=7200
@@ -1905,21 +2262,29 @@ void handleStartsClear() {
 }
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32 OTA</title><style>
-body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;text-align:center;padding:40px}
-.b{background:#161b22;border:1px solid #21262d;border-radius:12px;padding:26px;max-width:440px;margin:auto}
-input[type=file]{margin:14px 0;color:#e6edf3}
-button{background:#238636;color:#fff;border:0;border-radius:8px;padding:10px 22px;font-size:15px;cursor:pointer}
-progress{width:100%;height:16px;margin-top:16px}#m{margin-top:12px;color:#8b949e;min-height:1.2em}
-a{color:#58a6ff}</style></head><body>
-<div class="b"><h2>&#11014;&#65039; ESP32-S3 Firmware Update</h2>
-<input type="file" id="fw" accept=".bin"><br>
-<button onclick="up()">Upload &amp; flash</button>
-<progress id="pb" value="0" max="100"></progress>
-<div id="m">pick the compiled .bin -- the board flashes it and reboots</div>
-<p><a href="/">&larr; back to dashboard</a></p></div>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
+<nav class="tabs">
+<a href="/" data-p="/">Main</a>
+<a href="/wifi" data-p="/wifi">WiFi / Net</a>
+<a href="/voltage" data-p="/voltage">Voltage</a>
+<a href="/cpu" data-p="/cpu">CPU</a>
+<a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
+<a href="/logs" data-p="/logs">Log</a>
+<a href="/update" data-p="/update">Update</a>
+</nav>
+<div class="wrap">
+<div class="card" style="max-width:460px;margin:10px auto">
+<div class="k">Upload a compiled .bin &mdash; the board flashes it and reboots</div>
+<input type="file" id="fw" accept=".bin" style="margin:14px 0;color:#e6edf3"><br>
+<button class="tx" style="background:#238636;border-color:#2ea043" onclick="up()">Upload &amp; flash</button>
+<progress id="pb" value="0" max="100" style="width:100%;height:16px;margin-top:16px"></progress>
+<div id="m" class="k" style="margin-top:12px;min-height:1.2em">pick the compiled .bin</div>
+</div>
+</div>
 <script>
+document.querySelectorAll("nav.tabs a").forEach(function(a){if(a.getAttribute("data-p")===location.pathname)a.classList.add("on")});
 function up(){var f=document.getElementById('fw').files[0];if(!f){return}
 var x=new XMLHttpRequest(),fd=new FormData();fd.append('firmware',f);
 x.upload.onprogress=function(e){if(e.lengthComputable){document.getElementById('pb').value=100*e.loaded/e.total}};
@@ -1930,9 +2295,28 @@ x.open('POST','/update');x.send(fd)}
 </script></body></html>
 )HTML";
 
+// STA link profile, applied whenever the STA (re)starts.
+//   TX power -> max the core exposes (~19.5 dBm): boosts our uplink; safe for the
+//   S3 and well under 2.4 GHz regulatory limits with the small whip.
+// NOTE ON PROTOCOL: 4.18 briefly forced 802.11b-only for range. Against THIS AP
+// that was a disaster -- latency jumped to ~1.7 s / 20% loss and a watchdog-fed
+// task starved into a TASK-WATCHDOG *reboot loop*. esp_wifi stores the protocol
+// in NVS, so we must explicitly set it back to the default b/g/n to undo the
+// persisted b-only -- doing nothing would leave the bad setting in flash.
+// esp_wifi_set_protocol() must run after the WiFi driver has started (WiFi.mode
+// does that), so this is always called after a mode change, before begin().
+static void applyWifiRangeProfile() {
+  esp_err_t e = esp_wifi_set_protocol(WIFI_IF_STA,
+                  WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);  // default; overwrites persisted b-only
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  Serial.printf("WiFi profile: protocol b/g/n (%s), TX 19.5 dBm\n",
+                e == ESP_OK ? "ok" : "set FAILED");
+}
+
 void startAP() {
   apMode = true;
   WiFi.mode(WIFI_AP);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);   // strong fallback AP too, so it's reachable from the house
   IPAddress apIP(192, 168, 4, 1), gw(192, 168, 4, 1), mask(255, 255, 255, 0);
   WiFi.softAPConfig(apIP, gw, mask);
   bool secured = strlen(AP_PASS) >= 8;
@@ -1992,11 +2376,12 @@ void setup() {
   g_log = (char(*)[LOG_LEN]) ps_malloc((size_t)LOG_LINES * LOG_LEN);   // event-log ring in PSRAM
   Serial.printf("Event log: %d lines (%u bytes) in %s\n", LOG_LINES,
                 (unsigned)((size_t)LOG_LINES * LOG_LEN), g_log ? "PSRAM" : "FAILED");
+  loadLogFromFlash();                              // replay pre-reboot log tail into the ring
+  Serial.printf("Restored %d prior log lines from flash.\n", g_logCount);
   loadHistory();
   Serial.printf("Loaded %d prior samples from flash.\n", histCount);
   loadStarts();
   Serial.printf("Loaded %d prior start events from flash.\n", g_startCount);
-  g_dashLen = strlen_P(DASH_HTML);
 
   setenv("TZ", TZ_INFO, 1); tzset();               // local time for logs even before NTP replies
   sntp_set_time_sync_notification_cb(onNtpSync);   // log each NTP sync
@@ -2007,6 +2392,7 @@ void setup() {
   Serial.printf("Connecting to WiFi '%s' ", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
+  applyWifiRangeProfile();             // 802.11b-only + max TX (range over speed) before we associate
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   WiFi.setSleep(g_wifi_ps);            // apply persisted WiFi power-save state
   uint32_t t0 = millis();
@@ -2024,7 +2410,13 @@ void setup() {
     startAP();   // boot-time failure -> AP immediately (no NTP in AP mode)
   }
 
-  server.on("/", handleDash);
+  server.on("/", handleDash);                 // Main tab
+  server.on("/wifi", handleWifiPage);         // WiFi / Network tab
+  server.on("/voltage", handleVoltagePage);   // Voltage tab
+  server.on("/cpu", handleCpuPage);           // CPU tab
+  server.on("/memdisk", handleMemPage);       // Memory / Disk tab
+  server.on("/app.css", handleAppCss);        // shared cached stylesheet
+  server.on("/app.js", handleAppJs);          // shared cached engine
   server.on("/json", handleJson);
   server.on("/history", handleHistory);
   server.on("/update", HTTP_GET, []() { trackReq(); server.send_P(200, "text/html; charset=utf-8", UPDATE_HTML); });
@@ -2032,6 +2424,7 @@ void setup() {
     []() {                                    // runs after the upload finishes
       bool ok = !Update.hasError();
       server.send(200, "text/plain", ok ? "OK - flashed" : "FAILED");
+      flushLogToFlash();                          // persist pending lines before the OTA reboot
       delay(800);
       if (ok) ESP.restart();
     },
@@ -2064,6 +2457,7 @@ void setup() {
   server.on("/reboot", HTTP_POST, []() {          // manual reboot from the dashboard
     trackReq();
     logLine("reboot requested via /reboot");
+    flushLogToFlash();                            // get that last line onto flash before we go
     server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
     delay(300);
     ESP.restart();
@@ -2133,6 +2527,7 @@ void loop() {
   if (apMode) dnsServer.processNextRequest();
   server.handleClient();
   if (SNMP_ENABLED) snmp.poll();
+  flushLogToFlash();                               // persist any new event-log lines (idle-cheap)
   uint32_t now = millis();
 
   if (DISPLAY_ENABLED) {
@@ -2157,6 +2552,7 @@ void loop() {
     lastApRetry = now;
     Serial.printf("AP mode: retrying home WiFi '%s'...\n", WIFI_SSID);
     WiFi.mode(WIFI_AP_STA);
+    applyWifiRangeProfile();                     // keep 11b + max TX on the retry
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < AP_RETRY_WAIT_MS) {
@@ -2168,6 +2564,7 @@ void loop() {
       dnsServer.stop();
       WiFi.softAPdisconnect(true);                 // tear the AP down, back to plain STA
       WiFi.mode(WIFI_STA);
+      applyWifiRangeProfile();                     // re-assert 11b + max TX after the mode flip
       WiFi.setSleep(g_wifi_ps);                    // re-apply the persisted power-save
       apMode    = false;
       downSince = 0;

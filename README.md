@@ -13,13 +13,20 @@ enough enclosure + wiring to live behind the OBD-II port. **No Pi, no
 display, no MQTT** in the shipped v1 build (see "v2 — optional
 telematics" below).
 
-**Status (2026-08-06): remote start + stop verified working** on the car
-(firmware 4.6). Confirmed end-to-end via the OBD-II battery tap — a board-fired
+**Status (2026-08-07): remote start + stop verified working** on the car
+(firmware 4.9). Confirmed end-to-end via the OBD-II battery tap — a board-fired
 Start produces the same crank-dip → 14.3 V charging signature as the real FOB.
 Low-voltage **auto-start is armed** on the installed unit (threshold + hold are
 user-settable); the dashboard shows a live **ETA to the next auto-start** and a
 **battery-drain-rate graph**, both projected/plotted from the parked drain
-regression. The build is installed behind the OBD-II port and running.
+regression, plus min/max lines, uptime, and combined CPU load.
+
+For the deployed unit, the sampling and low-voltage safety decision run in a
+**dedicated FreeRTOS task on a separate core** from the Wi-Fi/HTTP loop, guarded
+by a **task watchdog** (auto-reboot on a stall) — so a weak-signal Wi-Fi stall
+can't silently disable the auto-start, and a genuine hang self-recovers in ~30 s.
+A dashboard **reboot** button provides a manual kick. Installed behind the
+OBD-II port and running.
 
 ## Scope decision — ESP32-only is the build
 

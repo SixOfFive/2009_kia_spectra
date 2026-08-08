@@ -60,7 +60,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.11";            // 4.11 = temp-compensated drain fit, since-last-start, rolling /logs viewer
+const char* FW_VERSION = "4.12";            // 4.12 = event log lines carry full date+time (was time-only)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -246,9 +246,12 @@ void logLine(const char* fmt, ...) {
   va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
   char line[LOG_LEN];
   time_t tt = time(nullptr);
-  if (tt > 1700000000L) { struct tm* lt = localtime(&tt);
-    snprintf(line, sizeof(line), "%02d:%02d:%02d %s", lt->tm_hour, lt->tm_min, lt->tm_sec, msg);
-  } else {
+  if (tt > 1700000000L) {                       // wall clock: full date + time
+    struct tm* lt = localtime(&tt);
+    char stamp[24];
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", lt);
+    snprintf(line, sizeof(line), "%s %s", stamp, msg);
+  } else {                                       // pre-NTP: uptime seconds
     snprintf(line, sizeof(line), "+%lus %s", (unsigned long)(millis() / 1000), msg);
   }
   portENTER_CRITICAL(&g_logMux);

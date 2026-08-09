@@ -27,6 +27,7 @@
 #include "esp_system.h"     // esp_reset_reason() -- why the last boot happened
 #include "esp_sntp.h"       // NTP sync notification callback
 #include "esp_wifi.h"       // esp_wifi_set_protocol() -- force 802.11b for range/stability
+#include "esp_attr.h"       // RTC_NOINIT_ATTR -- WDT breadcrumbs that survive a reset
 #include <stdarg.h>         // logLine() variadic formatting
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
@@ -63,7 +64,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.20";            // 4.20 = dashboard split into tabbed pages (WiFi/Volt/CPU/Mem/Log); WiFi link-rate graph; paginated newest-first log
+const char* FW_VERSION = "4.23";            // 4.23 = drain plausibility cap (|rate|<=40 mV/h) -- 4.22 r2+window gate still let a reboot-spanning -112 mV/h through
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -436,6 +437,18 @@ TaskHandle_t      g_safetyTask   = nullptr;
 SemaphoreHandle_t g_rfMutex      = nullptr;
 const uint32_t    WDT_TIMEOUT_MS = 30000;  // reboot if a watched task stalls this long
 
+// WDT-culprit breadcrumbs. Each watched task stamps "what am I doing" into RTC
+// memory, which survives a TASK-WATCHDOG reset -- so the next boot can report
+// which task was stuck on what, instead of us guessing. On a reset the stuck
+// task's mark shows the blocking op; the healthy task's mark just shows its last
+// normal phase. A magic guards against garbage on a cold (power-on) boot.
+RTC_NOINIT_ATTR static char     g_loopMark[28];
+RTC_NOINIT_ATTR static char     g_safetyMark[28];
+RTC_NOINIT_ATTR static uint32_t g_markMagic;
+static const uint32_t MARK_MAGIC = 0x574D4B31;   // "WMK1"
+static inline void loopMark(const char* s)   { strncpy(g_loopMark,   s, sizeof(g_loopMark) - 1);   g_loopMark[sizeof(g_loopMark) - 1] = 0; }
+static inline void safetyMark(const char* s) { strncpy(g_safetyMark, s, sizeof(g_safetyMark) - 1); g_safetyMark[sizeof(g_safetyMark) - 1] = 0; }
+
 // Extra restraint state. These stop the three ways an automatic starter
 // misbehaves: firing while you're driving, firing over and over on a battery
 // that never really recovers, and cranking a car that isn't going to start.
@@ -709,6 +722,26 @@ DrainFit computeDrain() {
   return f;
 }
 
+// Is the parked-drain fit trustworthy enough to GRAPH and to project an ETA from?
+// computeDrain() reports ok as soon as there are 30 samples, but a just-settled
+// or post-gap window can show a steep, spurious slope -- that is the "spike" that
+// misrepresents the graph and produces a bogus short ETA ("4 h" when it's really
+// days). Requiring a decent fit quality AND at least an hour of continuous parked
+// data rejects those transients; until then drain reads "settling" (0 on the
+// graph, no ETA) instead of a wrong number.
+static const float    DRAIN_TRUST_R2  = 0.6f;
+static const uint32_t DRAIN_TRUST_WIN = 3600;    // >= 1 h continuous parked window
+static const float    DRAIN_MAX_MVPH  = 40.0f;   // |rate| above this isn't real parked drain --
+                                                 // it's a confound (reboot-spanning fit, a CPU-clock
+                                                 // voltage step, or post-drive surface-charge settling).
+                                                 // The trigger is voltage-threshold based, so capping
+                                                 // the *projection* here is safe; it just reads
+                                                 // "settling" until a believable slow slope emerges.
+static inline bool drainTrusted() {
+  return g_drain.ok && g_drain.r2 >= DRAIN_TRUST_R2 && g_drain.win_s >= DRAIN_TRUST_WIN
+      && fabsf(g_drain.mvph) <= DRAIN_MAX_MVPH;
+}
+
 // Estimated seconds until low-voltage auto-start would fire: project the current
 // parked drain rate (g_drain) down to the trigger threshold, then add the
 // sustain hold. Same math as the "projected to 11.8 V" countdown, but the target
@@ -723,7 +756,7 @@ long autoStartEtaS(float v) {
     long rem = (long)g_as_hold - (long)((millis() - g_lowSince) / 1000);
     return rem > 0 ? rem : 0;
   }
-  if (!g_drain.ok || g_drain.mvph >= 0) return -1;      // no fit, or not discharging
+  if (!drainTrusted() || g_drain.mvph >= 0) return -1;  // no trustworthy fit, or not discharging
   double vps = (-(double)g_drain.mvph) / 3600000.0;     // mV/h -> V/s (positive)
   if (vps < 1e-12) return -1;
   double toThresh = ((double)v - (double)g_as_volts) / vps;
@@ -745,8 +778,9 @@ void recordSample() {
   s.cpu0    = g_cpuN ? (uint8_t)(g_cpuAcc0 / g_cpuN + 0.5f) : (uint8_t)(g_cpu0 + 0.5f);
   s.cpu1    = g_cpuN ? (uint8_t)(g_cpuAcc1 / g_cpuN + 0.5f) : (uint8_t)(g_cpu1 + 0.5f);
   // Stored one cycle behind (computeDrain runs at the end of this function), which
-  // is a 60 s lag on a metric that moves over hours -- fine. 0 while the fit settles.
-  float mv = g_drain.ok ? g_drain.mvph : 0.0f;
+  // is a 60 s lag on a metric that moves over hours -- fine. 0 until the fit is
+  // trustworthy, so a settling/post-gap transient can't spike the graph.
+  float mv = drainTrusted() ? g_drain.mvph : 0.0f;
   if (mv >  32000.0f) mv =  32000.0f;
   if (mv < -32000.0f) mv = -32000.0f;
   s.drain   = (int16_t)lroundf(mv);
@@ -1101,10 +1135,11 @@ void safetyTaskFn(void*) {
   for (;;) {
     esp_task_wdt_reset();
     uint32_t now = millis();
-    readBatteryVolts();                    // ADC owner -> refreshes g_lastV / g_last_mv
-    g_lastTemp = temperatureRead();        // temp-sensor owner -> refreshes g_lastTemp
-    if (now - lastEval   >= 1000)      { lastEval   = now; evalAutoStart(g_lastV); }
-    if (now - lastSample >= SAMPLE_MS) { lastSample = now; recordSample(); }
+    safetyMark("adc");   readBatteryVolts();       // ADC owner -> refreshes g_lastV / g_last_mv (I2C to ADS1115)
+    safetyMark("temp");  g_lastTemp = temperatureRead();
+    if (now - lastEval   >= 1000)      { safetyMark("autostart"); lastEval   = now; evalAutoStart(g_lastV); }
+    if (now - lastSample >= SAMPLE_MS) { safetyMark("sample");    lastSample = now; recordSample(); }
+    safetyMark("idle");                            // if starved off core 0, this is the frozen mark
     vTaskDelay(pdMS_TO_TICKS(250));
   }
 }
@@ -2081,6 +2116,36 @@ void handleLogText() {
   server.sendContent("");
 }
 
+// GET /logpage?p=N -- server-side pagination for the /logs viewer: transfers
+// ONLY the requested page of the newest-first log (25 lines), never the whole
+// ring -- so a quick look is cheap on a flaky link. First response line is the
+// total line count (so the UI can show "page X / Y"); the rest are the page's
+// lines, newest first. /logtext stays the full raw (oldest-first) dump.
+static const int LOG_PAGE_SZ = 25;
+void handleLogPage() {
+  trackReq();
+  int p = server.arg("p").toInt();
+  if (p < 0) p = 0;
+  portENTER_CRITICAL(&g_logMux);                 // snapshot a consistent (head,count)
+  int head = g_logHead, total = g_logCount;
+  portEXIT_CRITICAL(&g_logMux);
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/plain", "");
+  char hd[24]; int hn = snprintf(hd, sizeof(hd), "%d\n", total);
+  g_out_total += hn; server.sendContent(hd);
+
+  String chunk; chunk.reserve(1600);
+  int startK = p * LOG_PAGE_SZ;                   // k=0 is the newest line
+  for (int k = startK; k < startK + LOG_PAGE_SZ && k < total; k++) {
+    int idx = (head - 1 - k + 2 * LOG_LINES) % LOG_LINES;
+    chunk += g_log[idx]; chunk += '\n';
+    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; }
+  }
+  if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
+  server.sendContent("");
+}
+
 // GET /logs -- the event log as a tab: newest-first, paginated 25 lines/page,
 // with a settable auto-refresh. Reads /logtext (oldest-first) and reverses it
 // client-side, so /logtext stays raw-chronological for any tooling.
@@ -2132,31 +2197,35 @@ select.inp{width:auto}
 <footer>newest first &middot; 25 lines/page &middot; persisted to flash, survives reboot</footer>
 <script>
 function $(i){return document.getElementById(i)}
-var PS=25, page=0, lines=[], timer=null;
-function render(){
-  var tot=lines.length, pages=Math.max(1,Math.ceil(tot/PS));
+var PS=25, page=0, total=0, timer=null;
+function render(lines){
+  var pages=Math.max(1,Math.ceil(total/PS));
   if(page>=pages)page=pages-1; if(page<0)page=0;
-  var start=page*PS, slice=lines.slice(start,start+PS);
-  $("log").innerHTML = slice.length? slice.map(function(l){
+  $("log").innerHTML = lines.length? lines.map(function(l){
     return "<div>"+l.replace(/&/g,"&amp;").replace(/</g,"&lt;")+"</div>";}).join("") : '<div class="k">no log lines</div>';
-  var info="page "+(page+1)+" / "+pages+" &middot; "+tot+" lines";
+  var info="page "+(page+1)+" / "+pages+" &middot; "+total+" lines";
   $("pginfo").innerHTML=info; $("pginfo2").innerHTML=info;
   var atNew=page<=0, atOld=page>=pages-1;
   $("prev").disabled=atNew; $("prev2").disabled=atNew;
   $("next").disabled=atOld; $("next2").disabled=atOld;
 }
+// Fetches ONLY the current page (25 lines + a total count) -- never the whole
+// log -- so a quick look stays cheap on a flaky link. Server returns the total
+// on the first line, then the page's lines already newest-first.
 function load(){
-  fetch("/logtext",{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
+  fetch("/logpage?p="+page,{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
     var a=t.replace(/\s+$/,"").split("\n");
-    lines = a.filter(function(s){return s.length}).reverse();
+    total=parseInt(a.shift(),10)||0;
+    var pages=Math.max(1,Math.ceil(total/PS));
+    if(page>pages-1&&page>0){page=pages-1;load();return;}   // rolled past the end -> clamp + refetch
     $("dot").style.background="#3fb950";$("stxt").textContent="live";
-    render();
+    render(a.filter(function(s){return s.length}));
   }).catch(function(e){$("dot").style.background="#d29922";$("stxt").textContent="reconnecting..."});
 }
 function setIv(v){ if(timer){clearInterval(timer);timer=null;} if(v>0)timer=setInterval(load,v*1000);
   try{localStorage.vroomLogIv=v;}catch(e){} }
-$("prev").onclick=$("prev2").onclick=function(){page--;render();window.scrollTo(0,0)};
-$("next").onclick=$("next2").onclick=function(){page++;render();window.scrollTo(0,0)};
+$("prev").onclick=$("prev2").onclick=function(){if(page>0){page--;load();window.scrollTo(0,0)}};
+$("next").onclick=$("next2").onclick=function(){page++;load();window.scrollTo(0,0)};
 $("refresh").onclick=load;
 $("iv").onchange=function(){setIv(+this.value)};
 document.querySelectorAll("nav.tabs a").forEach(function(a){if(a.getAttribute("data-p")===location.pathname)a.classList.add("on")});
@@ -2314,6 +2383,7 @@ static void applyWifiRangeProfile() {
 }
 
 void startAP() {
+  loopMark("wifi-startAP");
   apMode = true;
   WiFi.mode(WIFI_AP);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);   // strong fallback AP too, so it's reachable from the house
@@ -2388,6 +2458,14 @@ void setup() {
   WiFi.onEvent(onWiFiEvent);                        // verbose WiFi diagnostics -> event log
   logLine("boot: fw %s, CPU %u MHz, reset=%s",
           FW_VERSION, (unsigned)getCpuFrequencyMhz(), resetReasonName());
+  // If the last reset was the task watchdog, the breadcrumbs in RTC memory say
+  // what each watched task was doing when it hung -- the stuck one names the
+  // blocking op. (Guarded by a magic so a cold power-on doesn't print garbage.)
+  if (esp_reset_reason() == ESP_RST_TASK_WDT && g_markMagic == MARK_MAGIC)
+    logLine("  ^ WDT stall: loop was '%s', safety was '%s'",
+            g_loopMark[0] ? g_loopMark : "?", g_safetyMark[0] ? g_safetyMark : "?");
+  g_markMagic = MARK_MAGIC;                         // (re)validate for this session
+  loopMark("boot"); safetyMark("boot");
 
   Serial.printf("Connecting to WiFi '%s' ", WIFI_SSID);
   WiFi.mode(WIFI_STA);
@@ -2410,13 +2488,16 @@ void setup() {
     startAP();   // boot-time failure -> AP immediately (no NTP in AP mode)
   }
 
-  server.on("/", handleDash);                 // Main tab
-  server.on("/wifi", handleWifiPage);         // WiFi / Network tab
-  server.on("/voltage", handleVoltagePage);   // Voltage tab
-  server.on("/cpu", handleCpuPage);           // CPU tab
-  server.on("/memdisk", handleMemPage);       // Memory / Disk tab
-  server.on("/app.css", handleAppCss);        // shared cached stylesheet
-  server.on("/app.js", handleAppJs);          // shared cached engine
+  // Page routes are GET-only: /cpu also has an HTTP_POST handler (set the clock),
+  // and a method-less registration here would shadow it -> POST /cpu would serve
+  // the CPU page HTML instead of changing frequency ("CPU request error").
+  server.on("/", HTTP_GET, handleDash);        // Main tab
+  server.on("/wifi", HTTP_GET, handleWifiPage);        // WiFi / Network tab
+  server.on("/voltage", HTTP_GET, handleVoltagePage);  // Voltage tab
+  server.on("/cpu", HTTP_GET, handleCpuPage);          // CPU tab (POST /cpu below sets the clock)
+  server.on("/memdisk", HTTP_GET, handleMemPage);      // Memory / Disk tab
+  server.on("/app.css", HTTP_GET, handleAppCss);       // shared cached stylesheet
+  server.on("/app.js", HTTP_GET, handleAppJs);         // shared cached engine
   server.on("/json", handleJson);
   server.on("/history", handleHistory);
   server.on("/update", HTTP_GET, []() { trackReq(); server.send_P(200, "text/html; charset=utf-8", UPDATE_HTML); });
@@ -2434,6 +2515,7 @@ void setup() {
         Serial.printf("OTA start: %s\n", u.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
       } else if (u.status == UPLOAD_FILE_WRITE) {
+        loopMark("ota");
         esp_task_wdt_reset();   // a 1.1 MB OTA over weak WiFi can span many seconds; keep the WDT fed
         if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
       } else if (u.status == UPLOAD_FILE_END) {
@@ -2451,6 +2533,7 @@ void setup() {
   server.on("/powerup", HTTP_POST, handlePowerup);
   server.on("/logs", HTTP_GET, handleLogsPage);
   server.on("/logtext", HTTP_GET, handleLogText);
+  server.on("/logpage", HTTP_GET, handleLogPage);   // server-side paged log (25/req)
   server.on("/autostart", HTTP_POST, handleAutoStart);
   server.on("/starts", HTTP_GET, handleStarts);
   server.on("/starts", HTTP_POST, handleStartsClear);
@@ -2525,9 +2608,10 @@ uint32_t lastApRetry = 0;      // millis() of the last AP->STA reconnect attempt
 void loop() {
   esp_task_wdt_reset();                            // loop serviced a pass -> healthy
   if (apMode) dnsServer.processNextRequest();
-  server.handleClient();
-  if (SNMP_ENABLED) snmp.poll();
-  flushLogToFlash();                               // persist any new event-log lines (idle-cheap)
+  loopMark("http");   server.handleClient();       // top suspect: a slow client on a weak link
+  if (SNMP_ENABLED) { loopMark("snmp"); snmp.poll(); }
+  loopMark("logflush"); flushLogToFlash();          // persist any new event-log lines (idle-cheap)
+  loopMark("loop");
   uint32_t now = millis();
 
   if (DISPLAY_ENABLED) {
@@ -2551,6 +2635,7 @@ void loop() {
     // fallback AP isn't kicked off just because the retry failed.
     lastApRetry = now;
     Serial.printf("AP mode: retrying home WiFi '%s'...\n", WIFI_SSID);
+    loopMark("wifi-ap-retry");                     // driver calls below can block if the stack wedges
     WiFi.mode(WIFI_AP_STA);
     applyWifiRangeProfile();                     // keep 11b + max TX on the retry
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -2561,6 +2646,7 @@ void loop() {
       delay(100);
     }
     if (WiFi.status() == WL_CONNECTED) {
+      loopMark("wifi-rejoin");                    // teardown mode-flips below can also block
       dnsServer.stop();
       WiFi.softAPdisconnect(true);                 // tear the AP down, back to plain STA
       WiFi.mode(WIFI_STA);

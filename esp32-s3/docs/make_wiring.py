@@ -1,3 +1,4 @@
+import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -112,6 +113,6 @@ note = (
 )
 ax.text(-1.0, -3.8, note, ha="left", va="top", fontsize=8.6, color="#333", family="monospace")
 
-plt.savefig(r"C:\Users\sixoffive\Documents\Claude_Projects\esp32\docs\wiring-breadboard.png",
-            dpi=145, bbox_inches="tight", facecolor="white")
-print("saved")
+_out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wiring-breadboard.png")
+plt.savefig(_out, dpi=145, bbox_inches="tight", facecolor="white")
+print("saved", _out)

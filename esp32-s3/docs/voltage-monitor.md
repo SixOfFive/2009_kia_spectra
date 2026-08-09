@@ -98,10 +98,11 @@ reads ≈ 3.3 V.) This proves the math and lets you calibrate (section 6).
 ## 4. Flash the firmware
 
 ```powershell
-$cli = "C:\Users\sixoffive\Documents\Claude_Projects\esp32\tools\arduino-cli\arduino-cli.exe"
-$cfg = "C:\Users\sixoffive\Documents\Claude_Projects\esp32\tools\arduino-cli\arduino-cli.yaml"
-$dir = "C:\Users\sixoffive\Documents\Claude_Projects\esp32\esp32-s3\voltage_monitor"
-& $cli compile --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=custom" -u -p COM6 $dir --config-file $cfg
+# Prereq: arduino-cli installed with the esp32 core + libraries (see esp32-s3/README.md).
+# Run from the repo root; the sketch is esp32-s3/voltage_monitor.
+$dir = ".\esp32-s3\voltage_monitor"
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=custom" -u -p COM6 $dir
+# (If arduino-cli uses a non-default core/library location, add: --config-file <your-arduino-cli.yaml>)
 ```
 
 On boot the serial monitor (115200) prints the assigned IP, e.g. `WiFi OK. IP = 192.168.x.x`.

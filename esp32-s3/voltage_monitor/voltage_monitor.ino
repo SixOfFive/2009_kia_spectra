@@ -64,7 +64,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.24";            // 4.24 = feed the WDT during slow-client sends; per-endpoint stall breadcrumbs
+const char* FW_VERSION = "4.25";            // 4.25 = /scan (WiFi antenna health check) on top of 4.24 WDT feeding
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -2020,6 +2020,59 @@ void handleRfRegs() {
   server.send(200, "application/json", j);
 }
 
+// GET /scan -- WiFi survey, used as an ANTENNA HEALTH CHECK.
+//
+// Why a scan rather than a single RSSI: one RSSI number only means something if
+// you already know the distance and the AP's transmit power. A scan compares
+// THIS receiver against many transmitters at once, so it can be checked against
+// a phone or laptop standing in the same spot. A healthy front end sees roughly
+// the same AP list at roughly the same levels. A disconnected, pinched or
+// metal-buried antenna shows far fewer APs AND a uniform deficit (~20-30 dB for
+// an unseated U.FL) across ALL of them -- and that pattern cannot be explained
+// away by distance or AP power, which is what makes it conclusive.
+//
+// Costs: scanNetworks() blocks for a few seconds because it visits every
+// channel, and it briefly takes the radio off the home channel, so an already
+// marginal STA link may drop and re-associate. On-demand only, never periodic.
+// The WDT is fed either side; the safety task on core 0 is untouched by this.
+void handleScan() {
+  trackReq();
+  esp_task_wdt_reset();
+  int n = WiFi.scanNetworks(false, true);   // synchronous, include hidden SSIDs
+  esp_task_wdt_reset();
+  if (n < 0) n = 0;                         // -1 running / -2 failed -> report none
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  String chunk; chunk.reserve(1024);
+  chunk += "{\"ok\":true,\"n\":"; chunk += n;
+  chunk += ",\"self_rssi\":";
+  chunk += (WiFi.status() == WL_CONNECTED) ? (int)WiFi.RSSI() : 0;
+  chunk += ",\"aps\":[";
+  for (int i = 0; i < n; i++) {
+    if (i) chunk += ',';
+    chunk += "{\"ssid\":\"";
+    String ss = WiFi.SSID(i);               // hidden APs return "" -- expected
+    for (unsigned k = 0; k < ss.length(); k++) {
+      char c = ss[k];                       // minimal JSON escaping
+      if (c == '"' || c == '\\') { chunk += '\\'; chunk += c; }
+      else if ((uint8_t)c < 0x20)   { chunk += ' '; }
+      else                          { chunk += c; }
+    }
+    chunk += "\",\"bssid\":\""; chunk += WiFi.BSSIDstr(i);
+    chunk += "\",\"rssi\":";     chunk += (int)WiFi.RSSI(i);
+    chunk += ",\"ch\":";          chunk += (int)WiFi.channel(i);
+    chunk += '}';
+    if (chunk.length() > 1200) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }
+  }
+  chunk += "]}";
+  g_out_total += chunk.length(); server.sendContent(chunk);
+  server.sendContent("");
+  WiFi.scanDelete();                        // release the driver's result buffer
+  logLine("scan: %d APs visible, own link %d dBm", n,
+          (WiFi.status() == WL_CONNECTED) ? (int)WiFi.RSSI() : 0);
+}
+
 // GET /rftest -- non-transmitting CC1101 health check (see CC1101::selfTest).
 // Confirms SPI/power, config register read-back, and TX-state entry WITHOUT
 // radiating a carrier. Cannot start the car. Safe to hit any time.
@@ -2535,6 +2588,7 @@ void setup() {
   server.on("/rftest", HTTP_GET, handleRfTest);
   server.on("/xtaltest", HTTP_GET, handleXtalTest);
   server.on("/rfregs", HTTP_GET, handleRfRegs);
+  server.on("/scan", HTTP_GET, handleScan);      // WiFi survey / antenna health check
   server.on("/rftune", HTTP_POST, handleRfTune);
   server.on("/cpu", HTTP_POST, handleCpu);
   server.on("/wifips", HTTP_POST, handleWifiPs);

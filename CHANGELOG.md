@@ -82,6 +82,37 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-11 — fw 4.25
+
+### Added
+- **`GET /scan` — WiFi survey, intended as an antenna health check.** Returns
+  every visible AP as `{ssid, bssid, rssi, ch}` plus the board's own `self_rssi`,
+  hidden SSIDs included.
+
+  **Why a scan rather than reading a single RSSI:** one RSSI number only means
+  something if you already know the distance and the AP's transmit power. A scan
+  compares *this* receiver against many transmitters at once, so it can be held
+  against a phone or laptop standing in the same spot. A healthy front end sees
+  roughly the same AP list at roughly the same levels; a disconnected, pinched or
+  metal-buried antenna shows **far fewer APs and a uniform ~20–30 dB deficit
+  across all of them**. That pattern cannot be explained away by distance or AP
+  power, which is what makes it conclusive — and it is the closest thing to the
+  "can I measure the antenna?" question, since the ESP32 exposes no VSWR, no
+  reflected power and no antenna-detect pin, and DC resistance is meaningless on
+  an antenna that is open or near-short by design.
+
+  **Costs, deliberately accepted:** `scanNetworks()` blocks for a few seconds
+  because it visits every channel, and it briefly takes the radio off the home
+  channel, so an already marginal STA link may drop and re-associate. On-demand
+  only, never periodic. The WDT is fed either side (the 4.24 mechanism), and the
+  safety task on core 0 is untouched, so auto-start is unaffected throughout.
+  Registered explicitly as `HTTP_GET` per the 4.22 route-shadowing lesson.
+
+Compile-verified: 1,198,907 bytes (38 % of the 3 MB app slot), globals 61,544
+(18 % DRAM) — +1,499 bytes of flash and +32 bytes of RAM over 4.24. Not flashed.
+
+---
+
 ## 2026-08-10 — fw 4.24
 
 ### Fixed

@@ -14,6 +14,74 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-11 — field diagnosis (no firmware change)
+
+Live telemetry pulled off the installed board (fw 4.23). No release; recorded
+because it changes the priority of several open items.
+
+### Known issues
+- **Auto-start can be prevented from ever arming by watchdog reboots.**
+  `AS_PARK_NEED` is 900 s of park-confirm, and **a reboot resets the counter to
+  zero**. Observed watchdog reboots on 2026-08-10 were 42, 39 and **17 minutes**
+  apart — the 17-minute gap only just cleared the 900 s window. **If resets land
+  under ~15 minutes apart, the low-voltage protection never arms at all**, and
+  nothing surfaces that. This is the same class of silent-protection-loss the fw
+  4.9 hardening was written to eliminate, arriving by a different route. Caught
+  live at `as_state: park-wait, as_park_s: 642/900`, which then rebooted before
+  arming.
+- **Watchdog resets are not "isolated".** Five recorded in the log ring, four of
+  them inside 97 minutes on 2026-08-10. The earlier "leave it for now" assessment
+  was made against much sparser evidence.
+- **Every WDT breadcrumb reads identically:**
+  `^ WDT stall: loop was 'http', safety was 'idle'` — the safety task on core 0 is
+  healthy in every case; the loop task always hangs in the HTTP path. This is
+  direct confirmation that fw 4.24 targets the right code, and that the core-0
+  split is doing its job.
+- **Reproduced on demand:** a `GET /history?cols=vbatt,rssi` (~36 KB) over the
+  in-car link hung for 90 s and rebooted the board. On 4.23 that chunked send
+  never feeds the watchdog — exactly the defect 4.24 fixes.
+- **The deployed threshold is 12.2 V, not 12.4 V.** `as_volts` reads **12.2**
+  live. `AS_DEF_VOLTS` is `12.4f` in source, but the live value comes from NVS,
+  so the cold-weather recommendation has never reached the installed unit. The
+  dashboard's own help text on that page recommends 12.4 V.
+
+### Root cause identified — Wi-Fi instability is the AP, not the board
+The single AP `E8:9C:25:B2:23:E8` (SSID `IoT`) was observed on channels
+**5 → 4 → 3 → 7 → 8 → 3 → 4** in under 48 hours. Auto-channel-selection is running
+continuously and each hop deauthenticates the client. Disconnect reasons match:
+`auth-expire`, `assoc-expire`, `auth-leave`, `4way-handshake-timeout`,
+`auth-fail`, `assoc-fail`. A 4-way handshake failing at −66 dBm is not a range
+problem.
+
+**Pinning `IoT` to a fixed channel (1, 6 or 11) and disabling auto-channel is the
+highest-leverage fix available** — likely worth more than any firmware change,
+since it should reduce the disconnects, the AP-fallback episodes, and the HTTP
+stalls that trigger the reboots.
+
+**The Wi-Fi antenna is not the problem.** RSSI is a consistent **−64 to −70 dBm**
+across dozens of associations over three days, TX power is maxed at 19.5 dBm, and
+the board negotiates 11n-HT20 and gets an IP in 2–3 s whenever the AP cooperates.
+An unseated U.FL costs ~20–25 dB and would put it at −85 to −95, where it would
+not associate cleanly at all.
+
+### Measured drain — the parasitic fault is present and dominant
+The live least-squares fit is untrustworthy and correctly rejected
+(`drain_mvph +3.2`, `r² 0.223`, `as_eta_s -1`) — the 4.23 plausibility cap doing
+its job. A better measurement comes from the 67.4 h park itself: last engine run
+2026-08-08 16:52, battery now **12.33 V** (rested, ≈63 % SoC). From a
+post-alternator ~12.6–12.7 V that is **−4.0 to −5.5 mV/h**, i.e. **200–275 mA at
+50 Ah** or **140–190 mA at a degraded 35 Ah**, against the ~91 mA the power budget
+predicts for car + board. `docs/power-budget.md` §6: "worse than −2.5 mV/h → the
+fault is present and dominates everything in this document." Roughly double that.
+
+Treat the figure as indicative — the starting voltage is inferred, not measured —
+but it points the same way as everything else. Board's own share confirmed live at
+State C (`cpu_mhz 80`, `wifi_ps false`): ~61 mA ≈ 0.77 W.
+
+Also: `/starts` returns `[]` — **auto-start has never fired.**
+
+---
+
 ## 2026-08-10 — fw 4.24
 
 ### Fixed

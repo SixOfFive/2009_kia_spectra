@@ -100,7 +100,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.26";            // 4.26 = runtime-configurable WiFi (STA + AP fallback + timers + radio), NVS-backed
+const char* FW_VERSION = "4.27";            // 4.27 = bound per-write stalls so ONE slow send cannot outlast the watchdog (4.24 was insufficient)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -606,6 +606,22 @@ float readBatteryVolts() {
   g_lastV = (g_last_mv / 1000.0f) * DIVIDER * CAL;
   return g_lastV;
 }
+
+// Bound how long a SINGLE chunked write may block.
+//
+// NetworkClient::write() retries up to WIFI_CLIENT_MAX_WRITE_RETRY (10) times,
+// each doing a 1 s select() plus a send() bounded by SO_SNDTIMEO -- and
+// WebServer sets that from HTTP_MAX_SEND_WAIT, which is 5000 ms. So one write
+// against a stalled client can block ~10 x (1 + 5) = 60 s, TWICE the 30 s task
+// watchdog.
+//
+// This is why fw 4.24 did not fix it. 4.24 fed the WDT *between* chunks, which
+// helps a merely-slow client, but the feed sits AFTER the write -- and a write
+// that never returns is never followed. Confirmed in the field on 4.26:
+// "WDT stall: loop was '/history'". Bounding the socket to 1000 ms caps one
+// write at ~10 x (1 + 1) = 20 s, comfortably inside the watchdog, after which
+// the per-chunk feed does its job.
+static void boundSendStall() { server.client().setTimeout(1000); }
 
 void trackReq() {
   String u = server.uri();
@@ -1999,6 +2015,7 @@ void handleJson() {
 //   vbatt temp heap_kb disk_kb net_in net_out rssi cpu0 cpu1 drain link
 void handleHistory() {
   trackReq();
+  boundSendStall();
   static const char* NM[] = {"vbatt","temp","heap_kb","disk_kb","net_in",
                              "net_out","rssi","cpu0","cpu1","drain","link"};
   const int NC = 11;
@@ -2031,7 +2048,8 @@ void handleHistory() {
       if (sel[9])  { chunk += ','; chunk += s.drain; }
       if (sel[10]) { chunk += ','; chunk += s.link_mbps; }
       chunk += '\n';
-      if (chunk.length() > 1500) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }  // slow client streaming: a legit slow send must not trip the WDT
+      if (chunk.length() > 1500) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset();
+        if (!server.client().connected()) break; }    // client vanished mid-stream -- stop writing into a dead socket
     }
     if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   }
@@ -2178,6 +2196,7 @@ void handleRfRegs() {
 // The WDT is fed either side; the safety task on core 0 is untouched by this.
 void handleScan() {
   trackReq();
+  boundSendStall();
   // Persist a "starting" marker BEFORE blocking. logLine() only writes the RAM
   // ring; flash persistence normally happens in loop(), which cannot run while
   // the scan blocks -- so without an explicit flush a brownout or non-WDT reset
@@ -2432,6 +2451,7 @@ void handlePowerup() {
 // GET /logtext -- the rolling event log as plain text, oldest line first.
 void handleLogText() {
   trackReq();
+  boundSendStall();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/plain", "");
   int cnt = g_logCount;
@@ -2439,7 +2459,8 @@ void handleLogText() {
   String chunk; chunk.reserve(1600);
   for (int k = 0; k < cnt; k++) {
     chunk += g_log[(start + k) % LOG_LINES]; chunk += '\n';
-    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }  // feed WDT between chunks (slow client)
+    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset();
+      if (!server.client().connected()) break; }   // client vanished mid-stream
   }
   if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   server.sendContent("");
@@ -2453,6 +2474,7 @@ void handleLogText() {
 static const int LOG_PAGE_SZ = 25;
 void handleLogPage() {
   trackReq();
+  boundSendStall();
   int p = server.arg("p").toInt();
   if (p < 0) p = 0;
   portENTER_CRITICAL(&g_logMux);                 // snapshot a consistent (head,count)
@@ -2469,7 +2491,8 @@ void handleLogPage() {
   for (int k = startK; k < startK + LOG_PAGE_SZ && k < total; k++) {
     int idx = (head - 1 - k + 2 * LOG_LINES) % LOG_LINES;
     chunk += g_log[idx]; chunk += '\n';
-    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }  // feed WDT between chunks (slow client)
+    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset();
+      if (!server.client().connected()) break; }   // client vanished mid-stream
   }
   if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   server.sendContent("");
@@ -2629,6 +2652,7 @@ void handleAutoStart() {
 // GET /starts -- the engine-start log, newest first, as a JSON array.
 void handleStarts() {
   trackReq();
+  boundSendStall();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
   server.sendContent("[");

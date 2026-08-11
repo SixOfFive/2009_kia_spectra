@@ -82,6 +82,59 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-11 — fw 4.27: bound per-write stalls (4.24 was insufficient)
+
+### Fixed
+- **`/history` was still rebooting the board on 4.26 — fw 4.24 did not fix it.**
+  Caught in the field by the 4.24 breadcrumb, which named the endpoint:
+  `^ WDT stall: loop was '/history', safety was 'idle'` (on 4.23 the same line
+  read a generic `'http'`, so the per-endpoint naming is what localised it).
+
+  **Why 4.24 failed.** It fed the watchdog *between* chunks. The stall is inside
+  a *single write*: `NetworkClient::write()` retries up to
+  `WIFI_CLIENT_MAX_WRITE_RETRY` (10) times, each a 1 s `select()` plus a `send()`
+  bounded by `SO_SNDTIMEO` — which `WebServer` sets from `HTTP_MAX_SEND_WAIT`,
+  **5000 ms**. So one write against a stalled client blocks up to
+  **10 × (1 + 5) = 60 s, twice the 30 s watchdog**, and the
+  `esp_task_wdt_reset()` sits *after* that write, so it is never reached.
+  Feeding between chunks helps a merely-slow client and does nothing for a stuck
+  one — which is what a flaky link actually produces.
+
+  **The fix bounds the socket instead of the loop:** `boundSendStall()` calls
+  `server.client().setTimeout(1000)` at the top of every streaming handler
+  (`/history`, `/logtext`, `/logpage`, `/starts`, `/scan`), capping one write at
+  ~10 × (1 + 1) = 20 s — inside the watchdog, after which the per-chunk feed
+  works as intended. Each send loop also breaks on `!client().connected()` rather
+  than writing into a dead socket.
+
+  **Verified:** `GET /history?cols=vbatt,rssi` returned 29,232 bytes / 1,441 rows
+  in **3.7 s** with uptime still climbing. The same request hung 90 s and
+  rebooted 4.23. Caveat: the link had also improved to −67 dBm by then, so this
+  does not prove the fix at −77; the mechanism analysis is what carries it.
+
+  **Lesson worth keeping:** when a watchdog fires inside I/O, bound the I/O.
+  Feeding the dog around a blocking call only works if the call itself is bounded.
+
+### Measured drain — the parasitic fault is large and confirmed
+With `/history` finally retrievable, a least-squares fit over **25.7 h / 1,440
+samples**: **−6.91 mV/h at r² 0.741** (12.47 → 12.34 V). Converting with
+`I = |mV/h| × C`: **345 mA at 50 Ah, 242 mA at 35 Ah.** `docs/power-budget.md` §6
+predicts −1.82 mV/h for car + board and −7.26 mV/h for "car + board + 300 mA
+fault" — so the measurement lands essentially on the 300 mA-fault row. Net of the
+board (~61 mA) and a healthy car (~30 mA), **the unlocated fault is roughly
+150–250 mA**, dominating everything else in that document, exactly as it warned.
+
+At that rate the 150 mV of headroom from 12.35 V to the 12.2 V trigger is about
+**21 hours** — so if the car is not driven, auto-start should fire for the first
+time within a day.
+
+### Also changed (no flash — via the new 4.26 config endpoint)
+`boot_s` 20 → **45 s** and `ap_after_s` 300 → **180 s**. The 4.26 log showed a
+boot-connect window expiring **three seconds** before association completed,
+which cost ten minutes in AP fallback. First real payoff of runtime config.
+
+---
+
 ## 2026-08-11 — fw 4.26: runtime-configurable WiFi
 
 ### Added

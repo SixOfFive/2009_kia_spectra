@@ -82,6 +82,68 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-11 — fw 4.26: runtime-configurable WiFi
+
+### Added
+- **Full WiFi configuration at runtime, NVS-backed, in a new section on the WiFi
+  tab.** `secrets.h` now only *seeds* the config on first boot; it no longer
+  dictates it, so changing networks no longer means a reflash.
+
+  | Group | Settings |
+  |---|---|
+  | Home network | SSID (with scan-assisted picker), password, minimum accepted security (any / WPA / WPA2 / WPA3) |
+  | Fallback AP | SSID, password, security (Open / WPA2 / WPA+WPA2 / WPA2+WPA3), channel, hidden |
+  | Timers | raise-AP-after, retry-home-every, per-retry wait, boot connect window |
+  | Radio | TX power (12 steps, −1 to 19.5 dBm), protocol (b/g/n, b/g, b-only, +LR), hostname |
+
+- `GET /wificfg` returns current settings; `POST /wificfg` validates and applies.
+
+### The safety design, which is the point
+This board is bolted behind a dash and can start a car. A mistyped SSID or
+password would strand it on its fallback AP — and until now there was nothing you
+could *do* from that AP, so recovery meant a USB reflash of an inaccessible
+board. So credential changes are **applied, verified, and automatically
+reverted**: `applyPendingWifi()` runs from `loop()` (never the HTTP handler, so
+the reply escapes before the radio drops), tries the new network for the boot
+connect window, and on failure restores the previous credentials and reconnects.
+A typo now costs one connection cycle instead of a dashboard disassembly.
+
+Supporting choices:
+- **Passwords travel in the POST body, never the query string.** `trackReq()`
+  stamps `server.uri()` into the RTC breadcrumb, which is written to the
+  persistent flash log on a watchdog reset — a password in a URL would end up in
+  that log. (`_currentUri` is set after the query is stripped, so this is belt
+  and braces, but the log is durable and worth being careful about.)
+- **Passwords are never returned by `GET /wificfg`** — only `*_pass_set`
+  booleans, so a stored password cannot be read back off the device. A blank
+  password field means "leave unchanged".
+- **A secured AP with a password under 8 characters is refused**, because
+  `softAP()` would silently fail to start and that AP is the only recovery path.
+- Every out-of-range or corrupt NVS value falls back to something that still
+  connects, never to something that strands the board.
+- `WiFi.setMinSecurity()` is now always called explicitly. The Arduino default is
+  already `WPA2_PSK`, so the config default is WPA2 to preserve exactly today's
+  behaviour rather than silently loosening it.
+- `esp_wifi_set_protocol` persists to NVS in the driver — the fw 4.18 lesson — so
+  the protocol is always written explicitly rather than assumed.
+
+### Validated in a browser before flashing
+Per the 4.20 precedent, the real `WIFI_HTML` / `APP_CSS` / `APP_JS` were extracted
+from the sketch and served against mock endpoints. Confirmed: all 20 controls
+present, every field populated from `/wificfg`, the timer hint computing
+("raise the AP after 5 min, then retry home every 10 min"), the scan populating
+the SSID picker while correctly excluding hidden networks, the POST going out as
+`application/x-www-form-urlencoded` with **the password in the body and not the
+URL**, and the password field self-clearing after save. Zero console errors.
+
+**Also caught pre-flash:** `app.css` and `app.js` changed, but every page still
+requested them as `?v=420` — browsers would have served stale cached assets
+against the new firmware. Bumped to `?v=426` across all 12 references.
+
+Compile-verified: 1,216,928 bytes (38 % of the app slot), globals 61,672 (18 %).
+
+---
+
 ## 2026-08-11 — fw 4.25 flashed; antenna CLEARED, weak AP identified
 
 4.25 went out by OTA at −77 dBm: 1,199,367 bytes in 21.5 s (55.6 KB/s), clean

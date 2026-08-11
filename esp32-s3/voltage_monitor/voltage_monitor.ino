@@ -64,7 +64,43 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.25";            // 4.25 = /scan (WiFi antenna health check) on top of 4.24 WDT feeding
+// ---- Runtime-configurable WiFi (NVS-backed) -------------------------------
+// Everything below can be changed from the WiFi tab and survives reboots. The
+// constants above are only the FIRST-BOOT defaults, used until the NVS keys
+// exist. secrets.h therefore seeds the config; it no longer dictates it.
+//
+// Safety note: this device lives behind a dash and can start a car. A bad SSID
+// or password would strand it on its fallback AP with no way to fix it, so
+// credential changes go through applyPendingWifi() -- try, verify, and revert
+// automatically if the new network does not come up.
+String   g_sta_ssid, g_sta_pass;          // home network
+String   g_ap_ssid,  g_ap_pass;           // fallback AP
+String   g_hostname;
+uint8_t  g_ap_auth    = 1;                // 0 open, 1 WPA2-PSK, 2 WPA/WPA2 mixed, 3 WPA2/WPA3
+uint8_t  g_ap_chan    = 1;                // fallback AP channel
+bool     g_ap_hidden  = false;
+uint8_t  g_sta_minsec = 2;                // min accepted AP security: 0 any, 1 WPA, 2 WPA2, 3 WPA3
+                                          // (2 = the Arduino default, i.e. today's behaviour)
+uint32_t g_ap_after_s = 300;              // home WiFi down this long -> raise the AP
+uint32_t g_ap_retry_s = 600;              // from the AP, retry home this often
+uint32_t g_ap_wait_s  = 10;               // how long each retry waits for a join
+uint32_t g_boot_s     = 20;               // boot-time connect window
+float    g_tx_dbm     = 19.5f;            // TX power (snapped to the nearest supported step)
+uint8_t  g_proto      = 7;                // bit0 = 11b, bit1 = 11g, bit2 = 11n, bit3 = LR
+
+// Pending credential switch, driven from loop() so the HTTP reply gets out first.
+bool     g_wifiPend    = false;
+String   g_pendSsid, g_pendPass;
+
+// Forward declarations: the /wificfg handlers appear earlier in this file than
+// these helpers, and Arduino's auto-prototype pass does not cover statics.
+static void             applyWifiRangeProfile();
+static wifi_auth_mode_t staMinAuth();
+static uint8_t          protoBits();
+static wifi_power_t     txEnumFor(float dbm);
+
+
+const char* FW_VERSION = "4.26";            // 4.26 = runtime-configurable WiFi (STA + AP fallback + timers + radio), NVS-backed
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -1255,6 +1291,9 @@ static const SnmpEntry SNMP_OIDS[] = {
 };
 
 const char APP_CSS[] PROGMEM = R"CSS(
+.wrow{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+select.inp{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:5px 6px}
+
 :root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#8b949e}
 *{box-sizing:border-box}
 body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
@@ -1491,6 +1530,59 @@ function attachHandlers(){
     if(!confirm("Reboot the board now?\n\nIt drops off WiFi for a few seconds, then the dashboard reconnects. Auto-start protection resumes on boot."))return;
     C("dot","#d29922");T("stxt","rebooting...");
     fetch("/reboot",{method:"POST"}).catch(function(){});setTimeout(poll,9000);});
+  // ---- WiFi configuration (WiFi tab only; all null-guarded) ----
+  function wcSet(id,v){var e=$(id);if(e!=null&&v!==undefined&&v!==null)e.value=v}
+  function wcHint(){var a=+($("wAfter")||{}).value||0,r=+($("wRetry")||{}).value||0;
+    T("wTimerHint","= raise the AP after "+(a/60).toFixed(a%60?1:0)+" min, then retry home every "+(r/60).toFixed(r%60?1:0)+" min");}
+  function wcLoad(){
+    fetch("/wificfg",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+      wcSet("wSsid",d.sta_ssid); wcSet("wMinsec",d.sta_minsec);
+      wcSet("wApSsid",d.ap_ssid); wcSet("wApAuth",d.ap_auth); wcSet("wApChan",d.ap_chan);
+      var h=$("wApHid"); if(h)h.checked=!!d.ap_hidden;
+      wcSet("wAfter",d.ap_after_s); wcSet("wRetry",d.ap_retry_s);
+      wcSet("wWait",d.ap_wait_s); wcSet("wBoot",d.boot_s);
+      wcSet("wTx",d.tx_dbm); wcSet("wProto",d.proto); wcSet("wHost",d.hostname);
+      var p=$("wPass"),ap=$("wApPass");
+      if(p)p.placeholder=d.sta_pass_set?"unchanged (set)":"not set";
+      if(ap)ap.placeholder=d.ap_pass_set?"unchanged (set)":"not set";
+      wcHint();
+    }).catch(function(){T("wMsg","could not load current settings")});
+  }
+  if($("wSsid")){
+    wcLoad();
+    ["wAfter","wRetry"].forEach(function(i){var e=$(i);if(e)e.addEventListener("input",wcHint)});
+    var sb=$("wScanBtn");if(sb)sb.addEventListener("click",function(){
+      T("wScanMsg","scanning (a few seconds; the link may blip)...");
+      fetch("/scan",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+        var dl=$("wScan");if(dl){dl.innerHTML="";
+          var seen={};d.aps.forEach(function(a){if(a.ssid&&!seen[a.ssid]){seen[a.ssid]=1;
+            var o=document.createElement("option");o.value=a.ssid;dl.appendChild(o)}})}
+        var top=d.aps.slice(0,6).map(function(a){return (a.ssid||"(hidden)")+" "+a.rssi+"dBm ch"+a.ch}).join(" | ");
+        T("wScanMsg",d.n+" networks, own link "+d.self_rssi+" dBm -- "+top);
+      }).catch(function(){T("wScanMsg","scan failed (the link may have dropped during it)")});
+    });
+    var sv=$("wSave");if(sv)sv.addEventListener("click",function(){
+      var ss=$("wSsid").value, pw2=$("wPass").value;
+      if(!confirm("Save WiFi settings?\n\nSSID: "+ss+(pw2?"\nPassword: (changing)":"\nPassword: (unchanged)")+
+        "\n\nIf the SSID or password changed the board switches now and this page will drop for a few seconds. "+
+        "If the new network does not come up it reverts to the old one automatically. Check the Log tab for the result."))return;
+      var kv=[["sta_ssid",ss],["sta_pass",pw2],["sta_minsec",$("wMinsec").value],
+        ["ap_ssid",$("wApSsid").value],["ap_pass",$("wApPass").value],["ap_auth",$("wApAuth").value],
+        ["ap_chan",$("wApChan").value],["ap_hidden",$("wApHid").checked?"1":"0"],
+        ["ap_after_s",$("wAfter").value],["ap_retry_s",$("wRetry").value],
+        ["ap_wait_s",$("wWait").value],["boot_s",$("wBoot").value],
+        ["tx_dbm",$("wTx").value],["proto",$("wProto").value],["hostname",$("wHost").value]];
+      var body=kv.map(function(x){return encodeURIComponent(x[0])+"="+encodeURIComponent(x[1])}).join("&");
+      T("wMsg","saving...");
+      fetch("/wificfg",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body})
+        .then(function(r){return r.json()}).then(function(d){
+          T("wMsg",d.ok?d.detail:("save failed: "+(d.detail||"error")));
+          if(d.ok){var p=$("wPass");if(p)p.value="";var a=$("wApPass");if(a)a.value="";
+            if(d.pending)setTimeout(wcLoad,12000); else wcLoad();}
+        }).catch(function(){T("wMsg","request error -- if the SSID changed this is expected; check the Log tab")});
+    });
+  }
+
   var pw=$("powerbtn");if(pw)pw.addEventListener("click",function(e){e.preventDefault();
     if(!confirm("Power-up mode?\n\nDisables WiFi power-save and sets the CPU to 240 MHz (both persist across reboot). Snappier + more reliable link, at a bit more current draw."))return;
     fetch("/powerup",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
@@ -1512,7 +1604,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1607,13 +1699,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=420"></script>
+<script src="/app.js?v=426"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1642,6 +1734,55 @@ const char WIFI_HTML[] PROGMEM = R"HTML(
 <div class="card"><div class="k">HTTP in total</div><div class="v"><span id="nin">--</span></div></div>
 <div class="card"><div class="k">HTTP out total</div><div class="v"><span id="nout">--</span></div></div>
 </div>
+<div class="clbl">WiFi configuration</div>
+<div class="card" style="margin-bottom:10px">
+
+<div class="k" style="margin-bottom:6px">Home network &mdash; what it connects to</div>
+<div class="wrow">
+<div><div class="k">SSID</div><input id="wSsid" class="inp" style="width:190px" list="wScan" autocomplete="off"><datalist id="wScan"></datalist></div>
+<div><div class="k">Password</div><input id="wPass" class="inp" type="password" style="width:170px" placeholder="unchanged" autocomplete="new-password"></div>
+<div><div class="k">Min security</div><select id="wMinsec" class="inp"><option value="0">Any / open</option><option value="1">WPA or better</option><option value="2">WPA2 or better</option><option value="3">WPA3 only</option></select></div>
+<button class="tx" id="wScanBtn">Scan for networks</button>
+</div>
+<div class="k" id="wScanMsg" style="margin-top:6px">&nbsp;</div>
+
+<div class="k" style="margin:14px 0 6px;padding-top:12px;border-top:1px solid #21262d">Fallback access point &mdash; what it becomes when it can't connect</div>
+<div class="wrow">
+<div><div class="k">AP SSID</div><input id="wApSsid" class="inp" style="width:190px" autocomplete="off"></div>
+<div><div class="k">AP password</div><input id="wApPass" class="inp" type="password" style="width:170px" placeholder="unchanged" autocomplete="new-password"></div>
+<div><div class="k">AP security</div><select id="wApAuth" class="inp"><option value="0">Open</option><option value="1">WPA2-PSK</option><option value="2">WPA / WPA2</option><option value="3">WPA2 / WPA3</option></select></div>
+<div><div class="k">AP channel</div><input id="wApChan" class="inp" type="number" min="1" max="13" style="width:70px"></div>
+<div><div class="k">Hidden</div><input id="wApHid" type="checkbox" style="transform:scale(1.4);margin-top:8px"></div>
+</div>
+
+<div class="k" style="margin:14px 0 6px;padding-top:12px;border-top:1px solid #21262d">Timers</div>
+<div class="wrow">
+<div><div class="k">Give up &amp; raise AP after</div><input id="wAfter" class="inp" type="number" min="30" max="3600" style="width:90px"> <span class="k">s (30&ndash;3600)</span></div>
+<div><div class="k">Retry home every</div><input id="wRetry" class="inp" type="number" min="60" max="7200" style="width:90px"> <span class="k">s (60&ndash;7200)</span></div>
+<div><div class="k">Each retry waits</div><input id="wWait" class="inp" type="number" min="5" max="120" style="width:80px"> <span class="k">s (5&ndash;120)</span></div>
+<div><div class="k">Boot connect window</div><input id="wBoot" class="inp" type="number" min="5" max="300" style="width:80px"> <span class="k">s (5&ndash;300)</span></div>
+</div>
+<div class="k" id="wTimerHint" style="margin-top:6px">&nbsp;</div>
+
+<div class="k" style="margin:14px 0 6px;padding-top:12px;border-top:1px solid #21262d">Radio</div>
+<div class="wrow">
+<div><div class="k">TX power</div><select id="wTx" class="inp"><option value="19.5">19.5 dBm (max)</option><option value="19">19 dBm</option><option value="18.5">18.5 dBm</option><option value="17">17 dBm</option><option value="15">15 dBm</option><option value="13">13 dBm</option><option value="11">11 dBm</option><option value="8.5">8.5 dBm</option><option value="7">7 dBm</option><option value="5">5 dBm</option><option value="2">2 dBm</option><option value="-1">-1 dBm</option></select></div>
+<div><div class="k">Protocol</div><select id="wProto" class="inp"><option value="7">b/g/n (default)</option><option value="3">b/g</option><option value="1">b only (see warning)</option><option value="15">b/g/n + LR</option></select></div>
+<div><div class="k">Hostname</div><input id="wHost" class="inp" style="width:150px" autocomplete="off"></div>
+<button class="tx" id="wSave" style="border-color:#8957e5">Save WiFi settings</button>
+</div>
+<div class="k" id="wMsg" style="margin-top:10px">&nbsp;</div>
+
+<div class="k" style="margin-top:12px;line-height:1.7;text-transform:none;letter-spacing:0">
+Changing the <b>SSID or password</b> is applied live and <b>verified</b>: if the new network does not come up
+within the boot-connect window, the board <b>reverts to the previous one by itself</b>. You will lose this page
+for a few seconds either way &mdash; check the <b>Log</b> tab for the result, which is written to flash and
+survives a reboot. <b>b only</b> is kept for completeness but was a disaster against this AP in fw 4.18
+(latency ~1.7 s, 20&nbsp;% loss, watchdog reboot loop) &mdash; leave it on b/g/n unless testing. Every setting
+here is stored in NVS and survives reboots.
+</div>
+</div>
+
 <div class="clbl">WiFi RSSI dBm (24 h)</div><canvas id="g_rssi" width="800" height="104"></canvas>
 <div class="clbl">WiFi link rate Mbps (24 h) &mdash; from negotiated PHY</div><canvas id="g_link" width="800" height="104"></canvas>
 <div class="clbl">Network in B/min (24 h)</div><canvas id="g_nin" width="800" height="104"></canvas>
@@ -1653,13 +1794,13 @@ const char WIFI_HTML[] PROGMEM = R"HTML(
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=420"></script>
+<script src="/app.js?v=426"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1699,13 +1840,13 @@ const char VOLT_HTML[] PROGMEM = R"HTML(
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=420"></script>
+<script src="/app.js?v=426"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1737,13 +1878,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=420"></script>
+<script src="/app.js?v=426"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1769,7 +1910,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=420"></script>
+<script src="/app.js?v=426"></script>
 </body></html>
 )HTML";
 
@@ -1800,7 +1941,7 @@ void handleJson() {
   String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   int    rssi = apMode ? 0 : (int)WiFi.RSSI();
   // WiFi link detail (kept in locals so the String temporaries survive snprintf).
-  String ssid  = apMode ? String(AP_SSID) : WiFi.SSID();
+  String ssid  = apMode ? g_ap_ssid : WiFi.SSID();
   String bssid = apMode ? String("")      : WiFi.BSSIDstr();
   int    chan  = WiFi.channel();
   int8_t txq = 0; esp_wifi_get_max_tx_power(&txq);        // 0.25 dBm units
@@ -2081,6 +2222,126 @@ void handleScan() {
           (WiFi.status() == WL_CONNECTED) ? (int)WiFi.RSSI() : 0);
 }
 
+// ---- WiFi configuration ---------------------------------------------------
+// GET /wificfg  -> current settings. Passwords are NEVER returned, only whether
+// one is set, so a saved password cannot be read back out of the device.
+static void jsonEscTo(String& out, const String& in) {
+  for (unsigned i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if ((uint8_t)c < 0x20)  { out += ' '; }
+    else                          { out += c; }
+  }
+}
+
+void handleWifiCfgGet() {
+  trackReq();
+  String j; j.reserve(640);
+  j += "{\"ok\":true,\"sta_ssid\":\"";      jsonEscTo(j, g_sta_ssid);
+  j += "\",\"sta_pass_set\":";                j += g_sta_pass.length() ? "true" : "false";
+  j += ",\"ap_ssid\":\"";                     jsonEscTo(j, g_ap_ssid);
+  j += "\",\"ap_pass_set\":";                 j += g_ap_pass.length() ? "true" : "false";
+  j += ",\"hostname\":\"";                    jsonEscTo(j, g_hostname);
+  j += "\",\"ap_auth\":";                     j += g_ap_auth;
+  j += ",\"ap_chan\":";                        j += g_ap_chan;
+  j += ",\"ap_hidden\":";                      j += g_ap_hidden ? "true" : "false";
+  j += ",\"sta_minsec\":";                     j += g_sta_minsec;
+  j += ",\"ap_after_s\":";                     j += g_ap_after_s;
+  j += ",\"ap_retry_s\":";                     j += g_ap_retry_s;
+  j += ",\"ap_wait_s\":";                      j += g_ap_wait_s;
+  j += ",\"boot_s\":";                         j += g_boot_s;
+  j += ",\"tx_dbm\":";                         j += String(g_tx_dbm, 1);
+  j += ",\"proto\":";                          j += g_proto;
+  j += ",\"pending\":";                        j += g_wifiPend ? "true" : "false";
+  j += "}";
+  g_out_total += j.length();
+  server.send(200, "application/json", j);
+}
+
+// POST /wificfg -- validate, persist, apply. Credentials are read from the POST
+// BODY (not the query string) so they never land in a URL. Non-credential
+// settings apply immediately; a changed SSID/password is handed to
+// applyPendingWifi() so this reply gets out before the radio drops.
+void handleWifiCfgSave() {
+  trackReq();
+  String err;
+  auto num = [&](const char* k, long lo, long hi, uint32_t cur) -> uint32_t {
+    if (!server.hasArg(k)) return cur;
+    long v = server.arg(k).toInt();
+    if (v < lo || v > hi) { err = String(k) + " out of range"; return cur; }
+    return (uint32_t)v;
+  };
+
+  uint32_t ap_after = num("ap_after_s", 30, 3600, g_ap_after_s);
+  uint32_t ap_retry = num("ap_retry_s", 60, 7200, g_ap_retry_s);
+  uint32_t ap_wait  = num("ap_wait_s",   5,  120, g_ap_wait_s);
+  uint32_t boot_s   = num("boot_s",      5,  300, g_boot_s);
+  uint32_t ap_chan  = num("ap_chan",     1,   13, g_ap_chan);
+  uint32_t ap_auth  = num("ap_auth",     0,    3, g_ap_auth);
+  uint32_t minsec   = num("sta_minsec",  0,    3, g_sta_minsec);
+  uint32_t proto    = num("proto",       1,   15, g_proto);
+  float    tx       = server.hasArg("tx_dbm") ? server.arg("tx_dbm").toFloat() : g_tx_dbm;
+  if (tx < -1.0f || tx > 19.5f) err = "tx_dbm out of range";
+
+  String staSsid = server.hasArg("sta_ssid") ? server.arg("sta_ssid") : g_sta_ssid;
+  String apSsid  = server.hasArg("ap_ssid")  ? server.arg("ap_ssid")  : g_ap_ssid;
+  String host    = server.hasArg("hostname") ? server.arg("hostname") : g_hostname;
+  // Blank password field means "leave it alone" -- otherwise the UI could not
+  // show the form without either leaking or clearing the stored password.
+  String staPass = (server.hasArg("sta_pass") && server.arg("sta_pass").length()) ? server.arg("sta_pass") : g_sta_pass;
+  String apPass  = (server.hasArg("ap_pass")  && server.arg("ap_pass").length())  ? server.arg("ap_pass")  : g_ap_pass;
+
+  if (!staSsid.length() || staSsid.length() > 32) err = "STA SSID must be 1-32 chars";
+  if (!apSsid.length()  || apSsid.length()  > 32) err = "AP SSID must be 1-32 chars";
+  if (!host.length()    || host.length()    > 31) err = "hostname must be 1-31 chars";
+  // A secured AP with a short password silently fails to start -- that would
+  // strand the only recovery path, so refuse it here.
+  if (ap_auth != 0 && apPass.length() < 8) err = "AP password must be 8+ chars (or set security to Open)";
+  if (staPass.length() && staPass.length() < 8) err = "STA password must be 8+ chars";
+
+  if (err.length()) {
+    String j = "{\"ok\":false,\"detail\":\""; jsonEscTo(j, err); j += "\"}";
+    g_out_total += j.length(); server.send(400, "application/json", j); return;
+  }
+
+  bool credsChanged = (staSsid != g_sta_ssid) || (staPass != g_sta_pass);
+
+  // Persist + apply everything that cannot strand us.
+  g_ap_after_s = ap_after; g_ap_retry_s = ap_retry; g_ap_wait_s = ap_wait;
+  g_boot_s = boot_s; g_ap_chan = ap_chan; g_ap_auth = ap_auth;
+  g_sta_minsec = minsec; g_proto = proto; g_tx_dbm = tx;
+  g_ap_ssid = apSsid; g_ap_pass = apPass; g_hostname = host;
+  g_ap_hidden = server.hasArg("ap_hidden") ? (server.arg("ap_hidden") == "1") : g_ap_hidden;
+
+  prefs.putUInt ("ap_after_s", g_ap_after_s); prefs.putUInt ("ap_retry_s", g_ap_retry_s);
+  prefs.putUInt ("ap_wait_s",  g_ap_wait_s);  prefs.putUInt ("boot_s",     g_boot_s);
+  prefs.putUChar("ap_chan",    g_ap_chan);    prefs.putUChar("ap_auth",    g_ap_auth);
+  prefs.putUChar("sta_minsec", g_sta_minsec); prefs.putUChar("proto",      g_proto);
+  prefs.putFloat("tx_dbm",     g_tx_dbm);     prefs.putBool ("ap_hidden",  g_ap_hidden);
+  prefs.putString("ap_ssid",   g_ap_ssid);    prefs.putString("ap_pass",   g_ap_pass);
+  prefs.putString("hostname",  g_hostname);
+
+  if (!apMode) { applyWifiRangeProfile(); WiFi.setMinSecurity(staMinAuth()); }  // live radio settings
+
+  if (credsChanged) {                 // hand off; loop() does the risky part
+    g_pendSsid = staSsid; g_pendPass = staPass; g_wifiPend = true;
+  }
+  logLine("wificfg saved: AP '%s' ch%u auth%u, fallback %lus/retry %lus/wait %lus, boot %lus, TX %.1f, proto 0x%02X%s",
+          g_ap_ssid.c_str(), (unsigned)g_ap_chan, (unsigned)g_ap_auth,
+          (unsigned long)g_ap_after_s, (unsigned long)g_ap_retry_s, (unsigned long)g_ap_wait_s,
+          (unsigned long)g_boot_s, g_tx_dbm, protoBits(),
+          credsChanged ? " [STA change pending]" : "");
+
+  String j = "{\"ok\":true,\"pending\":";
+  j += credsChanged ? "true" : "false";
+  j += ",\"detail\":\"";
+  j += credsChanged ? "settings saved; switching network now -- if it fails the board reverts automatically"
+                    : "settings saved";
+  j += "\"}";
+  g_out_total += j.length();
+  server.send(200, "application/json", j);
+}
+
 // GET /rftest -- non-transmitting CC1101 health check (see CC1101::selfTest).
 // Confirms SPI/power, config register read-back, and TX-state entry WITHOUT
 // radiating a carrier. Cannot start the car. Safe to hit any time.
@@ -2221,7 +2482,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=420">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=426">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -2401,7 +2662,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=420"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -2443,28 +2704,108 @@ x.open('POST','/update');x.send(fd)}
 // persisted b-only -- doing nothing would leave the bad setting in flash.
 // esp_wifi_set_protocol() must run after the WiFi driver has started (WiFi.mode
 // does that), so this is always called after a mode change, before begin().
+// TX power is an enum of discrete steps, not a continuous value -- snap to the
+// nearest one the radio actually supports so the UI can offer plain dBm numbers.
+static wifi_power_t txEnumFor(float dbm) {
+  struct { float d; wifi_power_t e; } T[] = {
+    {-1.0f, WIFI_POWER_MINUS_1dBm}, {2.0f, WIFI_POWER_2dBm},   {5.0f, WIFI_POWER_5dBm},
+    {7.0f,  WIFI_POWER_7dBm},       {8.5f, WIFI_POWER_8_5dBm}, {11.0f, WIFI_POWER_11dBm},
+    {13.0f, WIFI_POWER_13dBm},      {15.0f, WIFI_POWER_15dBm}, {17.0f, WIFI_POWER_17dBm},
+    {18.5f, WIFI_POWER_18_5dBm},    {19.0f, WIFI_POWER_19dBm}, {19.5f, WIFI_POWER_19_5dBm} };
+  int best = 11; float bd = 1e9f;
+  for (int i = 0; i < 12; i++) { float d = fabsf(T[i].d - dbm); if (d < bd) { bd = d; best = i; } }
+  return T[best].e;
+}
+
+static uint8_t protoBits() {
+  uint8_t p = 0;
+  if (g_proto & 1) p |= WIFI_PROTOCOL_11B;
+  if (g_proto & 2) p |= WIFI_PROTOCOL_11G;
+  if (g_proto & 4) p |= WIFI_PROTOCOL_11N;
+  if (g_proto & 8) p |= WIFI_PROTOCOL_LR;
+  if (!p) p = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;   // never leave it empty
+  return p;
+}
+
+// Minimum AP security the STA will associate to. Refusing weak crypto is a real
+// setting, but set it too high and the board silently cannot join -- so the
+// default is "accept anything the AP offers".
+static wifi_auth_mode_t staMinAuth() {
+  switch (g_sta_minsec) {
+    case 1:  return WIFI_AUTH_WPA_PSK;
+    case 2:  return WIFI_AUTH_WPA2_PSK;
+    case 3:  return WIFI_AUTH_WPA3_PSK;
+    default: return WIFI_AUTH_OPEN;
+  }
+}
+
+static void loadWifiCfg() {
+  g_sta_ssid   = prefs.getString("sta_ssid", WIFI_SSID);
+  g_sta_pass   = prefs.getString("sta_pass", WIFI_PASS);
+  g_ap_ssid    = prefs.getString("ap_ssid",  AP_SSID);
+  g_ap_pass    = prefs.getString("ap_pass",  AP_PASS);
+  g_hostname   = prefs.getString("hostname", HOSTNAME);
+  g_ap_auth    = prefs.getUChar("ap_auth",   1);
+  g_ap_chan    = prefs.getUChar("ap_chan",   1);
+  g_ap_hidden  = prefs.getBool ("ap_hidden", false);
+  g_sta_minsec = prefs.getUChar("sta_minsec",2);
+  g_ap_after_s = prefs.getUInt ("ap_after_s", AP_AFTER_DOWN_MS / 1000);
+  g_ap_retry_s = prefs.getUInt ("ap_retry_s", AP_RETRY_STA_MS / 1000);
+  g_ap_wait_s  = prefs.getUInt ("ap_wait_s",  AP_RETRY_WAIT_MS / 1000);
+  g_boot_s     = prefs.getUInt ("boot_s",     20);
+  g_tx_dbm     = prefs.getFloat("tx_dbm",     19.5f);
+  g_proto      = prefs.getUChar("proto",      7);
+  // Corrupt or out-of-range values must fall back to something that still
+  // connects -- never to something that strands the board.
+  if (!g_sta_ssid.length())                       g_sta_ssid = WIFI_SSID;
+  if (!g_ap_ssid.length())                        g_ap_ssid  = AP_SSID;
+  if (!g_hostname.length())                       g_hostname = HOSTNAME;
+  if (g_ap_chan < 1 || g_ap_chan > 13)            g_ap_chan  = 1;
+  if (g_ap_auth > 3)                              g_ap_auth  = 1;
+  if (g_sta_minsec > 3)                           g_sta_minsec = 0;
+  if (g_ap_after_s < 30  || g_ap_after_s > 3600)  g_ap_after_s = 300;
+  if (g_ap_retry_s < 60  || g_ap_retry_s > 7200)  g_ap_retry_s = 600;
+  if (g_ap_wait_s  < 5   || g_ap_wait_s  > 120)   g_ap_wait_s  = 10;
+  if (g_boot_s     < 5   || g_boot_s     > 300)   g_boot_s     = 20;
+  if (g_tx_dbm < -1.0f   || g_tx_dbm > 19.5f)     g_tx_dbm     = 19.5f;
+  if (!g_proto || g_proto > 15)                   g_proto      = 7;
+}
+
+// Applies protocol + TX power to the STA interface. esp_wifi_set_protocol
+// PERSISTS TO NVS in the driver, which is why fw 4.18's 11b-only setting
+// survived a reflash -- so this always writes explicitly rather than assuming
+// a default. Called after every mode change, before begin().
 static void applyWifiRangeProfile() {
-  esp_err_t e = esp_wifi_set_protocol(WIFI_IF_STA,
-                  WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);  // default; overwrites persisted b-only
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  Serial.printf("WiFi profile: protocol b/g/n (%s), TX 19.5 dBm\n",
-                e == ESP_OK ? "ok" : "set FAILED");
+  esp_err_t e = esp_wifi_set_protocol(WIFI_IF_STA, protoBits());
+  WiFi.setTxPower(txEnumFor(g_tx_dbm));
+  Serial.printf("WiFi profile: proto 0x%02X (%s), TX %.1f dBm\n",
+                protoBits(), e == ESP_OK ? "ok" : "set FAILED", g_tx_dbm);
 }
 
 void startAP() {
   loopMark("wifi-startAP");
   apMode = true;
   WiFi.mode(WIFI_AP);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);   // strong fallback AP too, so it's reachable from the house
+  WiFi.setTxPower(txEnumFor(g_tx_dbm));  // strong fallback AP too, so it's reachable from the house
   IPAddress apIP(192, 168, 4, 1), gw(192, 168, 4, 1), mask(255, 255, 255, 0);
   WiFi.softAPConfig(apIP, gw, mask);
-  bool secured = strlen(AP_PASS) >= 8;
-  WiFi.softAP(AP_SSID, secured ? AP_PASS : nullptr);
+  bool secured = (g_ap_auth != 0) && g_ap_pass.length() >= 8;   // WPA needs 8+ chars
+  WiFi.softAP(g_ap_ssid.c_str(), secured ? g_ap_pass.c_str() : nullptr,
+              g_ap_chan, g_ap_hidden ? 1 : 0);
+  if (secured && g_ap_auth > 1) {          // softAP() only gives WPA2-PSK; widen it if asked
+    wifi_config_t c;
+    if (esp_wifi_get_config(WIFI_IF_AP, &c) == ESP_OK) {
+      c.ap.authmode = (g_ap_auth == 2) ? WIFI_AUTH_WPA_WPA2_PSK : WIFI_AUTH_WPA2_WPA3_PSK;
+      esp_wifi_set_config(WIFI_IF_AP, &c);
+    }
+  }
   dnsServer.start(53, "*", apIP);
   Serial.println("---- starting fallback ACCESS POINT ----");
   Serial.printf("  Join WiFi \"%s\" %s, then browse http://192.168.4.1/\n",
-                AP_SSID, secured ? "(password set)" : "(OPEN)");
-  logLine("home WiFi lost >5 min -> fallback AP '%s' (192.168.4.1)", AP_SSID);
+                g_ap_ssid.c_str(), secured ? "(password set)" : "(OPEN)");
+  logLine("home WiFi lost >%lus -> fallback AP '%s' ch%u%s (192.168.4.1)",
+          (unsigned long)g_ap_after_s, g_ap_ssid.c_str(), (unsigned)g_ap_chan,
+          g_ap_hidden ? " hidden" : "");
 }
 
 void setup() {
@@ -2475,6 +2816,7 @@ void setup() {
   // now (before WiFi). Falls back to the compiled defaults on first boot or
   // a bad/garbage value.
   prefs.begin("vroom", false);
+  loadWifiCfg();                     // WiFi config before any radio call uses it
   g_cpu_mhz = prefs.getUInt("cpu_mhz", 240);
   g_wifi_ps = prefs.getBool("wifi_ps", true);
   if (g_cpu_mhz != 80 && g_cpu_mhz != 240) g_cpu_mhz = 240;   // sanity guard
@@ -2536,21 +2878,22 @@ void setup() {
   g_markMagic = MARK_MAGIC;                         // (re)validate for this session
   loopMark("boot"); safetyMark("boot");
 
-  Serial.printf("Connecting to WiFi '%s' ", WIFI_SSID);
+  Serial.printf("Connecting to WiFi '%s' ", g_sta_ssid.c_str());
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname(HOSTNAME);
-  applyWifiRangeProfile();             // 802.11b-only + max TX (range over speed) before we associate
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.setHostname(g_hostname.c_str());
+  applyWifiRangeProfile();             // protocol + TX power before we associate
+  WiFi.setMinSecurity(staMinAuth());   // always explicit: the library default is WPA2
+  WiFi.begin(g_sta_ssid.c_str(), g_sta_pass.c_str());
   WiFi.setSleep(g_wifi_ps);            // apply persisted WiFi power-save state
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(400); Serial.print("."); }
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < g_boot_s * 1000UL) { delay(400); Serial.print("."); }
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("WiFi OK in %lu ms. IP = %s   RSSI = %d dBm\n",
                   (unsigned long)(millis() - t0), WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
-    if (MDNS.begin(HOSTNAME)) { MDNS.addService("http", "tcp", 80);
-      Serial.printf("Reachable at: http://%s.local/  or  http://%s/\n", HOSTNAME, WiFi.localIP().toString().c_str()); }
+    if (MDNS.begin(g_hostname.c_str())) { MDNS.addService("http", "tcp", 80);
+      Serial.printf("Reachable at: http://%s.local/  or  http://%s/\n", g_hostname.c_str(), WiFi.localIP().toString().c_str()); }
     syncTimeNow();   // kick off NTP now that STA is up
     Serial.printf("NTP sync requested (%s / %s)\n", NTP_SERVER1, NTP_SERVER2);
   } else {
@@ -2597,6 +2940,8 @@ void setup() {
   server.on("/xtaltest", HTTP_GET, handleXtalTest);
   server.on("/rfregs", HTTP_GET, handleRfRegs);
   server.on("/scan", HTTP_GET, handleScan);      // WiFi survey / antenna health check
+  server.on("/wificfg", HTTP_GET,  handleWifiCfgGet);
+  server.on("/wificfg", HTTP_POST, handleWifiCfgSave);
   server.on("/rftune", HTTP_POST, handleRfTune);
   server.on("/cpu", HTTP_POST, handleCpu);
   server.on("/wifips", HTTP_POST, handleWifiPs);
@@ -2675,6 +3020,61 @@ void setup() {
 
 uint32_t lastSample = 0, lastSave = 0, lastPrint = 0, downSince = 0, lastDisp = 0;
 uint32_t lastApRetry = 0;      // millis() of the last AP->STA reconnect attempt
+
+// Switch the STA to new credentials, verify, and REVERT if they do not come up.
+// Runs from loop() (never from the HTTP handler) so the reply reaches the
+// browser before the radio drops. This is what makes remote credential edits
+// safe on a board that is bolted behind a dash: a typo costs one connection
+// cycle, not a disassembly.
+void applyPendingWifi() {
+  if (!g_wifiPend) return;
+  g_wifiPend = false;
+  loopMark("wifi-switch");
+  String oldS = g_sta_ssid, oldP = g_sta_pass;
+  String newS = g_pendSsid, newP = g_pendPass;
+
+  logLine("wifi: trying '%s' (auto-revert to '%s' after %lus if it fails)",
+          newS.c_str(), oldS.c_str(), (unsigned long)g_boot_s);
+  flushLogToFlash();                       // must survive even if this goes wrong
+
+  WiFi.disconnect(false, true);            // drop and erase the stored AP entry
+  delay(200);
+  if (!apMode) WiFi.mode(WIFI_STA);
+  applyWifiRangeProfile();
+  WiFi.setMinSecurity(staMinAuth());
+  WiFi.begin(newS.c_str(), newP.c_str());
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < g_boot_s * 1000UL) {
+    esp_task_wdt_reset();                  // a legitimate wait, not a stall
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    g_sta_ssid = newS; g_sta_pass = newP;
+    prefs.putString("sta_ssid", g_sta_ssid);
+    prefs.putString("sta_pass", g_sta_pass);
+    if (MDNS.begin(g_hostname.c_str())) MDNS.addService("http", "tcp", 80);
+    syncTimeNow();
+    logLine("wifi: joined '%s' as %s @ %d dBm -- saved",
+            newS.c_str(), WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+  } else {
+    logLine("wifi: '%s' did NOT come up -- reverting to '%s'", newS.c_str(), oldS.c_str());
+    WiFi.disconnect(false, true);
+    delay(200);
+    WiFi.begin(oldS.c_str(), oldP.c_str());
+    t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < g_boot_s * 1000UL) {
+      esp_task_wdt_reset();
+      delay(100);
+    }
+    logLine(WiFi.status() == WL_CONNECTED
+              ? "wifi: reverted to '%s' OK"
+              : "wifi: revert to '%s' failed too -- AP fallback will take over",
+            oldS.c_str());
+  }
+  downSince = 0;                            // the switch itself is not "home down"
+  flushLogToFlash();
+}
 void loop() {
   esp_task_wdt_reset();                            // loop serviced a pass -> healthy
   if (apMode) dnsServer.processNextRequest();
@@ -2695,22 +3095,24 @@ void loop() {
     if (now - lastDisp >= 400) { lastDisp = now; dispDrawValue(readBatteryVolts(), temperatureRead()); }
   }
 
-  if (!apMode) {                                   // 5 min of lost WiFi -> AP
+  applyPendingWifi();                              // pending credential switch (safe: reverts on failure)
+
+  if (!apMode) {                                   // configurable downtime -> AP
     if (WiFi.status() == WL_CONNECTED) downSince = 0;
     else { if (downSince == 0) downSince = now;
-           else if (now - downSince >= AP_AFTER_DOWN_MS) { startAP(); lastApRetry = now; } }
-  } else if (now - lastApRetry >= AP_RETRY_STA_MS) {
+           else if (now - downSince >= g_ap_after_s * 1000UL) { startAP(); lastApRetry = now; } }
+  } else if (now - lastApRetry >= g_ap_retry_s * 1000UL) {
     // In AP mode: periodically try to get back onto the home network. Runs the
     // AP and STA together during the attempt so anyone connected to the
     // fallback AP isn't kicked off just because the retry failed.
     lastApRetry = now;
-    Serial.printf("AP mode: retrying home WiFi '%s'...\n", WIFI_SSID);
+    Serial.printf("AP mode: retrying home WiFi '%s'...\n", g_sta_ssid.c_str());
     loopMark("wifi-ap-retry");                     // driver calls below can block if the stack wedges
     WiFi.mode(WIFI_AP_STA);
-    applyWifiRangeProfile();                     // keep 11b + max TX on the retry
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    applyWifiRangeProfile();                     // re-assert proto + TX on the retry
+    WiFi.begin(g_sta_ssid.c_str(), g_sta_pass.c_str());
     uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < AP_RETRY_WAIT_MS) {
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < g_ap_wait_s * 1000UL) {
       server.handleClient();                       // stay responsive while waiting
       esp_task_wdt_reset();                         // legit retry -- don't let the WDT trip
       delay(100);
@@ -2724,10 +3126,10 @@ void loop() {
       WiFi.setSleep(g_wifi_ps);                    // re-apply the persisted power-save
       apMode    = false;
       downSince = 0;
-      if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
+      if (MDNS.begin(g_hostname.c_str())) MDNS.addService("http", "tcp", 80);
       syncTimeNow();
       Serial.printf("rejoined '%s' as %s - AP torn down\n",
-                    WIFI_SSID, WiFi.localIP().toString().c_str());
+                    g_sta_ssid.c_str(), WiFi.localIP().toString().c_str());
       logLine("WiFi rejoined home as %s (AP torn down)", WiFi.localIP().toString().c_str());
     } else {
       WiFi.mode(WIFI_AP);                          // give up for now; AP-only draws less

@@ -14,7 +14,31 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
-## 2026-08-10
+## 2026-08-10 — fw 4.24
+
+### Fixed
+- **fw 4.24** **A slow client could trip the task watchdog.** The chunked-send
+  loops in `/history`, `/logtext`, `/logpage` and `/starts` can span many seconds
+  against the car's ~−70 dBm link, and none of them fed the watchdog while
+  sending. A legitimately slow send was therefore indistinguishable from a stall,
+  and the ~30 s WDT would panic-reboot the board mid-response — a plausible
+  contributor to the isolated TASK-WATCHDOG resets logged against 4.19/4.20,
+  which correlated with Wi-Fi disruption. All four now call
+  `esp_task_wdt_reset()` between chunks, matching what the OTA handler already
+  did for the same reason. Safe because these run on the loop task, which is
+  subscribed to the WDT; the safety task on core 0 is untouched and keeps its own
+  independent deadline.
+
+### Changed
+- **fw 4.24** `trackReq()` stamps the **requested endpoint** into the WDT
+  breadcrumb instead of a generic `"http"`, so if a stall does happen inside a
+  handler the next boot names which one. Builds on the 4.21 breadcrumbs.
+  `loopMark()` `strncpy`s into a fixed `RTC_NOINIT` buffer, so passing the
+  temporary `String`'s `c_str()` is safe.
+
+> **Not compile-verified.** The Arduino toolchain is not present on the Linux
+> host this was written on, so 4.24 has been reviewed but neither built nor
+> flashed. Build and flash from close range before trusting it.
 
 ### Added
 - `.gitattributes` pinning all text to LF (`* text=auto eol=lf`), with binary

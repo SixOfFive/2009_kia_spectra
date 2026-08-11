@@ -64,7 +64,7 @@ const char* HOSTNAME  = "esp32-volt";       // -> http://esp32-volt.local/
 const char* AP_SSID   = "ESP32-Volt";       // fallback Access Point (its own DHCP @ 192.168.4.1)
 const char* AP_PASS   = SECRET_AP_PASS;      // from secrets.h (8+ chars, or "" for open)
 
-const char* FW_VERSION = "4.23";            // 4.23 = drain plausibility cap (|rate|<=40 mV/h) -- 4.22 r2+window gate still let a reboot-spanning -112 mV/h through
+const char* FW_VERSION = "4.24";            // 4.24 = feed the WDT during slow-client sends; per-endpoint stall breadcrumbs
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -571,7 +571,14 @@ float readBatteryVolts() {
   return g_lastV;
 }
 
-void trackReq() { g_in_total += server.uri().length() + 120; }   // approx request size
+void trackReq() {
+  String u = server.uri();
+  g_in_total += u.length() + 120;   // approx request size
+  // Finer WDT breadcrumb: record WHICH endpoint, not a generic 'http', so that
+  // if a stall happens inside this handler the next boot names it. loopMark()
+  // strncpy's into a fixed RTC buffer, so the temporary String is safe here.
+  loopMark(u.c_str());
+}
 
 const char* voltStatus(float v) {
   if (v < V_LOW || v > V_HIGH) return "red";   // too low or over-voltage
@@ -1883,7 +1890,7 @@ void handleHistory() {
       if (sel[9])  { chunk += ','; chunk += s.drain; }
       if (sel[10]) { chunk += ','; chunk += s.link_mbps; }
       chunk += '\n';
-      if (chunk.length() > 1500) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; }
+      if (chunk.length() > 1500) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }  // slow client streaming: a legit slow send must not trip the WDT
     }
     if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   }
@@ -2110,7 +2117,7 @@ void handleLogText() {
   String chunk; chunk.reserve(1600);
   for (int k = 0; k < cnt; k++) {
     chunk += g_log[(start + k) % LOG_LINES]; chunk += '\n';
-    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; }
+    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }  // feed WDT between chunks (slow client)
   }
   if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   server.sendContent("");
@@ -2140,7 +2147,7 @@ void handleLogPage() {
   for (int k = startK; k < startK + LOG_PAGE_SZ && k < total; k++) {
     int idx = (head - 1 - k + 2 * LOG_LINES) % LOG_LINES;
     chunk += g_log[idx]; chunk += '\n';
-    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; }
+    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }  // feed WDT between chunks (slow client)
   }
   if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   server.sendContent("");
@@ -2313,6 +2320,7 @@ void handleStarts() {
       e.src == 0 ? "auto" : "manual", e.ok ? "true" : "false", e.ver);
     g_out_total += strlen(rec);
     server.sendContent(rec);
+    esp_task_wdt_reset();                 // feed WDT between records (slow client)
   }
   server.sendContent("]");
   server.sendContent("");

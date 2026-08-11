@@ -104,13 +104,51 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
   `loopMark()` `strncpy`s into a fixed `RTC_NOINIT` buffer, so passing the
   temporary `String`'s `c_str()` is safe.
 
-> **Not compile-verified.** The Arduino toolchain is not present on the Linux
-> host this was written on, so 4.24 has been reviewed but neither built nor
-> flashed. Build and flash from close range before trusting it.
+> **Compile-verified 2026-08-11, not yet flashed.** Builds clean against esp32
+> core 3.3.10 — the same core that produced 4.23, so the two differ only by the
+> source change. 1,197,408 bytes, 38 % of the 3 MB app slot; globals 61,512 bytes
+> (18 % DRAM). `4.24` confirmed present in the output binary. The board is still
+> running 4.23; flash from close range.
+>
+> The FQBN was recovered from the 4.23 build's own `build.options.json` rather
+> than from the docs, which disagree —
+> `esp32-s3/docs/voltage-monitor.md` says `PartitionScheme=custom` but the real
+> build used **`PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB`**.
+> Worth correcting in the docs: a wrong partition scheme on a 16 MB OTA board is
+> exactly the mistake that bricks an update.
 
 ### Added
 - `.gitattributes` pinning all text to LF (`* text=auto eol=lf`), with binary
   assets marked explicitly.
+
+### Build environment (2026-08-11)
+The Arduino toolchain was rebuilt for Linux after the Windows→Debian reinstall.
+It had survived at `/mnt/datacifs/SixOfFive/claude/esp32/tools/` but as Windows
+binaries (`PE32+ executable`), unusable here.
+
+**The durable gotcha: `/mnt/datacifs` is CIFS mounted `nounix` and cannot create
+symlinks** — `ln -s` returns `Input/output error`. The Linux GCC toolchain
+contains them (`xtensa-esp-elf/lib64/libcc1.so → libcc1.so.0.0.0`), so installing
+the esp32 core onto that share fails partway through extraction. The Windows
+toolchain lived there only because Windows toolchains have no symlinks. **Test
+`ln -s` on that share before installing anything that might need one** — this
+applies equally to `node_modules`, Python venvs, and any other Linux toolchain.
+
+Resolution: `arduino-cli` (Linux), both configs, and the libraries stay on the
+share; only the compiler tree moved to local disk (`~/.arduino15`), which is also
+much faster to build against than CIFS. `arduino-cli-linux.yaml` documents the
+reason inline. Build command:
+
+```
+arduino-cli --config-file .../arduino-cli-linux.yaml compile \
+  --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB" \
+  --build-path ~/.cache/vroom-build esp32-s3/voltage_monitor
+```
+
+Note that `arduino-cli core install` is a **no-op when the version matches** — it
+checks only that the platform is present, not that the binaries match the host
+OS, so it reported "already installed" over a tree of Windows `.exe` files. A
+toolchain moved between operating systems will not self-correct; uninstall first.
 
 ### Fixed
 - 29 tracked files had been rewritten to CRLF by a Windows-side editor reaching

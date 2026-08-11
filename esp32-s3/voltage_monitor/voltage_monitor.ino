@@ -2037,6 +2037,14 @@ void handleRfRegs() {
 // The WDT is fed either side; the safety task on core 0 is untouched by this.
 void handleScan() {
   trackReq();
+  // Persist a "starting" marker BEFORE blocking. logLine() only writes the RAM
+  // ring; flash persistence normally happens in loop(), which cannot run while
+  // the scan blocks -- so without an explicit flush a brownout or non-WDT reset
+  // mid-scan would leave no trace that a scan was ever in flight. Same trick the
+  // OTA handler uses before it reboots. (A WDT reset is already covered: 4.24's
+  // trackReq() stamps "/scan" into the RTC breadcrumb, so the next boot names it.)
+  logLine("scan: starting (blocks a few seconds, may drop the link)");
+  flushLogToFlash();
   esp_task_wdt_reset();
   int n = WiFi.scanNetworks(false, true);   // synchronous, include hidden SSIDs
   esp_task_wdt_reset();

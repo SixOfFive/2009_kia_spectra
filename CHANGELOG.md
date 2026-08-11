@@ -82,7 +82,58 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
-## 2026-08-11 — fw 4.25
+## 2026-08-11 — fw 4.25 flashed; antenna CLEARED, weak AP identified
+
+4.25 went out by OTA at −77 dBm: 1,199,367 bytes in 21.5 s (55.6 KB/s), clean
+`reset=software` reboot, back on the LAN in ~12 s. `/scan` then answered the
+question the whole Wi-Fi investigation had been circling.
+
+### The antenna is fine
+The board sees **14 APs spanning −64 to −96 dBm**. A disconnected, pinched or
+metal-buried antenna costs 20–30 dB, which would push everything below the noise
+floor — such a board sees two or three APs and nothing under about −80. Hearing
+−96 dBm proves the receive path is healthy and sensitive. **The earlier suspicion
+that the 10-foot/−74 dBm combination indicted the antenna was wrong.**
+
+### What is actually weak: the `IoT` AP itself
+Measured by the same receiver at the same instant, from the car:
+
+| AP | RSSI from the car |
+|---|---|
+| `Password is Taco` / `TacoForYou` / hidden (ch 10, one router) | **−64, −64, −65** |
+| `IoT` (ch 6) | **−75** |
+
+**An 11 dB gap between two of the user's own APs, same receiver, same moment.**
+A receiver that hears −64 from one AP is not deaf; `IoT` is simply farther,
+lower-powered, or more obstructed. This reframes months of "weak signal in the
+car" — it was never the board.
+
+**Highest-leverage fix: move the board onto the ch 10 network for ~11 dB
+instantly**, which is more than any channel change or antenna rework can offer.
+The counter-argument is real though: `IoT` is presumably a segregated SSID, and
+this device can start the car, so keeping it off the main network is defensible.
+The alternative that preserves segregation is to move the `IoT` AP closer to the
+driveway or raise its transmit power.
+
+### Channel 6 is the worst realistic choice — now provable from the car
+Interference summed in linear power from the board's own scan position, expressed
+as dBm-equivalent (lower is better):
+
+```
+ch5  -74.3    ch3  -72.2  <- clear, and the empirical winner
+ch4  -73.1    ch6  -66.1  <- current, ~6 dB worse than ch3
+ch1  -70.8    ch10 -59.5  <- worst
+```
+
+Channel 6 carries **`TELUS1365` at −76, essentially equal to `IoT`'s own −75** —
+co-channel contention with a network we do not control. **Channel 3 has no
+occupant at all** from the car's viewpoint, which independently explains why it
+produced the only associations that never died of a Wi-Fi failure.
+
+**A laptop scan from indoors missed this entirely** — it saw `TELUS1365` only on
+5 GHz and never registered its 2.4 GHz radio on ch 6. The device's own scan, from
+where the device actually lives, is the better instrument. That is the argument
+for `/scan` existing.
 
 ### Added
 - **`GET /scan` — WiFi survey, intended as an antenna health check.** Returns

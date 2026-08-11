@@ -1,0 +1,18 @@
+# Pin line endings to LF inside the repository.
+#
+# This working tree lives on a CIFS share that is also reachable from Windows.
+# A Windows-side editor rewrote 29 tracked files to CRLF on 2026-08-10, which
+# git reported as a ~9,400-line diff that was entirely whitespace and buried a
+# real firmware change underneath it. `text=auto eol=lf` makes git normalize to
+# LF on commit and check out LF on every platform, so that cannot recur.
+* text=auto eol=lf
+
+# Binary assets: never normalize, never try to diff as text.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.pdf  binary
+
+# SDR IQ captures (gitignored, but guard the pattern in case one is ever added).
+*.bin  binary

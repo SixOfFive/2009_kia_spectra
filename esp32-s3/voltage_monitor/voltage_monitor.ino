@@ -104,7 +104,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.29";            // 4.29 = long-term baseline anchored to the VEHICLE's last run, seeded from persisted history
+const char* FW_VERSION = "4.30";            // 4.30 = Voltage tab: run-to-next-auto-start interval + last auto-start date
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -864,6 +864,16 @@ long autoStartEtaS(float v) {
     long rem = (long)g_as_hold - (long)((millis() - g_lowSince) / 1000);
     return rem > 0 ? rem : 0;
   }
+  // Prefer the long-term anchored estimate wherever one exists. It spans days
+  // from a fixed point at the SAME phase of the settling curve, so it is not
+  // distorted by the diurnal thermal swing -- which on this car is ~130 mV
+  // against a ~20 mV daily trend, i.e. the noise is several times the signal.
+  // It also survives reboots. The 24 h least-squares fit below is only a
+  // fallback for when no anchor exists yet: it is a short window, it restarts on
+  // every reboot, and it reads day/night cycling as depletion.
+  long lt = longTermEtaS(v);
+  if (lt >= 0) return lt + (long)g_as_hold;
+
   if (!drainTrusted() || g_drain.mvph >= 0) return -1;  // no trustworthy fit, or not discharging
   double vps = (-(double)g_drain.mvph) / 3600000.0;     // mV/h -> V/s (positive)
   if (vps < 1e-12) return -1;
@@ -1551,6 +1561,18 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
     T("ltmv", d.lt_ref_ts?d.lt_mvph.toFixed(2):"--");
     T("ltref", d.lt_ref_ts?new Date(d.lt_ref_ts*1000).toLocaleString():"waiting 12 h after last run");
     T("ltrefv", d.lt_ref_ts?d.lt_ref_v.toFixed(2):"--");
+    // Whole projected cycle: how long from the vehicle's last run until the next
+    // auto-start is expected = time already elapsed + the remaining estimate.
+    if(d.last_run&&d.lt_eta_s>0&&d.epoch){
+      var span=(d.epoch-d.last_run)+d.lt_eta_s;
+      T("ltcycle",(fmtEta(span)||"--").replace("~","")+" total");
+    }else{
+      T("ltcycle", d.last_run?(d.lt_eta_s>0?"--":"holding"):"no run recorded");
+    }
+    // as_last is written only by the auto-start fire path, so it IS the last
+    // automatic start -- never a manual button press or a key/FOB start.
+    T("ltlastauto", d.as_last?new Date(d.as_last*1000).toLocaleString():"never");
+    C("ltlastauto", d.as_last?"":"#8b949e");
   }
   var ae=!!d.as_en,eta=fmtEta(d.as_eta_s);
   T("aseta",ae?(eta||(d.drain_ok?"holding":"settling")):"--");
@@ -1720,7 +1742,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=430"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1815,13 +1837,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=428"></script>
+<script src="/app.js?v=430"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=430"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1910,13 +1932,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=428"></script>
+<script src="/app.js?v=430"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=430"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1950,6 +1972,8 @@ const char VOLT_HTML[] PROGMEM = R"HTML(
 <div class="card"><div class="k">Long-term rate</div><div class="v"><span id="ltmv">--</span> mV/h</div></div>
 <div class="card"><div class="k">Baseline anchored</div><div class="v" style="font-size:13px" id="ltref">--</div></div>
 <div class="card"><div class="k">Baseline voltage</div><div class="v"><span id="ltrefv">--</span> V</div></div>
+<div class="card"><div class="k">Last run &rarr; next auto-start</div><div class="v"><span id="ltcycle">--</span></div></div>
+<div class="card"><div class="k">Last auto-start</div><div class="v" style="font-size:13px" id="ltlastauto">--</div></div>
 </div>
 <div class="k" style="margin-top:10px;line-height:1.7;text-transform:none;letter-spacing:0">
 The 24&nbsp;h graphs below cannot see a drain that plays out over days, and their window restarts on every
@@ -1972,13 +1996,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=428"></script>
+<script src="/app.js?v=430"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=430"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2010,13 +2034,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=428"></script>
+<script src="/app.js?v=430"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=430"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2042,7 +2066,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=428"></script>
+<script src="/app.js?v=430"></script>
 </body></html>
 )HTML";
 
@@ -2626,7 +2650,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=428">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=430">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -2809,7 +2833,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=430"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

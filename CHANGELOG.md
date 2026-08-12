@@ -82,6 +82,50 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-12 — fw 4.30: cycle + last-auto-start cards, and every ETA now uses the anchor
+
+### Added — two cards on the Voltage tab
+- **Last run → next auto-start** — the whole projected cycle: time already elapsed
+  since the vehicle last ran, plus the remaining estimate. Verified independently
+  against `/json` (3.7 days elapsed + 4.8 remaining = 8.5 total).
+- **Last auto-start** — `as_last`, which is written *only* by the auto-start fire
+  path, so it can never be confused with a dashboard button press or a key/FOB
+  start. Currently reads "never".
+
+### Changed — `autoStartEtaS()` prefers the long-term anchor
+It was still computing from the 24 h least-squares fit, which fed the Main tab's
+ETA card, the dashboard status line **and SNMP OID `.44`**. That fit is a short
+window, it restarts on every reboot, and on this car the diurnal thermal swing
+(~130 mV) is several times the daily trend (~20 mV) — so it is structurally
+incapable of the answer, and it was driving the Cacti feed too. It now prefers
+the anchored long-term estimate wherever one exists, falling back to the short
+fit only when no anchor is available yet.
+
+Immediately visible after flashing: `as_eta_s` went from **−1** on 4.29 to
+**3.6 days**, matching `lt_eta_s` (the 60 s difference is the sustain hold).
+
+### Operational finding — a wedged `Update` state rejects OTAs until a reboot
+Three consecutive 4.30 OTAs failed. The verbose trace was decisive: the third
+sent all 1,221,751 bytes, curl logged `upload completely sent off`, and the board
+answered **`HTTP/1.1 200 OK`** with a 6-byte body — **`FAILED`**. So the image
+arrived intact and `Update.hasError()` rejected it. The image was ruled out
+independently: magic byte `e9`, MD5 identical across the CIFS copy, 1.22 MB into
+3 MB slots.
+
+**A `POST /reboot` immediately before the OTA cleared it, and the same image then
+flashed first try** (`HTTP=200`, 81 s). Worth remembering after several rapid OTA
+cycles in one session.
+
+**Gap this exposed:** the specific reason only goes to `Serial`
+(`Update.printError(Serial)`), and there is no USB on a board behind a dash — the
+one piece of information that would identify the failure is written where nobody
+can read it. `/update` should return `Update.errorString()` in the response and
+the flash log instead of a bare `FAILED`, for the same reason the WDT breadcrumbs
+exist: a failure you cannot see is a failure you cannot fix remotely. **Not yet
+implemented.**
+
+---
+
 ## 2026-08-12 — fw 4.29: anchor the long-term baseline to the VEHICLE, not the boot
 
 ### Fixed

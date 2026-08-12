@@ -82,6 +82,39 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-12 — fw 4.33: recommended trigger 12.4 V → 12.2 V
+
+### Changed
+`AS_DEF_VOLTS` and the dashboard help text now say **12.2 V**. The board has been
+running 12.2 V from NVS all along; the firmware kept recommending 12.4 V, which
+made every status report flag a discrepancy that was never going to be actioned.
+
+**This is a measurement-led change, not a relaxation.** The cold-weather argument
+for 12.4 V is sound in general and is kept in the source comment — near −20 °C the
+engine needs roughly double the cranking torque while the battery delivers about
+half its power, and 12.2 V rested (~SG 1.19) slushes around −26 °C where 12.4 V
+(~SG 1.23) is good to about −37 °C.
+
+It is the wrong number **for this car**. The battery settles at about **12.30 V**
+after days parked, so a 12.4 V trigger sits *above* its resting voltage: the board
+would fire immediately, then need 12.55 V (threshold + `AS_REARM_MARGIN`) held for
+`AS_REARM_S` to re-arm — a level this pack never reaches without a long drive. It
+would fall through the `AS_REARM_MAX_COOLDOWNS` escape hatch and start the engine
+every cooldown, indefinitely. **A threshold above resting voltage is not a safety
+margin, it is a loop.**
+
+The honest reading of a 12.30 V rested battery is ~60 % SoC on a pack that no
+longer takes a full charge — consistent with the two batteries this car has
+already killed. Raising the trigger cannot fix a tired battery; it only runs the
+starter more.
+
+**Revisit when** the battery is replaced or the parasitic drain is located: a
+healthy pack resting at 12.6–12.7 V carries a 12.4 V trigger comfortably, and in
+deep cold it should. The help text now explains the dependency rather than naming
+a bare number, so the reasoning travels with the setting.
+
+---
+
 ## 2026-08-12 — fw 4.32: smoothed long-term fit, task watchdog 30 s → 5 min
 
 ### Fixed — the projection "bounced around like crazy"

@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.32";            // 4.32 = smoothed long-term fit + task watchdog 30s -> 5min (9/9 firings were network I/O, never the safety task)
+const char* FW_VERSION = "4.33";            // 4.33 = default/recommended trigger 12.4 -> 12.2 V (12.4 sits above this battery's resting voltage)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -194,17 +194,31 @@ const uint16_t RF_TAIL_CARRIER_MS  = 525;   // trailing carrier after the data (
 // to ~9-10 V for a second or two. Requiring the low reading to persist for a
 // full minute means a real crank (or a momentary load like the blower) can
 // never be mistaken for a flat battery.
-// Default trigger is 12.4 V, not the 12.2 V the older MicroPython tree used.
-// Two reasons, both specific to a car parked outside in Alberta:
+// Default trigger is 12.2 V (changed from 12.4 V on 2026-08-12).
+//
+// The cold-weather argument for 12.4 V is real and worth keeping on record:
 //   * Cold cranking. Near -20 C the engine needs roughly double the torque
 //     while the battery can deliver only about half its rated power, so the
 //     "still cranks" line moves UP a couple tenths from the mild-weather value.
 //   * Electrolyte freezing. 12.2 V resting is about SG 1.19, which slushes up
-//     around -26 C -- i.e. right at the local design low. 12.4 V is ~SG 1.23,
-//     good to about -37 C. Firing at 12.2 can mean firing at a battery that is
-//     already too cold-soaked to turn the engine.
-// In a mild climate 12.2 V is perfectly reasonable -- it's one field on the page.
-const float    AS_DEF_VOLTS     = 12.4f;    // suggested trigger (V)
+//     around -26 C. 12.4 V is ~SG 1.23, good to about -37 C.
+//
+// It is nevertheless the wrong number FOR THIS CAR, on measurement rather than
+// theory. This battery settles at about 12.30 V after days parked. A 12.4 V
+// trigger therefore sits ABOVE its resting voltage: the board would fire at
+// once, then need 12.55 V (threshold + AS_REARM_MARGIN) held for AS_REARM_S to
+// re-arm -- a level this battery never reaches without a long drive. It would
+// fall through to the AS_REARM_MAX_COOLDOWNS escape hatch and start the engine
+// every cooldown, indefinitely. A threshold above resting voltage is not a
+// safety margin, it is a loop.
+//
+// The honest reading of a 12.30 V rested battery is ~60 % SoC on a pack that no
+// longer holds a full charge -- consistent with the two batteries this car has
+// already killed. Raising the trigger cannot fix a tired battery; it only makes
+// the starter run more. Revisit if the battery is replaced, or once the
+// parasitic drain is located: a healthy pack resting at 12.6-12.7 V would carry
+// a 12.4 V trigger comfortably, and in deep cold it should.
+const float    AS_DEF_VOLTS     = 12.2f;    // suggested trigger (V) -- see above
 const uint32_t AS_DEF_HOLD_S    = 60;       // must stay below threshold this long
 const uint32_t AS_DEF_COOL_S    = 7200;     // 2 h between auto-starts (anti-loop)
 const float    AS_V_FLOOR       = 8.0f;     // below this the divider isn't on a battery
@@ -1777,7 +1791,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=431"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1825,8 +1839,10 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 <button class="tx" id="assave">Save</button>
 </div>
 <div class="k" style="margin-top:12px;line-height:1.7;text-transform:none;letter-spacing:0">
-<b>12.4 V</b> is the suggested trigger for a cold climate &mdash; about 75&nbsp;% charge, where the engine
-still cranks easily. Below about <b>11.8 V</b> it likely won't crank at all. The hold time ignores the brief dip
+<b>12.2 V</b> is the suggested trigger here &mdash; about 50&nbsp;% charge. A colder climate normally wants
+<b>12.4 V</b> (~75&nbsp;%), but that only works if the battery rests <i>above</i> it: a trigger above resting
+voltage fires immediately and then can't re-arm, so it just loops. Below about <b>11.8 V</b> it likely won't
+crank at all. The hold time ignores the brief dip
 while the engine is <i>actually cranking</i>. It won't fire while you're driving and won't re-fire until the
 battery recovers and holds. <b>Max per 24 h</b> is off by default (<b>0</b>/<b>&minus;1</b> = unlimited). The
 real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, it latches off until you clear it.
@@ -1872,13 +1888,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=431"></script>
+<script src="/app.js?v=433"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=431"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1967,13 +1983,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=431"></script>
+<script src="/app.js?v=433"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=431"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2036,13 +2052,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=431"></script>
+<script src="/app.js?v=433"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=431"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2074,13 +2090,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=431"></script>
+<script src="/app.js?v=433"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=431"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2106,7 +2122,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=431"></script>
+<script src="/app.js?v=433"></script>
 </body></html>
 )HTML";
 
@@ -2690,7 +2706,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=431">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=433">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -2873,7 +2889,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=431"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

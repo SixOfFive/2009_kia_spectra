@@ -82,6 +82,35 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-12 — fw 4.31: real dates, cycle progress % and bar
+
+### Added — Voltage tab
+- **Next auto-start** and **Last auto-start** as **actual calendar dates**
+  (`Wed 19 Aug 06:21`), not countdowns. 4.30 had shipped every forward-looking
+  value as a countdown; "date" means a date.
+- **Last run → next auto-start** now shows the **duration *and* both endpoints**
+  (`Sat 8 Aug 16:52 → Wed 19 Aug 06:21`).
+- **Percent elapsed through the cycle, with a progress bar** — green under 60 %,
+  amber to 85 %, red beyond. Validated against an independent calculation:
+  card read `50% elapsed`, bar 50.3 % wide, computed 50.3 %.
+
+`fmtDate()` helper added; all date fields use it for a consistent short format.
+
+### Note on stability of the projection
+The estimate refines as the baseline grows, and the percentage moves with it —
+between two readings minutes apart the projection went from *16 Aug / 7.3 days /
+50 %* to *19 Aug / 10.6 days / 35 %*. Nothing about the battery changed; the
+long-term rate is still settling as its window extends. **Treat the bar as a
+trend indicator, not a precise gauge**, until the baseline spans several days.
+
+### Confirmed — reboot before OTA
+The `Update`-wedge workaround from 4.30 held: a `POST /reboot` immediately before
+the upload, and 4.31 flashed first try (`HTTP=200`, 54.7 s) where 4.30 had needed
+four attempts. This now looks like the reliable procedure after repeated OTA
+cycles in one session, not a one-off.
+
+---
+
 ## 2026-08-12 — fw 4.30: cycle + last-auto-start cards, and every ETA now uses the anchor
 
 ### Added — two cards on the Voltage tab

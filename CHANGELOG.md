@@ -82,6 +82,70 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-12 — fw 4.28: the stall fix that actually works, long-term drain ETA
+
+### Fixed — `/history` watchdog stalls, third and correct attempt
+4.27 did not fix it either: three more `WDT stall: loop was '/history'` overnight
+(04:32, 04:34, 08:52). The mechanism, finally understood:
+
+`NetworkClient::write()` retries up to 10 times, each with a **hardcoded 1 s
+`select()`** (`WIFI_CLIENT_SELECT_TIMEOUT_US`) that no setting can change — so a
+single write has a **~10 s floor regardless of `SO_SNDTIMEO`**, and
+`sendContent()` issues several writes per chunk. That is why both earlier
+attempts failed: **4.24** fed the watchdog *after* a call that never returned,
+and **4.27** shrank a timeout that was never the binding constraint.
+
+**The fix is to never enter a blocking write.** `waitWritable()` polls the socket
+with `select()` in 50 ms slices, resetting the WDT each slice because *we* own
+the wait, and only calls `sendContent()` once the socket is genuinely writable. A
+client that never drains has its response aborted after 4 s instead of hanging
+the loop. Applied to `/history`, `/logtext`, `/logpage`, `/starts`.
+
+**The watchdog is not weakened.** It stays armed at 30 s throughout; a genuine
+hang anywhere, including inside these handlers, still panics and reboots exactly
+as before. Only legitimate network waiting stops *looking* like a hang. (An
+earlier proposal to `esp_task_wdt_delete()` during streaming was rejected for
+exactly this reason — it would have traded a stall for a lockup.)
+
+### Added — long-term drain estimate (Voltage tab)
+The 24 h RAM ring cannot see a drain that plays out over days, **and every reboot
+restarts it** — which is precisely what the stalls above were doing to the
+measurement. So the long-term view anchors a single reference point instead:
+**12 h after the engine last stops**, record time and voltage, skipping the fast
+fluctuating settling phase while surface charge dissipates. The rate is the slope
+from that anchor to now.
+
+**Both ends live in NVS, so it survives reboots** and keeps extending for as long
+as the car sits — immune to the failure mode that has been destroying the 24 h
+fit. Reports `lt_ref_ts`, `lt_ref_v`, `lt_mvph`, `lt_eta_s` in `/json`, with four
+cards and an explanation on the Voltage tab. Holds off until 6 h of baseline
+exist; re-arms on the next engine run; bootstraps immediately if the last run is
+already older than 12 h (so a fresh flash does not wait a whole cycle).
+
+### Added — external (key/FOB) starts are now recorded
+Previously `/starts` held only board-fired starts, so a key or FOB start appeared
+as an `ENGINE ON` log line and nothing else — the start history was not a
+complete account of the car's runs. A run detected without the board asking for
+it now gets a start-history entry with a new **`external`** source (purple pill),
+marked confirmed by definition since the alternator is demonstrably up. Guarded
+on `g_verifying` so a start the board *did* fire is not double-counted.
+
+### Changed
+`ENGINE OFF` now records run duration: `charging ended at 12.94 V after 20m 14s`.
+That gives the Compustar's real runtime as measured rather than remembered, and
+pairs with the charging voltage during the run — the number that shows whether
+HVAC load was consuming the alternator's output instead of charging the battery.
+
+Compile-verified 1,219,951 bytes (38 %), globals 61,696 (18 %). Browser-validated
+against mocks: long-term cards render (`~4.8 days`, rate, anchor time/voltage),
+the three-way source pill maps `auto`/`external`/`manual` correctly, zero console
+errors. Cache-bust bumped to `?v=428`.
+
+**Field state after flashing:** RSSI **−61 dBm** (best recorded; it was −74 on
+`IoT`), baseline anchored at 12.29 V by the bootstrap path as designed.
+
+---
+
 ## 2026-08-11 — fw 4.27: bound per-write stalls (4.24 was insufficient)
 
 ### Fixed

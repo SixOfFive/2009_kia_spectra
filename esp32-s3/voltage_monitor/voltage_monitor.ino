@@ -24,6 +24,7 @@
 #include <time.h>
 #include <Preferences.h>   // NVS-backed persistence for CPU clock + WiFi power-save
 #include "esp_task_wdt.h"   // task watchdog -- auto-reboot if the loop or safety task stalls
+#include <lwip/sockets.h>   // select() -- gate chunked sends without blocking (see waitWritable)
 #include "esp_system.h"     // esp_reset_reason() -- why the last boot happened
 #include "esp_sntp.h"       // NTP sync notification callback
 #include "esp_wifi.h"       // esp_wifi_set_protocol() -- force 802.11b for range/stability
@@ -95,12 +96,14 @@ String   g_pendSsid, g_pendPass;
 // Forward declarations: the /wificfg handlers appear earlier in this file than
 // these helpers, and Arduino's auto-prototype pass does not cover statics.
 static void             applyWifiRangeProfile();
+float                   longTermMvph(float vNow);
+long                    longTermEtaS(float vNow);
 static wifi_auth_mode_t staMinAuth();
 static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.27";            // 4.27 = bound per-write stalls so ONE slow send cannot outlast the watchdog (4.24 was insufficient)
+const char* FW_VERSION = "4.28";            // 4.28 = non-blocking send gate (WDT stays armed), long-term drain ETA, external-start logging
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -493,6 +496,19 @@ uint32_t  g_rearmS      = 0;               // seconds continuously at/above AS_R
 bool      g_needRearm   = false;           // set after a start; blocks refiring until recovered
 bool      g_asLock      = false;           // latched lockout  NVS "as_lock"
 uint8_t   g_asFails     = 0;               // consecutive unverified starts  NVS "as_fails"
+// ---- Long-term drain reference -------------------------------------------
+// A 24 h RAM ring cannot measure a drain that plays out over days, and every
+// reboot restarts it -- which is exactly what the /history watchdog stalls were
+// doing. So anchor a reference point in NVS instead: 12 h after the engine last
+// stopped (skipping the fast, fluctuating settling phase while surface charge
+// dissipates), record time+voltage. The long-term rate is then simply the slope
+// from that anchor to now, and it SURVIVES REBOOTS because both ends are stored.
+const uint32_t LT_SETTLE_S = 12UL * 3600UL;   // ignore the first 12 h after a run
+const uint32_t LT_MIN_S    = 6UL  * 3600UL;   // need this much baseline to report
+uint32_t  g_ltRefTs  = 0;                  // epoch of the settled reference
+float     g_ltRefV   = 0.0f;               // voltage at that reference
+uint32_t  g_ltDue    = 0;                  // epoch when the reference should be taken
+
 bool      g_verifying   = false;           // waiting to see the alternator come up
 uint32_t  g_verifyMs    = 0;               // millis() when verification started
 int       g_pendingIdx  = -1;              // index of the start event awaiting verification
@@ -507,7 +523,8 @@ struct StartEvent {
   uint32_t ts;        // unix epoch when fired (0 if NTP hadn't synced)
   uint32_t up_s;      // uptime seconds at fire -- orders events even with no clock
   float    vbatt;     // battery voltage at the moment it fired
-  uint8_t  src;       // 0 = auto (low voltage), 1 = manual (dashboard button)
+  uint8_t  src;       // 0 = auto (low voltage), 1 = manual (dashboard button),
+                      // 2 = external (key/FOB -- detected from alternator voltage)
   uint8_t  ok;        // 1 = the CC1101 reported the burst went out
   uint8_t  ver;       // did the engine actually run? 0 = unknown, 1 = confirmed, 2 = no charge seen
   uint8_t  _pad;
@@ -622,6 +639,37 @@ float readBatteryVolts() {
 // write at ~10 x (1 + 1) = 20 s, comfortably inside the watchdog, after which
 // the per-chunk feed does its job.
 static void boundSendStall() { server.client().setTimeout(1000); }
+
+// Wait until the socket will actually accept a write, WITHOUT ever entering a
+// blocking write, and WITHOUT weakening the watchdog.
+//
+// Why the two previous attempts failed. NetworkClient::write() retries up to
+// WIFI_CLIENT_MAX_WRITE_RETRY (10) times, each with a HARDCODED 1 s select()
+// (WIFI_CLIENT_SELECT_TIMEOUT_US) -- so a single write has a ~10 s floor no
+// matter what SO_SNDTIMEO is, and sendContent() issues several writes per chunk.
+// fw 4.24 fed the WDT *between* chunks (never reached, the feed is after the
+// write) and fw 4.27 shrank SO_SNDTIMEO (cannot touch the hardcoded select
+// floor). Both still tripped the 30 s watchdog on /history.
+//
+// So: poll the socket ourselves in short slices and only send when it is ready.
+// The WDT is reset each slice because WE own the wait -- it stays fully armed,
+// and a genuine hang anywhere else still reboots the board as before. A client
+// that never drains gets the response aborted rather than hanging the loop.
+static bool waitWritable(uint32_t budget_ms) {
+  int fd = server.client().fd();
+  if (fd < 0) return false;
+  uint32_t t0 = millis();
+  while ((uint32_t)(millis() - t0) < budget_ms) {
+    if (!server.client().connected()) return false;
+    fd_set w; FD_ZERO(&w); FD_SET(fd, &w);
+    struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 50 * 1000;   // 50 ms slice
+    int r = ::select(fd + 1, nullptr, &w, nullptr, &tv);
+    if (r > 0) return true;
+    if (r < 0) return false;
+    esp_task_wdt_reset();          // our wait, our feed -- watchdog stays armed
+  }
+  return false;                    // stalled client -> abort, do not block the loop
+}
 
 void trackReq() {
   String u = server.uri();
@@ -1080,16 +1128,57 @@ void evalAutoStart(float v) {
   // FOB, or the board). Alternator charging (>= AS_ALT_V) == running. Log both
   // edges and remember the last run, so "Last charge" is real even when the board
   // never issued a start. 0.3 V hysteresis so it can't chatter at the threshold.
-  static bool engRunning = false;
+  static bool     engRunning = false;
+  static uint32_t engOnMs    = 0;
   bool nowRun = engRunning ? (v >= AS_ALT_V - 0.3f) : (valid && v >= AS_ALT_V);
   if (nowRun && !engRunning) {
+    engOnMs     = millis();
     g_lastRunTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
     if (g_lastRunTs) prefs.putUInt("last_run", g_lastRunTs);
     logLine("ENGINE ON: alternator charging at %.2f V", v);
+    // The engine is running but WE did not ask for it -- key, FOB or someone
+    // else. Record it in the start history so the log is a complete account of
+    // every run, not just board-fired ones. Guarded on g_verifying so a start
+    // the board DID fire is not double-counted here.
+    if (!g_verifying) {
+      recordStart(v, 2, true);                    // src 2 = external
+      if (g_startCount) {                         // it is confirmed by definition
+        int i = (g_startHead - 1 + START_N) % START_N;
+        g_starts[i].ver = 1; saveStarts();
+      }
+    }
+    // A run invalidates the long-term reference; a fresh one is taken 12 h after
+    // this run ends.
+    g_ltRefTs = 0; g_ltRefV = 0; g_ltDue = 0;
+    prefs.putUInt("lt_ref_ts", 0); prefs.putUInt("lt_due", 0);
   } else if (!nowRun && engRunning) {
-    logLine("ENGINE OFF: charging ended at %.2f V", v);
+    uint32_t ran = (millis() - engOnMs) / 1000;
+    logLine("ENGINE OFF: charging ended at %.2f V after %lum %lus",
+            v, (unsigned long)(ran / 60), (unsigned long)(ran % 60));
+    if (timeIsValid()) {                          // arm the settled reference
+      g_ltDue = (uint32_t)time(nullptr) + LT_SETTLE_S;
+      prefs.putUInt("lt_due", g_ltDue);
+      logLine("drain baseline: will anchor in %luh (after settling)",
+              (unsigned long)(LT_SETTLE_S / 3600));
+    }
   }
   engRunning = nowRun;
+
+  // Take the settled reference once the 12 h wait is up. Also bootstrap one if
+  // the engine last ran long ago and we simply have no anchor yet (e.g. this
+  // firmware is new) -- the baseline then starts now rather than never.
+  if (valid && timeIsValid() && !g_ltRefTs && !nowRun) {
+    uint32_t nowS = (uint32_t)time(nullptr);
+    bool due       = g_ltDue && nowS >= g_ltDue;
+    bool bootstrap = !g_ltDue && g_lastRunTs && nowS > g_lastRunTs + LT_SETTLE_S;
+    if (due || bootstrap) {
+      g_ltRefTs = nowS; g_ltRefV = v; g_ltDue = 0;
+      prefs.putUInt ("lt_ref_ts", g_ltRefTs);
+      prefs.putFloat("lt_ref_v",  g_ltRefV);
+      prefs.putUInt ("lt_due", 0);
+      logLine("drain baseline anchored at %.2f V (%s)", v, due ? "settled" : "bootstrap");
+    }
+  }
 
   // Re-arm hysteresis. Without this, a battery that recovers to just above the
   // trigger re-fires every cooldown, forever, until the tank is empty.
@@ -1351,6 +1440,7 @@ table.st th{text-align:left;color:var(--mut);font-weight:600;font-size:11px;text
 table.st td{padding:6px 4px;border-bottom:1px solid #1b2129}
 .pill{display:inline-block;padding:1px 9px;border-radius:12px;font-size:11px;font-weight:600}
 .pill.auto{background:#1f6feb;color:#fff}.pill.man{background:#30363d;color:#c9d1d9}
+.pill.ext{background:#8957e5;color:#fff}
 )CSS";
 const char APP_JS[] PROGMEM = R"JS(
 // Shared engine for all vroom dashboard tabs. Each page sets window.PAGE
@@ -1452,6 +1542,15 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
   document.querySelectorAll("button.seg").forEach(function(b){b.classList.toggle("on",+b.getAttribute("data-mhz")===d.cpu_mhz)});
   var ps=!!d.wifi_ps;H("psbadge",'<span class="badge '+(ps?"on":"off")+'">'+(ps?"ON":"OFF")+'</span>');
   var pb=$("psbtn");if(pb){pb.textContent=ps?"Turn OFF":"Turn ON";pb.setAttribute("data-next",ps?"0":"1");}
+  // long-term drain (Voltage tab)
+  if(d.lt_ref_ts!==undefined){
+    var lte=fmtEta(d.lt_eta_s);
+    T("lteta", d.lt_ref_ts?(lte||(d.lt_mvph>=-0.05?"holding":"settling")):"no baseline yet");
+    C("lteta", !d.lt_ref_ts?"#8b949e":(d.lt_eta_s<0?"#3fb950":"#d29922"));
+    T("ltmv", d.lt_ref_ts?d.lt_mvph.toFixed(2):"--");
+    T("ltref", d.lt_ref_ts?new Date(d.lt_ref_ts*1000).toLocaleString():"waiting 12 h after last run");
+    T("ltrefv", d.lt_ref_ts?d.lt_ref_v.toFixed(2):"--");
+  }
   var ae=!!d.as_en,eta=fmtEta(d.as_eta_s);
   T("aseta",ae?(eta||(d.drain_ok?"holding":"settling")):"--");
   C("aseta",(!ae||d.as_eta_s<0)?"#8b949e":(d.drain_r2<0.6?"#d29922":"#3fb950"));
@@ -1498,7 +1597,7 @@ function loadStarts(){if(!$("startbox"))return;
     var h='<table class="st"><tr><th>When</th><th>Voltage</th><th>Trigger</th><th>TX</th><th>Engine</th></tr>';
     var VER=['<span style="color:#8b949e">unknown</span>','<span style="color:#3fb950">ran</span>','<span style="color:#f85149">no charge</span>'];
     a.forEach(function(e){var w=(e.ts>1700000000)?new Date(e.ts*1000).toLocaleString():("uptime "+fmtUp(e.up_s)+" | no clock");
-      h+='<tr><td>'+w+'</td><td>'+e.v.toFixed(2)+' V</td><td><span class="pill '+(e.src=="auto"?"auto":"man")+'">'+e.src+'</span></td><td>'+(e.ok?"sent":"<span style=\"color:#f85149\">failed</span>")+'</td><td>'+(VER[e.ver]||VER[0])+'</td></tr>';});
+      h+='<tr><td>'+w+'</td><td>'+e.v.toFixed(2)+' V</td><td><span class="pill '+(e.src=="auto"?"auto":(e.src=="external"?"ext":"man"))+'">'+e.src+'</span></td><td>'+(e.ok?"sent":"<span style=\"color:#f85149\">failed</span>")+'</td><td>'+(VER[e.ver]||VER[0])+'</td></tr>';});
     H("startbox",h+'</table>');
   }).catch(function(e){})}
 
@@ -1620,7 +1719,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1715,13 +1814,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=426"></script>
+<script src="/app.js?v=428"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1810,13 +1909,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=426"></script>
+<script src="/app.js?v=428"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1843,6 +1942,22 @@ const char VOLT_HTML[] PROGMEM = R"HTML(
 </div>
 <div class="k" id="dmeta" style="margin-top:8px;text-transform:none;letter-spacing:0">&nbsp;</div>
 </div>
+<div class="clbl">Long-term drain &mdash; the days-to-weeks view</div>
+<div class="card" style="margin-bottom:10px">
+<div class="grid" style="margin-top:0">
+<div class="card"><div class="k">Est. time to auto-start</div><div class="v"><span id="lteta">--</span></div></div>
+<div class="card"><div class="k">Long-term rate</div><div class="v"><span id="ltmv">--</span> mV/h</div></div>
+<div class="card"><div class="k">Baseline anchored</div><div class="v" style="font-size:13px" id="ltref">--</div></div>
+<div class="card"><div class="k">Baseline voltage</div><div class="v"><span id="ltrefv">--</span> V</div></div>
+</div>
+<div class="k" style="margin-top:10px;line-height:1.7;text-transform:none;letter-spacing:0">
+The 24&nbsp;h graphs below cannot see a drain that plays out over days, and their window restarts on every
+reboot. This estimate instead anchors a single reference point &mdash; time and voltage &mdash; <b>12&nbsp;hours
+after the engine last stopped</b>, skipping the fast, fluctuating settling phase while surface charge
+dissipates, and measures the slope from there to now. Both ends live in flash, so <b>it survives reboots</b>
+and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline before it will report.
+</div>
+</div>
 <div class="clbl">Voltage (24 h)</div><canvas id="g_v" width="800" height="104"></canvas>
 <div class="clbl">Temperature &deg;C (24 h)</div><canvas id="g_t" width="800" height="104"></canvas>
 <div class="clbl">Battery drain rate mV/h (24 h) &mdash; below 0 = discharging</div><canvas id="g_d" width="800" height="104"></canvas>
@@ -1856,13 +1971,13 @@ const char VOLT_HTML[] PROGMEM = R"HTML(
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=426"></script>
+<script src="/app.js?v=428"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1894,13 +2009,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=426"></script>
+<script src="/app.js?v=428"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1926,7 +2041,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=426"></script>
+<script src="/app.js?v=428"></script>
 </body></html>
 )HTML";
 
@@ -1982,7 +2097,8 @@ void handleJson() {
     "\"as_max24\":%d,\"as_eta_s\":%ld,\"cpu0\":%.1f,\"cpu1\":%.1f,"
     "\"net_in\":%lu,\"net_out\":%lu,\"as_last\":%lu,\"last_run\":%lu,"
     "\"drain_ok\":%s,\"drain_mvph\":%.2f,\"drain_r2\":%.3f,\"drain_n\":%d,"
-    "\"drain_win_s\":%lu,\"drain_days\":%.2f,\"drain_mvpc\":%.1f}",
+    "\"drain_win_s\":%lu,\"drain_days\":%.2f,\"drain_mvpc\":%.1f,"
+    "\"lt_ref_ts\":%lu,\"lt_ref_v\":%.2f,\"lt_mvph\":%.2f,\"lt_eta_s\":%ld}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
@@ -2002,7 +2118,8 @@ void handleJson() {
     (unsigned long)g_in_total, (unsigned long)g_out_total,
     (unsigned long)g_lastStartTs, (unsigned long)g_lastRunTs,
     g_drain.ok ? "true" : "false", g_drain.mvph, g_drain.r2, g_drain.n,
-    (unsigned long)g_drain.win_s, g_drain.days, g_drain.mv_per_c);
+    (unsigned long)g_drain.win_s, g_drain.days, g_drain.mv_per_c,
+    (unsigned long)g_ltRefTs, g_ltRefV, longTermMvph(v), longTermEtaS(v));
   g_out_total += strlen(json);
   server.send(200, "application/json", json);
 }
@@ -2048,8 +2165,9 @@ void handleHistory() {
       if (sel[9])  { chunk += ','; chunk += s.drain; }
       if (sel[10]) { chunk += ','; chunk += s.link_mbps; }
       chunk += '\n';
-      if (chunk.length() > 1500) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset();
-        if (!server.client().connected()) break; }    // client vanished mid-stream -- stop writing into a dead socket
+      if (chunk.length() > 1500) {
+        if (!waitWritable(4000)) break;               // stalled client -> abort rather than block
+        g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }
     }
     if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   }
@@ -2459,8 +2577,9 @@ void handleLogText() {
   String chunk; chunk.reserve(1600);
   for (int k = 0; k < cnt; k++) {
     chunk += g_log[(start + k) % LOG_LINES]; chunk += '\n';
-    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset();
-      if (!server.client().connected()) break; }   // client vanished mid-stream
+    if (chunk.length() > 1400) {
+      if (!waitWritable(4000)) break;                // stalled client -> abort rather than block
+      g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }
   }
   if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   server.sendContent("");
@@ -2491,8 +2610,9 @@ void handleLogPage() {
   for (int k = startK; k < startK + LOG_PAGE_SZ && k < total; k++) {
     int idx = (head - 1 - k + 2 * LOG_LINES) % LOG_LINES;
     chunk += g_log[idx]; chunk += '\n';
-    if (chunk.length() > 1400) { g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset();
-      if (!server.client().connected()) break; }   // client vanished mid-stream
+    if (chunk.length() > 1400) {
+      if (!waitWritable(4000)) break;                // stalled client -> abort rather than block
+      g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset(); }
   }
   if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   server.sendContent("");
@@ -2505,7 +2625,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=426">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=428">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -2663,10 +2783,12 @@ void handleStarts() {
     snprintf(rec, sizeof(rec),
       "%s{\"ts\":%lu,\"up_s\":%lu,\"v\":%.2f,\"src\":\"%s\",\"ok\":%s,\"ver\":%u}",
       n ? "," : "", (unsigned long)e.ts, (unsigned long)e.up_s, e.vbatt,
-      e.src == 0 ? "auto" : "manual", e.ok ? "true" : "false", e.ver);
+      e.src == 0 ? "auto" : (e.src == 1 ? "manual" : "external"),
+      e.ok ? "true" : "false", e.ver);
+    if (!waitWritable(4000)) break;       // stalled client -> abort rather than block
     g_out_total += strlen(rec);
     server.sendContent(rec);
-    esp_task_wdt_reset();                 // feed WDT between records (slow client)
+    esp_task_wdt_reset();
   }
   server.sendContent("]");
   server.sendContent("");
@@ -2686,7 +2808,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=426"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=428"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -2763,7 +2885,29 @@ static wifi_auth_mode_t staMinAuth() {
   }
 }
 
+// Long-term drain rate in mV/h from the settled anchor to now. Returns 0 if
+// there is no anchor yet or too little baseline to be meaningful.
+float longTermMvph(float vNow) {
+  if (!g_ltRefTs || !timeIsValid()) return 0.0f;
+  uint32_t nowS = (uint32_t)time(nullptr);
+  if (nowS <= g_ltRefTs + LT_MIN_S)  return 0.0f;
+  float hrs = (nowS - g_ltRefTs) / 3600.0f;
+  return (vNow - g_ltRefV) * 1000.0f / hrs;
+}
+
+// Seconds until the trigger at the long-term rate. -1 = unknown/holding.
+long longTermEtaS(float vNow) {
+  float r = longTermMvph(vNow);
+  if (r >= -0.05f) return -1;                    // flat or rising -> no estimate
+  float mv = (vNow - g_as_volts) * 1000.0f;
+  if (mv <= 0) return 0;
+  return (long)(mv / (-r) * 3600.0f);
+}
+
 static void loadWifiCfg() {
+  g_ltRefTs = prefs.getUInt ("lt_ref_ts", 0);
+  g_ltRefV  = prefs.getFloat("lt_ref_v",  0.0f);
+  g_ltDue   = prefs.getUInt ("lt_due",    0);
   g_sta_ssid   = prefs.getString("sta_ssid", WIFI_SSID);
   g_sta_pass   = prefs.getString("sta_pass", WIFI_PASS);
   g_ap_ssid    = prefs.getString("ap_ssid",  AP_SSID);

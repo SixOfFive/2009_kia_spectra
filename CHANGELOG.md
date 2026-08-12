@@ -82,6 +82,51 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-12 — fw 4.29: anchor the long-term baseline to the VEHICLE, not the boot
+
+### Fixed
+4.28's bootstrap path anchored the long-term reference at **the moment the board
+booted**, which on a device that reboots means the baseline restarts every time —
+defeating the entire purpose of the feature, which exists precisely to escape
+that. The measurement must be anchored to the **car's last run**.
+
+Now the target is `last_run + LT_SETTLE_S` (12 h after the engine stopped, past
+the fast fluctuating settle). If that moment has already passed, it does **not**
+wait for a new cycle: the 24 h history ring is written through to flash by
+`saveHistory()` and **survives reboots**, so the voltage at that time is usually
+still on record. `seedLongTermFromHistory()` takes the earliest stored sample at
+or after the target and uses its real recorded timestamp and voltage.
+
+A one-time NVS schema bump (`lt_schema` → 2) discards any anchor written by the
+4.28 scheme, so a wrong boot-time value cannot persist and quietly poison the
+number.
+
+**Verified in the field immediately after flashing:**
+```
+last_run 08-08 16:52   anchor 08-11 07:39 @ 12.32 V   baseline 25.8 h
+rate -0.86 mV/h        ETA 4.8 days to the 12.20 V trigger
+```
+`drain baseline back-dated to 12.32 V ... (62.8 h after the last run, 25.7 h of
+baseline)` — a usable number the moment the board came up, rather than six hours
+after a reboot.
+
+**Known limit:** the ring holds 24 h, so when the last run is older than that the
+anchor lands at the oldest stored sample rather than exactly `last_run + 12 h`.
+That is the longest baseline the stored data supports, and it is real measured
+voltage rather than an assumption. From the next engine run onward the 12 h mark
+is recorded as it happens and the baseline extends for as long as the car sits.
+
+### What this says about the drain
+**−0.86 mV/h over a 25.8 h baseline ≈ 43 mA at 50 Ah** — close to the board's own
+consumption and nowhere near the "150–250 mA parasitic fault" claimed on 08-11.
+That earlier figure came from an uncompensated fit over a window whose thermal
+swing (130 mV) was six times its trend (20 mV); it read a day/night cycle as
+depletion. The long-term anchor is immune to that by construction, because it
+compares two points at the same phase of the settling curve rather than fitting
+through a diurnal cycle.
+
+---
+
 ## 2026-08-12 — fw 4.28: the stall fix that actually works, long-term drain ETA
 
 ### Fixed — `/history` watchdog stalls, third and correct attempt

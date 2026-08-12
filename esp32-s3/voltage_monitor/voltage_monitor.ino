@@ -97,13 +97,14 @@ String   g_pendSsid, g_pendPass;
 // these helpers, and Arduino's auto-prototype pass does not cover statics.
 static void             applyWifiRangeProfile();
 float                   longTermMvph(float vNow);
+void                    seedLongTermFromHistory();
 long                    longTermEtaS(float vNow);
 static wifi_auth_mode_t staMinAuth();
 static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.28";            // 4.28 = non-blocking send gate (WDT stays armed), long-term drain ETA, external-start logging
+const char* FW_VERSION = "4.29";            // 4.29 = long-term baseline anchored to the VEHICLE's last run, seeded from persisted history
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -1169,14 +1170,14 @@ void evalAutoStart(float v) {
   // firmware is new) -- the baseline then starts now rather than never.
   if (valid && timeIsValid() && !g_ltRefTs && !nowRun) {
     uint32_t nowS = (uint32_t)time(nullptr);
-    bool due       = g_ltDue && nowS >= g_ltDue;
-    bool bootstrap = !g_ltDue && g_lastRunTs && nowS > g_lastRunTs + LT_SETTLE_S;
-    if (due || bootstrap) {
+    if (g_ltDue && nowS >= g_ltDue) {          // exactly 12 h after the run ended
       g_ltRefTs = nowS; g_ltRefV = v; g_ltDue = 0;
       prefs.putUInt ("lt_ref_ts", g_ltRefTs);
       prefs.putFloat("lt_ref_v",  g_ltRefV);
       prefs.putUInt ("lt_due", 0);
-      logLine("drain baseline anchored at %.2f V (%s)", v, due ? "settled" : "bootstrap");
+      logLine("drain baseline anchored at %.2f V (settled, 12h after run)", v);
+    } else if (!g_ltDue) {
+      seedLongTermFromHistory();               // back-date it from the last run
     }
   }
 
@@ -2885,6 +2886,41 @@ static wifi_auth_mode_t staMinAuth() {
   }
 }
 
+// Seed the long-term anchor by BACK-DATING it to the vehicle's last run, not to
+// whenever this board happened to boot.
+//
+// The target is g_lastRunTs + LT_SETTLE_S -- 12 h after the engine last stopped,
+// past the fast fluctuating settle. If that moment has already passed we do not
+// need to wait for a new one: the 24 h history ring is written through to flash
+// (see saveHistory/loadHistory) and therefore SURVIVES REBOOTS, so the voltage
+// at that time is usually still on record. Take the earliest stored sample at or
+// after the target; if the target predates the ring, the oldest sample we still
+// hold is used, which is the longest baseline the data actually supports.
+//
+// This is the whole point: the measurement must be anchored to the CAR's last
+// run, so a board reboot cannot reset it. An anchor taken at boot would restart
+// the baseline every time the watchdog fired, which is exactly the failure this
+// feature exists to escape.
+void seedLongTermFromHistory() {
+  if (g_ltRefTs || !hist || histCount < 2 || !g_lastRunTs || !timeIsValid()) return;
+  uint32_t target = g_lastRunTs + LT_SETTLE_S;
+  uint32_t nowS   = (uint32_t)time(nullptr);
+  if (nowS <= target + LT_MIN_S) return;            // baseline still too short
+  int oldest = (histCount < HIST_N) ? 0 : histHead;
+  for (int k = 0; k < histCount; k++) {
+    Sample& s = hist[(oldest + k) % HIST_N];
+    if (s.ts >= target && s.vbatt > 8.0f && s.vbatt < 16.0f) {
+      g_ltRefTs = s.ts; g_ltRefV = s.vbatt;
+      prefs.putUInt ("lt_ref_ts", g_ltRefTs);
+      prefs.putFloat("lt_ref_v",  g_ltRefV);
+      logLine("drain baseline back-dated to %.2f V at %lu (%.1f h after the last run, %.1f h of baseline)",
+              g_ltRefV, (unsigned long)g_ltRefTs,
+              (g_ltRefTs - g_lastRunTs) / 3600.0f, (nowS - g_ltRefTs) / 3600.0f);
+      return;
+    }
+  }
+}
+
 // Long-term drain rate in mV/h from the settled anchor to now. Returns 0 if
 // there is no anchor yet or too little baseline to be meaningful.
 float longTermMvph(float vNow) {
@@ -2905,6 +2941,12 @@ long longTermEtaS(float vNow) {
 }
 
 static void loadWifiCfg() {
+  // fw 4.28 anchored at boot time, which restarted the baseline on every reboot.
+  // Drop any anchor written by that scheme once, so it is re-seeded from history.
+  if (prefs.getUChar("lt_schema", 1) < 2) {
+    prefs.putUInt("lt_ref_ts", 0); prefs.putFloat("lt_ref_v", 0.0f);
+    prefs.putUChar("lt_schema", 2);
+  }
   g_ltRefTs = prefs.getUInt ("lt_ref_ts", 0);
   g_ltRefV  = prefs.getFloat("lt_ref_v",  0.0f);
   g_ltDue   = prefs.getUInt ("lt_due",    0);

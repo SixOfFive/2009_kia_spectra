@@ -97,6 +97,7 @@ String   g_pendSsid, g_pendPass;
 // these helpers, and Arduino's auto-prototype pass does not cover statics.
 static void             applyWifiRangeProfile();
 float                   longTermMvph(float vNow);
+float                   smoothedVoltsRecent(int n);
 void                    seedLongTermFromHistory();
 long                    longTermEtaS(float vNow);
 static wifi_auth_mode_t staMinAuth();
@@ -104,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.31";            // 4.31 = Voltage tab: next/last auto-start DATES, cycle interval, % elapsed + progress bar
+const char* FW_VERSION = "4.32";            // 4.32 = smoothed long-term fit + task watchdog 30s -> 5min (9/9 firings were network I/O, never the safety task)
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -475,7 +476,22 @@ float     g_lastTemp    = 0.0f;            // most recent chip temp C (owned by 
 // here so evalAutoStart() and handleTransmit() can see g_rfMutex.
 TaskHandle_t      g_safetyTask   = nullptr;
 SemaphoreHandle_t g_rfMutex      = nullptr;
-const uint32_t    WDT_TIMEOUT_MS = 30000;  // reboot if a watched task stalls this long
+// Task-watchdog timeout. Raised 30 s -> 300 s on 2026-08-12 on the evidence of
+// four days of logs: NINE watchdog firings, every one of them network I/O
+// ('http', '/history', 'ota'), and every one recording "safety was 'idle'" --
+// the core-0 task the watchdog exists to protect was healthy in all nine. Not
+// one real hang was ever caught; each firing cost a reboot AND 15 minutes of
+// disarmed auto-start, because a reboot resets the 900 s park-confirm.
+//
+// So a longer timeout makes the safety function MORE available, not less. The
+// cost is that a genuine safety-task hang now takes up to 5 min to self-recover
+// instead of 30 s -- immaterial when the sampler runs at 1 Hz, the trigger needs
+// a 60 s sustain, and the battery moves about 1 mV/h.
+//
+// This is compensation, not the fix: bounding the I/O (waitWritable) is the
+// correct repair, and it stays. The wider timeout stops legitimate slowness --
+// a 68 s OTA over a contended channel -- from looking like a stall.
+const uint32_t    WDT_TIMEOUT_MS = 300000;  // 5 min; see the note above
 
 // WDT-culprit breadcrumbs. Each watched task stamps "what am I doing" into RTC
 // memory, which survives a TASK-WATCHDOG reset -- so the next boot can report
@@ -506,6 +522,7 @@ uint8_t   g_asFails     = 0;               // consecutive unverified starts  NVS
 // from that anchor to now, and it SURVIVES REBOOTS because both ends are stored.
 const uint32_t LT_SETTLE_S = 12UL * 3600UL;   // ignore the first 12 h after a run
 const uint32_t LT_MIN_S    = 6UL  * 3600UL;   // need this much baseline to report
+const int      LT_SMOOTH_N = 120;             // samples averaged at each end (2 h @ 60 s)
 uint32_t  g_ltRefTs  = 0;                  // epoch of the settled reference
 float     g_ltRefV   = 0.0f;               // voltage at that reference
 uint32_t  g_ltDue    = 0;                  // epoch when the reference should be taken
@@ -1181,7 +1198,7 @@ void evalAutoStart(float v) {
   if (valid && timeIsValid() && !g_ltRefTs && !nowRun) {
     uint32_t nowS = (uint32_t)time(nullptr);
     if (g_ltDue && nowS >= g_ltDue) {          // exactly 12 h after the run ended
-      g_ltRefTs = nowS; g_ltRefV = v; g_ltDue = 0;
+      g_ltRefTs = nowS; g_ltRefV = smoothedVoltsRecent(LT_SMOOTH_N); g_ltDue = 0;
       prefs.putUInt ("lt_ref_ts", g_ltRefTs);
       prefs.putFloat("lt_ref_v",  g_ltRefV);
       prefs.putUInt ("lt_due", 0);
@@ -2957,7 +2974,13 @@ void seedLongTermFromHistory() {
   for (int k = 0; k < histCount; k++) {
     Sample& s = hist[(oldest + k) % HIST_N];
     if (s.ts >= target && s.vbatt > 8.0f && s.vbatt < 16.0f) {
-      g_ltRefTs = s.ts; g_ltRefV = s.vbatt;
+      // Average forward from the anchor rather than trusting one sample.
+      double a = 0; int an = 0;
+      for (int j = k; j < histCount && an < LT_SMOOTH_N; j++) {
+        Sample& t = hist[(oldest + j) % HIST_N];
+        if (t.vbatt > 8.0f && t.vbatt < 16.0f) { a += t.vbatt; an++; }
+      }
+      g_ltRefTs = s.ts; g_ltRefV = an ? (float)(a / an) : s.vbatt;
       prefs.putUInt ("lt_ref_ts", g_ltRefTs);
       prefs.putFloat("lt_ref_v",  g_ltRefV);
       logLine("drain baseline back-dated to %.2f V at %lu (%.1f h after the last run, %.1f h of baseline)",
@@ -2968,21 +2991,44 @@ void seedLongTermFromHistory() {
   }
 }
 
+// Mean of the most recent n history samples.
+//
+// The long-term projection MUST NOT ride on a single ADC reading. The rate is
+// (vNow - refV) / hours, and with the anchor only tens of mV away a ~10 mV
+// wobble in one sample moves the rate by tens of percent -- and that rate is the
+// DENOMINATOR of the ETA, so the projected date jumped by days between
+// consecutive polls. Averaging both ends removes nearly all of that motion.
+float smoothedVoltsRecent(int n) {
+  if (!hist || histCount < 1) return g_lastV;
+  int take   = (n < histCount) ? n : histCount;
+  int oldest = (histCount < HIST_N) ? 0 : histHead;
+  double sum = 0; int cnt = 0;
+  for (int k = histCount - take; k < histCount; k++) {
+    Sample& q = hist[(oldest + k) % HIST_N];
+    if (q.vbatt > 8.0f && q.vbatt < 16.0f) { sum += q.vbatt; cnt++; }
+  }
+  return cnt ? (float)(sum / cnt) : g_lastV;
+}
+
 // Long-term drain rate in mV/h from the settled anchor to now. Returns 0 if
-// there is no anchor yet or too little baseline to be meaningful.
-float longTermMvph(float vNow) {
+// there is no anchor yet or too little baseline to be meaningful. The argument
+// is only a fallback -- the smoothed average is used whenever history exists,
+// deliberately, so the reported rate barely moves between polls.
+float longTermMvph(float vFallback) {
   if (!g_ltRefTs || !timeIsValid()) return 0.0f;
   uint32_t nowS = (uint32_t)time(nullptr);
   if (nowS <= g_ltRefTs + LT_MIN_S)  return 0.0f;
-  float hrs = (nowS - g_ltRefTs) / 3600.0f;
+  float hrs  = (nowS - g_ltRefTs) / 3600.0f;
+  float vNow = (hist && histCount > 2) ? smoothedVoltsRecent(LT_SMOOTH_N) : vFallback;
   return (vNow - g_ltRefV) * 1000.0f / hrs;
 }
 
 // Seconds until the trigger at the long-term rate. -1 = unknown/holding.
-long longTermEtaS(float vNow) {
-  float r = longTermMvph(vNow);
+long longTermEtaS(float vFallback) {
+  float r = longTermMvph(vFallback);
   if (r >= -0.05f) return -1;                    // flat or rising -> no estimate
-  float mv = (vNow - g_as_volts) * 1000.0f;
+  float vNow = (hist && histCount > 2) ? smoothedVoltsRecent(LT_SMOOTH_N) : vFallback;
+  float mv = (vNow - g_as_volts) * 1000.0f;      // smoothed here too, same reason
   if (mv <= 0) return 0;
   return (long)(mv / (-r) * 3600.0f);
 }
@@ -2990,9 +3036,9 @@ long longTermEtaS(float vNow) {
 static void loadWifiCfg() {
   // fw 4.28 anchored at boot time, which restarted the baseline on every reboot.
   // Drop any anchor written by that scheme once, so it is re-seeded from history.
-  if (prefs.getUChar("lt_schema", 1) < 2) {
+  if (prefs.getUChar("lt_schema", 1) < 3) {   // 3 = averaged anchor (4.32)
     prefs.putUInt("lt_ref_ts", 0); prefs.putFloat("lt_ref_v", 0.0f);
-    prefs.putUChar("lt_schema", 2);
+    prefs.putUChar("lt_schema", 3);
   }
   g_ltRefTs = prefs.getUInt ("lt_ref_ts", 0);
   g_ltRefV  = prefs.getFloat("lt_ref_v",  0.0f);
@@ -3253,14 +3299,16 @@ void setup() {
   updateLed(readBatteryVolts());     // set the LED immediately
 
   // Watchdog + safety task. Create the RF mutex first (both fire paths need it),
-  // arm the task watchdog (reboot if the loop or the safety task stalls > 30 s),
+  // arm the task watchdog (reboot if the loop or the safety task stalls past
+  // WDT_TIMEOUT_MS -- 5 min; see the note at its declaration),
   // subscribe the loop task, then launch the safety task on core 0 (loop is core 1).
   g_rfMutex = xSemaphoreCreateMutex();
   esp_task_wdt_config_t wdtc = { .timeout_ms = WDT_TIMEOUT_MS, .idle_core_mask = 0, .trigger_panic = true };
   if (esp_task_wdt_init(&wdtc) == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdtc);  // Arduino may have pre-inited it
   esp_task_wdt_add(nullptr);         // watch loopTask
   xTaskCreatePinnedToCore(safetyTaskFn, "safety", 8192, nullptr, 3, &g_safetyTask, 0);
-  Serial.println("safety task started (core 0); task watchdog armed @30s");
+  Serial.printf("safety task started (core 0); task watchdog armed @%lus\n",
+                (unsigned long)(WDT_TIMEOUT_MS / 1000));
 
   if (DISPLAY_ENABLED) {
     pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);    // backlight on

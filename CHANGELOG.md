@@ -82,6 +82,70 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-12 — fw 4.32: smoothed long-term fit, task watchdog 30 s → 5 min
+
+### Fixed — the projection "bounced around like crazy"
+Both ends of the long-term fit were **single ADC samples**. The rate is
+`(vNow − refV) / hours`; with the anchor only ~30 mV from the present reading, a
+one-LSB wobble (~5.5 mV at the battery) is a large fraction of the signal — and
+that rate is the **denominator** of the ETA, so the error compounds. Measured on
+4.31, consecutive polls:
+
+```
+v=12.30  ->  -0.840 mV/h  ->  Mon 17 Aug  ->  43.2%
+v=12.29  ->  -1.260 mV/h  ->  Sat 15 Aug  ->  56.2%
+v=12.29  ->  -1.050 mV/h  ->  Sun 16 Aug  ->  50.1%
+```
+
+**10 mV of ADC quantisation halved the rate and slid the projected date four
+days.** Both ends now use a 120-sample (2 h) mean via `smoothedVoltsRecent()`,
+and the anchor averages 120 samples forward instead of trusting one. NVS schema
+bumped to 3 to force re-seeding, so the noisy single-sample anchor cannot
+persist. The safety path is deliberately untouched — `autoStartEtaS()` still uses
+the instantaneous voltage for the "already below threshold" check.
+
+### Changed — task watchdog 30 s → 300 s
+On the evidence of four days of logs: **nine watchdog firings, every one network
+I/O** (`'http'`, `'/history'`, `'ota'`), and every one recording
+`safety was 'idle'` — the core-0 task the watchdog exists to protect was healthy
+in all nine. **Not one real hang was ever caught.** Each firing cost a reboot
+*and* 15 minutes of disarmed auto-start, since a reboot resets the 900 s
+park-confirm.
+
+So a longer timeout makes the safety function **more** available, not less. The
+cost: a genuine safety-task hang now self-recovers in up to 5 min instead of 30 s
+— immaterial when the sampler runs at 1 Hz, the trigger needs a 60 s sustain, and
+the battery moves ~1 mV/h. Note `esp_task_wdt_config_t` carries one timeout for
+all watched tasks, so this cannot be set per-task without a separate software
+watchdog.
+
+This is compensation, not the repair: bounding the I/O (`waitWritable`, 4.28)
+remains the correct fix and stays. The wider timeout stops *legitimate* slowness
+from looking like a stall.
+
+### Why it was needed: OTA was rebooting the board mid-upload
+Five consecutive 4.32 uploads failed with `HTTP=000` at varying byte counts. The
+cause was not the network — the breadcrumb named it:
+
+```
+2026-08-12 10:04:26   ^ WDT stall: loop was 'ota', safety was 'idle'
+2026-08-12 10:04:26 boot: fw 4.31, CPU 240 MHz, reset=TASK-WATCHDOG
+```
+
+**The OTA itself was tripping the watchdog**, rebooting the board and dropping
+the connection. At ~18 KB/s a 1.22 MB image needs ~68 s against a 30 s watchdog;
+the handler feeds the WDT only when data arrives, so any link stall past 30 s in
+that window rebooted it. Throughput had fallen from 55 KB/s to 18 KB/s after
+moving to channel 10, where the main router's three radios contend for airtime —
+the +5 dB of signal was paid for in throughput. Raising the CPU to 240 MHz did
+not help (18.1 vs 16.8 KB/s), confirming the bottleneck was the channel, not the
+board.
+
+**Delivered as a binary for manual upload**, since the defect blocks its own fix
+over the air: 1,223,584 bytes, md5 `7b988ef05086924a82ce882e2741e782`.
+
+---
+
 ## 2026-08-12 — fw 4.31: real dates, cycle progress % and bar
 
 ### Added — Voltage tab

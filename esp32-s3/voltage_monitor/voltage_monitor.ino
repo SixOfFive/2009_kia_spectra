@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.34";            // 4.34 = live sustain countdown on Main + every countdown start/reset logged with its reason
+const char* FW_VERSION = "4.35";            // 4.34 = live sustain countdown on Main + every countdown start/reset logged with its reason
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -307,6 +307,41 @@ static portMUX_TYPE g_logMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t g_logSeq = 0;          // total lines ever pushed (monotonic)
 static volatile uint32_t g_logPersistedSeq = 0; // how many have reached flash
 
+// ---- flap consolidation --------------------------------------------------
+// A value dithering at a threshold emits the same one- or two-line pattern over
+// and over. Observed: LOW-V STARTED/RESET pairs one second apart, repeatedly --
+// left alone that fills the 1000-line ring in minutes and buries everything
+// else worth reading.
+//
+// So recognise a repeating 1- or 2-line cycle and, instead of appending, keep
+// rewriting a "[repeated N times]" suffix on the lines already in the ring.
+// Keyed on the FULL message text including voltages, so 12.22 V and 12.23 V are
+// different lines and a change in the value starts a fresh count. That is what
+// makes the collapsed line trustworthy rather than a lie of omission.
+static char     g_flapA[LOG_LEN] = {0};        // first line of the detected cycle
+static char     g_flapB[LOG_LEN] = {0};        // second line ("" = single-line cycle)
+static int      g_flapIA = -1, g_flapIB = -1;  // their ring indices
+static uint16_t g_flapN    = 0;                // repeats collapsed so far
+static uint8_t  g_flapStep = 0;                // next expected slot in the cycle
+static char     g_prevMsg[LOG_LEN] = {0};      // last two appended messages
+static char     g_lastMsg[LOG_LEN] = {0};
+static int      g_prevIdx = -1, g_lastIdx = -1;
+
+// Rewrite ring[idx] as its original text plus "[repeated N times]". Caller holds
+// g_logMux. Truncates any previous suffix first so the count never stacks up.
+static void flapStamp(int idx, uint16_t n) {
+  if (idx < 0 || !g_log) return;
+  char* p = strstr(g_log[idx], "  [repeated ");
+  if (p) *p = 0;
+  size_t len = strlen(g_log[idx]);
+  snprintf(g_log[idx] + len, LOG_LEN - len, "  [repeated %u times]", (unsigned)(n + 1));
+}
+
+static void flapReset() {
+  g_flapA[0] = g_flapB[0] = 0; g_flapIA = g_flapIB = -1;
+  g_flapN = 0; g_flapStep = 0;
+}
+
 void logLine(const char* fmt, ...) {
   char msg[LOG_LEN];
   va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
@@ -322,10 +357,56 @@ void logLine(const char* fmt, ...) {
   }
   portENTER_CRITICAL(&g_logMux);
   if (g_log) {
-    strncpy(g_log[g_logHead], line, LOG_LEN - 1); g_log[g_logHead][LOG_LEN - 1] = 0;
-    g_logHead = (g_logHead + 1) % LOG_LINES;
-    if (g_logCount < LOG_LINES) g_logCount++;
-    g_logSeq++;                         // loop will persist anything past g_logPersistedSeq
+    bool collapsed = false;
+
+    // Already tracking a cycle: does this message continue it?
+    if (g_flapN > 0 || g_flapA[0]) {
+      const char* expect = (g_flapStep == 0) ? g_flapA : g_flapB;
+      if (expect[0] && strcmp(msg, expect) == 0) {
+        bool pair = (g_flapB[0] != 0);
+        g_flapStep = pair ? (g_flapStep ^ 1) : 0;
+        if (g_flapStep == 0) {                 // a full cycle just completed
+          g_flapN++;
+          flapStamp(g_flapIA, g_flapN);
+          if (pair) flapStamp(g_flapIB, g_flapN);
+          g_logSeq++;                          // re-persist the amended line(s)
+        }
+        collapsed = true;
+      } else {
+        flapReset();                           // pattern broken -- resume normally
+      }
+    }
+
+    if (!collapsed) {
+      // Detect the START of a cycle from the two most recently appended lines.
+      if (g_lastMsg[0] && strcmp(msg, g_lastMsg) == 0) {          // A,A
+        strncpy(g_flapA, msg, LOG_LEN - 1); g_flapA[LOG_LEN - 1] = 0;
+        g_flapB[0] = 0; g_flapIA = g_lastIdx; g_flapIB = -1;
+        g_flapN = 1; g_flapStep = 0;
+        flapStamp(g_flapIA, g_flapN);
+        g_logSeq++;
+        collapsed = true;
+      } else if (g_prevMsg[0] && strcmp(msg, g_prevMsg) == 0) {   // A,B,A
+        strncpy(g_flapA, g_prevMsg, LOG_LEN - 1); g_flapA[LOG_LEN - 1] = 0;
+        strncpy(g_flapB, g_lastMsg, LOG_LEN - 1); g_flapB[LOG_LEN - 1] = 0;
+        g_flapIA = g_prevIdx; g_flapIB = g_lastIdx;
+        g_flapN = 1; g_flapStep = 1;           // we have just re-seen A
+        flapStamp(g_flapIA, g_flapN);
+        flapStamp(g_flapIB, g_flapN);
+        g_logSeq++;
+        collapsed = true;
+      }
+    }
+
+    if (!collapsed) {                          // ordinary append
+      strncpy(g_log[g_logHead], line, LOG_LEN - 1); g_log[g_logHead][LOG_LEN - 1] = 0;
+      strncpy(g_prevMsg, g_lastMsg, LOG_LEN - 1); g_prevMsg[LOG_LEN - 1] = 0;
+      strncpy(g_lastMsg, msg,       LOG_LEN - 1); g_lastMsg[LOG_LEN - 1] = 0;
+      g_prevIdx = g_lastIdx; g_lastIdx = g_logHead;
+      g_logHead = (g_logHead + 1) % LOG_LINES;
+      if (g_logCount < LOG_LINES) g_logCount++;
+      g_logSeq++;                       // loop will persist anything past g_logPersistedSeq
+    }
   }
   portEXIT_CRITICAL(&g_logMux);
   Serial.println(line);                 // keep the USB console too
@@ -1464,25 +1545,39 @@ nav.tabs{display:flex;gap:2px;flex-wrap:wrap;background:var(--card);border-botto
 nav.tabs a{color:var(--mut);text-decoration:none;padding:11px 13px;font-size:14px;border-bottom:2px solid transparent;white-space:nowrap}
 nav.tabs a:hover{color:var(--fg)}
 nav.tabs a.on{color:var(--fg);border-bottom-color:#1f6feb;font-weight:600}
-.wrap{max-width:820px;margin:0 auto;padding:18px 20px}
-.hero{display:flex;gap:16px;flex-wrap:wrap}
-.metric{flex:1;min-width:150px;text-align:center;background:var(--card);border:1px solid #21262d;border-radius:10px;padding:16px}
+.wrap{max-width:880px;margin:0 auto;padding:22px 22px 34px}
+.hero{display:flex;gap:18px;flex-wrap:wrap}
+.metric{flex:1;min-width:160px;text-align:center;background:linear-gradient(180deg,#171d26 0%,var(--card) 100%);
+  border:1px solid #262d38;border-radius:14px;padding:20px 16px;
+  box-shadow:0 1px 2px rgba(0,0,0,.35);transition:border-color .15s,transform .15s}
+.metric:hover{border-color:#3a4658;transform:translateY(-1px)}
 .metric .lbl{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
 .metric .big{font-size:42px;font-weight:700;line-height:1}
 .metric .u{font-size:16px;color:var(--mut)}
-.sub{color:var(--mut);font-size:13px;text-align:center;margin:10px 0}
-.clbl{color:var(--mut);font-size:12px;margin:14px 0 5px;text-transform:uppercase;letter-spacing:.04em}
-canvas{width:100%;height:104px;background:var(--card);border:1px solid #21262d;border-radius:10px;display:block;cursor:crosshair}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin:18px 0}
-.card{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px}
-.card .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
-.card .v{font-size:18px;font-weight:600;margin-top:4px;word-break:break-word}
+.sub{color:var(--mut);font-size:13px;text-align:center;margin:14px 0 4px}
+.clbl{color:var(--mut);font-size:12px;margin:26px 0 9px;text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+.clbl:first-child{margin-top:6px}
+canvas{width:100%;height:104px;background:var(--card);border:1px solid #262d38;border-radius:12px;display:block;cursor:crosshair}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:16px;margin:20px 0 24px}
+.card{background:var(--card);border:1px solid #262d38;border-radius:14px;padding:16px 16px 15px;
+  box-shadow:0 1px 2px rgba(0,0,0,.3);transition:border-color .15s,transform .15s,box-shadow .15s}
+.card:hover{border-color:#3a4658;transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.4)}
+.card .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.05em;line-height:1.35}
+.card .v{font-size:19px;font-weight:600;margin-top:7px;word-break:break-word;line-height:1.25}
+/* anything with an explanation gets a dotted underline so it is discoverable */
+[data-tip]{cursor:help}
+.card[data-tip] .k{border-bottom:1px dotted #3a4658;display:inline-block;padding-bottom:2px}
 footer{text-align:center;color:var(--mut);font-size:12px;padding:16px}
 button.tx{background:#21262d;color:var(--fg);border:1px solid #30363d;border-radius:8px;padding:10px 16px;font-size:14px;cursor:pointer}
 button.tx:active{background:#30363d}
 button.tx.start{background:#238636;border-color:#2ea043;font-size:18px;font-weight:600;padding:14px}
 button.tx.start:active{background:#2ea043}
-#tip{position:fixed;display:none;pointer-events:none;z-index:50;background:#1f2733;color:var(--fg);border:1px solid #30363d;border-radius:6px;padding:6px 9px;font-size:12px;line-height:1.45;box-shadow:0 2px 10px rgba(0,0,0,.5);white-space:nowrap}
+#tip{position:fixed;display:none;pointer-events:none;z-index:50;background:#1f2733;color:var(--fg);
+  border:1px solid #3a4658;border-radius:8px;padding:9px 12px;font-size:12.5px;line-height:1.55;
+  box-shadow:0 6px 22px rgba(0,0,0,.6);white-space:nowrap}
+#tip.rich{white-space:normal;max-width:330px}
+#tip b{color:#fff}
+#tip .tk{color:#8b949e}
 button.tx.seg.on{background:#1f6feb;border-color:#388bfd;color:#fff;font-weight:600}
 .badge{display:inline-block;padding:2px 12px;border-radius:20px;font-size:15px;font-weight:700;letter-spacing:.03em}
 .badge.on{background:#1a7f37;color:#fff}.badge.off{background:#30363d;color:#8b949e}
@@ -1521,6 +1616,41 @@ function cdTick(){
 }
 setInterval(cdTick,1000);
 
+// ---- tooltip engine -------------------------------------------------------
+// Every element carrying data-tip explains itself on hover (and on tap, for
+// phones). Content is HTML so a tip can carry structure: what the value means,
+// what it is showing right now, and what would change it. The same #tip node the
+// graphs use is reused, switched to wrapping mode via the .rich class.
+function tipShow(el,ev){
+  var t=el.getAttribute("data-tip"); if(!t)return;
+  var n=$("tip"); if(!n)return;
+  n.innerHTML=t; n.className="rich"; n.style.display="block";
+  var r=n.getBoundingClientRect(), pad=12;
+  var x=(ev.clientX||0)+14, y=(ev.clientY||0)+16;
+  if(x+r.width+pad>window.innerWidth)  x=Math.max(pad,(ev.clientX||0)-r.width-14);
+  if(y+r.height+pad>window.innerHeight) y=Math.max(pad,(ev.clientY||0)-r.height-16);
+  n.style.left=x+"px"; n.style.top=y+"px";
+}
+function tipHide(){var n=$("tip");if(n){n.style.display="none";n.className="";}}
+document.addEventListener("mouseover",function(e){
+  var el=e.target.closest?e.target.closest("[data-tip]"):null;
+  if(el) tipShow(el,e);
+});
+document.addEventListener("mousemove",function(e){
+  var el=e.target.closest?e.target.closest("[data-tip]"):null;
+  if(el) tipShow(el,e); else if(($("tip")||{}).className==="rich") tipHide();
+});
+document.addEventListener("mouseout",function(e){
+  var el=e.target.closest?e.target.closest("[data-tip]"):null;
+  if(el) tipHide();
+});
+document.addEventListener("click",function(e){          // touch devices
+  var el=e.target.closest?e.target.closest("[data-tip]"):null;
+  if(el){ tipShow(el,{clientX:e.clientX,clientY:e.clientY}); setTimeout(tipHide,5200); }
+});
+// Attach/refresh a tip on an element by id.
+function TIP(id,html){var e=$(id);if(e){var c=e.closest(".card,.metric")||e;c.setAttribute("data-tip",html);}}
+
 function fmtDate(ts){if(!ts)return "--";var x=new Date(ts*1000);
   return x.toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"})+" "+
          x.toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit"});}
@@ -1554,7 +1684,7 @@ function idxFromEvent(ev,id){var ch=CHARTS[id];if(!ch||ch.data.length<2)return -
   return Math.max(0,Math.min(N-1,i));}
 function showTip(ev,id){var ch=CHARTS[id];if(!ch||hoverIdx<0)return;
   H("tip","<b>"+ch.data[hoverIdx].toFixed(ch.dec)+" "+ch.unit+"</b><br>"+fmtWhen(hoverIdx));
-  var tp=$("tip");if(!tp)return;tp.style.display="block";
+  var tp=$("tip");if(!tp)return;tp.className="";tp.style.display="block";   // not a rich card tip
   var tx=ev.clientX+12;if(tx+170>window.innerWidth)tx=ev.clientX-160;
   tp.style.left=tx+"px";tp.style.top=(ev.clientY+12)+"px";}
 function setupHover(){IDS.forEach(function(id){var c=$(id);if(!c)return;
@@ -1673,6 +1803,91 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
     }
     cdSeenStarts = d.as_n||0;
   }
+
+  // ---- tooltips: what it means, what it says NOW, what would change it ------
+  // Rebuilt every poll so the tip always quotes live values, not a static blurb.
+  (function(){
+    var thr=(d.as_volts||0).toFixed(2), now=(d.vbatt||0).toFixed(2);
+    var hold=d.as_hold||0, cool=d.as_cool||0;
+
+    TIP("vbatt","<b>Battery voltage</b><br>Measured at the OBD-II +12 V pin through a 1 M / 220 k divider "
+      +"(x5.545) on GPIO1, ~5.5 mV per ADC step.<br><span class='tk'>Now "+now+" V &middot; trigger "+thr+" V &middot; "
+      +"resting 12.6-12.7 V = healthy, 12.2 V &asymp; 50% charge, below 11.8 V likely will not crank.</span>");
+    TIP("temp","<b>Chip temperature</b><br>The ESP32-S3 internal sensor, not air temperature - it reads warm "
+      +"because it sits next to its own regulator.<br><span class='tk'>Used to temperature-compensate the drain "
+      +"fit: this battery swings ~5 mV per degree C, which is several times the real daily drain.</span>");
+    TIP("up","<b>Uptime</b><br>Time since the last boot. A steadily rising value is itself proof both watched "
+      +"tasks are alive - if either stalled, the task watchdog would reboot and reset this."
+      +"<br><span class='tk'>Every reboot also restarts park-confirm, so protection re-arms "+(d.as_park_need||900)+" s later.</span>");
+
+    TIP("aslow","<b>Sustain countdown</b><br>How long voltage has stayed below the trigger. It must hold for the "
+      +"full <b>"+hold+" s</b> before a start fires - that is what stops a crank dip or a blower surge from "
+      +"looking like a flat battery.<br><span class='tk'>Now "+(d.as_low_s||0)+" s of "+hold+" s. ANY reading back at "
+      +"or above "+thr+" V resets it to zero, so while the battery is still crossing the threshold expect "
+      +"repeated short countdowns - normal, and it settles once it sits solidly below.</span>");
+
+    TIP("aseta","<b>Estimated time to auto-start</b><br>Projected from the <b>long-term</b> drain anchor - a fixed "
+      +"point taken 12 h after the engine last stopped, compared against a 2 h average now. It deliberately does "
+      +"not use the 24 h least-squares fit, which restarts on every reboot and reads the day/night thermal cycle "
+      +"as depletion.<br><span class='tk'>Rate "+(d.lt_mvph!==undefined?d.lt_mvph.toFixed(2):"?")+" mV/h &middot; "
+      +"from "+now+" V down to "+thr+" V, plus the "+hold+" s hold.</span>");
+
+    TIP("ascool","<b>Cooldown</b><br>Minimum gap between automatic starts, so a faulty sensor or a battery sitting "
+      +"on the threshold cannot loop the starter.<br><span class='tk'>Set to "+cool+" s ("+(cool/3600).toFixed(1)
+      +" h). "+(d.as_cool_s>0?("Blocked for another "+d.as_cool_s+" s."):"Clear - not blocking anything right now.")+"</span>");
+
+    TIP("aspark","<b>Park confirm</b><br>The board refuses to fire until it has seen the car parked: voltage below "
+      +"the 13.2 V alternator line continuously for "+(d.as_park_need||900)+" s. Without it a start could be sent "
+      +"while you are driving.<br><span class='tk'>"+(d.as_park_s>=d.as_park_need?"Confirmed - parked.":
+        ("Waiting: "+(d.as_park_s||0)+" s of "+(d.as_park_need||900)+" s."))
+      +" Resets to zero on every reboot.</span>");
+
+    TIP("asf24","<b>Automatic starts in the last 24 h</b><br>Counts only starts the board fired by itself; manual "
+      +"and key/FOB starts are excluded.<br><span class='tk'>"+(d.as_max24>0
+        ?("Capped at "+d.as_max24+" per 24 h - further starts are refused until the window rolls.")
+        :"No cap set (0 = unlimited). The real runaway guard is the lockout below, not this counter.")+"</span>");
+
+    TIP("asfail","<b>Fail streak</b><br>Consecutive automatic starts that produced <i>no charging voltage</i> within "
+      +"180 s - meaning the engine did not actually catch.<br><span class='tk'>Now "+(d.as_fails||0)+" of 2. "
+      +"Reaching 2 latches the lockout. Any start that does bring the alternator up resets this to zero.</span>");
+
+    TIP("aslock","<b>Lockout</b> - the runaway guard.<br>It latches <b>ON</b> after <b>2 consecutive</b> automatic "
+      +"starts that drew no charge, i.e. the board sent Start and the engine never ran. While latched, auto-start "
+      +"will not fire at all and any countdown is abandoned immediately."
+      +"<br><br><span class='tk'>Right now: <b>"+(d.as_lock?"LATCHED - auto-start is disabled":"no")+"</b>"
+      +" (fail streak "+(d.as_fails||0)+" of 2).<br>"
+      +(d.as_lock
+        ? "Clear it with the <b>Clear lockout</b> button - but find out why the engine did not catch first. A dead "
+          +"starter, no fuel, or an RF problem will simply repeat."
+        : "It would trip if the next 2 automatic starts both failed to bring the alternator up. Nothing to do.")
+      +"</span>");
+
+    TIP("asn","<b>Starts logged</b><br>Entries in the persistent start history below - automatic, manual (dashboard "
+      +"button) and external (key or FOB, detected from alternator voltage).<br><span class='tk'>"+(d.as_n||0)
+      +" recorded. Survives reboots; clear it with the button under the table.</span>");
+
+    TIP("aslast","<b>Last start command</b><br>When the board last <i>sent</i> a start - not proof the engine ran. "
+      +"Compare with <b>Last charge</b>: a command with no charging afterwards means it did not catch.");
+    TIP("assince","<b>Since the last start command</b><br>Elapsed time since the board last transmitted Start.");
+    TIP("lastrun","<b>Last charge</b><br>When the engine was last actually <i>running</i>, judged from the "
+      +"alternator threshold (&ge;13.2 V with 0.3 V hysteresis). This catches key and FOB starts too, not just "
+      +"board-fired ones - it is the ground truth for whether the engine ran.");
+    TIP("runsince","<b>Since the engine last ran</b><br>Also the baseline for the long-term drain anchor, which is "
+      +"taken 12 h after this point so the fast post-charge settling is excluded.");
+
+    TIP("rfstat","<b>CC1101 radio</b><br>The 433 MHz transmitter that replays the Compustar FOB packet. "
+      +"<i>armed</i> means the module answered on SPI, its registers read back correctly, and the captured button "
+      +"codes are present.<br><span class='tk'>A start is one burst: ~1.44 s wake-up carrier, preamble, then the "
+      +"35-bit packet 8x. A second burst would toggle the engine back off.</span>");
+
+    TIP("cpu","<b>CPU clock</b><br>80 MHz is the deliberate steady setting - 240 MHz costs roughly 16 mA at the "
+      +"battery for no benefit while parked.<br><span class='tk'>Now "+(d.cpu_mhz||0)+" MHz. Persisted in NVS, so it "
+      +"survives reboots.</span>");
+    TIP("psbadge","<b>Wi-Fi power saving</b><br>With it on the radio sleeps between beacons and saves ~28 mA, but "
+      +"first-packet latency rises and this link went lossy.<br><span class='tk'>Currently <b>"+(d.wifi_ps?"on":"off")
+      +"</b>. Off was chosen deliberately after measuring 0% loss vs ~8% with it on - it roughly doubles the "
+      +"board's parked draw, which is the trade.</span>");
+  })();
   var ae=!!d.as_en,eta=fmtEta(d.as_eta_s);
   T("aseta",ae?(eta||(d.drain_ok?"holding":"settling")):"--");
   C("aseta",(!ae||d.as_eta_s<0)?"#8b949e":(d.drain_r2<0.6?"#d29922":"#3fb950"));
@@ -1841,7 +2056,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1950,13 +2165,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=434"></script>
+<script src="/app.js?v=435"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2045,13 +2260,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=434"></script>
+<script src="/app.js?v=435"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2114,13 +2329,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=434"></script>
+<script src="/app.js?v=435"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2152,13 +2367,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=434"></script>
+<script src="/app.js?v=435"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2184,7 +2399,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=434"></script>
+<script src="/app.js?v=435"></script>
 </body></html>
 )HTML";
 
@@ -2768,7 +2983,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=434">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=435">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -2951,7 +3166,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

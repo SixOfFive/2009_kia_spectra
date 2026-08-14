@@ -82,6 +82,60 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — fw 4.35: tooltips everywhere, log flap consolidation, UI spacing
+
+### Added — an explanation on every visible value
+Hovering any card, hero metric or badge now shows what it means, **what it says
+right now**, and what would change it. Tips are rebuilt on every poll so they
+quote live values rather than static blurbs, and anything carrying one gets a
+dotted underline on its label so it is discoverable. They also fire on tap for
+phones. 17 elements on the Main tab.
+
+The prompt for this was `Lockout`, which previously showed two words and nothing
+else. It now reads: *"the runaway guard. It latches ON after 2 consecutive
+automatic starts that drew no charge... Right now: no (fail streak 1 of 2). It
+would trip if the next 2 automatic starts both failed to bring the alternator
+up."*
+
+### Added — repeating log lines collapse instead of filling the ring
+A value dithering at a threshold emits the same one- or two-line pattern
+endlessly. `logLine()` now recognises a repeating 1- or 2-line cycle and rewrites
+a `[repeated N times]` suffix on the lines already in the ring instead of
+appending.
+
+**Keyed on the full message text including voltages**, so `12.22 V` repeating
+increments the count while a change to `12.23 V` starts a fresh line — that is
+what keeps a collapsed line honest rather than hiding a moving value behind a
+count.
+
+### Changed — spacing and visual polish
+Grid gap 12 → 16 px, minimum card width 120 → 158 px so cards stop cramming,
+padding 12 → 16 px, radius 10 → 14 px, section labels given real vertical rhythm,
+subtle gradient and shadow on cards and hero metrics with a slight lift on hover.
+
+### Fixed
+The graph hover reuses the same `#tip` node and never reset its class, so after
+hovering a card the graph tooltip inherited the wrapping style and was then
+hidden mid-hover by the card handler. `showTip()` now clears it.
+
+### Considered and rejected — a deadband on the countdown reset
+The log showed `STARTED`/`RESET` pairs one second apart, and a hysteresis margin
+on the reset was drafted. **Withdrawn on the owner's correction:** the battery is
+crossing the threshold on its way down, and once it sits solidly below, the hold
+completes normally. A deadband would let a countdown continue while voltage sat
+*above* the trigger, which breaks the meaning of "sustained below". The strict
+comparison stays; the consolidation above is what makes the crossing phase
+readable.
+
+### Known gap
+Auto-start config changes are written to NVS and Serial but **not to the flash
+log**, so a threshold or hold change leaves no durable trace. Observed after this
+flash: the hold read 300 s before and 60 s after, with every other NVS value
+intact — and there is no way to tell from the device whether that was a person or
+a fault. Worth logging.
+
+---
+
 ## 2026-08-14 — fw 4.34: live sustain countdown on Main, and every reset explained
 
 ### Added — live countdown, Main tab

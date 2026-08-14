@@ -82,6 +82,37 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — fw 4.38: migrate the file 4.37 renamed without a migration
+
+### Fixed
+4.37 renamed the hourly bucket file `/drain.bin` → `/hourly.bin` and **shipped no
+migration for it**, so the upgrade orphaned the old file and silently dropped the
+buckets it held. Caught on the live board immediately after flashing:
+`hr_buckets` went **1 → 0**, and with no file-management endpoint on the device
+the stray `/drain.bin` could not be removed remotely.
+
+`loadDrainFromFlash()` now adopts a pre-4.38 `/drain.bin` if `/hourly.bin` does
+not exist yet, and otherwise deletes it. Either way the stray goes.
+
+The cost here was one bucket and ~12 bytes, because the archive had barely
+started accumulating. **The lesson is worth more than the damage:** the same
+release contained a carefully-written migration for `/history.bin` — read once,
+replayed, removed — and the second rename in the same commit got none. Renaming a
+persisted file is a data migration whether or not it feels like one.
+
+### Verified on hardware (fw 4.37 flash, 2026-08-14 13:37)
+The parts that could only be checked by flashing:
+- **`/history.bin` migration works.** `samples` stayed at **1440** across the
+  upgrade and `disk_used` fell 151,552 → 102,400, i.e. exactly 49,152 bytes
+  (12 × 4096) — the old snapshot read and removed.
+- **New counters live:** `fs_wr_b 0`, `fs_wr_n 0`, `sb_n 1` seven seconds after
+  boot — one sample buffered in RTC RAM, nothing written to flash yet, which is
+  the intended behaviour (first flush at 30 samples).
+- Clean OTA: `boot: fw 4.37, CPU 80 MHz, reset=software`, 29.5 s upload,
+  reassociated at −59 dBm.
+
+---
+
 ## 2026-08-14 — fw 4.37: tiered sample storage (RTC RAM → journal → hourly archive)
 
 ### Changed — the history ring is no longer rewritten whole, every 10 minutes

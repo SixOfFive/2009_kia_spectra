@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.37";
+const char* FW_VERSION = "4.38";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -1372,6 +1372,19 @@ void flushDrainToFlash() {
 // watchdog, brownout or OTA -- must not reset the measurement.
 void loadDrainFromFlash() {
   if (!g_dr) return;
+  // 4.37 renamed /drain.bin to /hourly.bin and shipped without a migration, so
+  // the upgrade orphaned the file and dropped whatever buckets it held. Adopt it
+  // if the new name is not in use yet, otherwise just clear the stray.
+  if (LittleFS.exists("/drain.bin")) {
+    if (!LittleFS.exists(DR_FILE)) {
+      LittleFS.rename("/drain.bin", DR_FILE);
+      logLine("hourly archive: adopted pre-4.38 /drain.bin");
+    } else {
+      LittleFS.remove("/drain.bin");
+      logLine("hourly archive: removed orphaned /drain.bin");
+    }
+  }
+
   g_drN = 0;
   const char* files[2] = { DR_OLD, DR_FILE };    // oldest generation first
   for (int i = 0; i < 2; i++) {

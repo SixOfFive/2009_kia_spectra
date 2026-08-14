@@ -82,6 +82,105 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — fw 4.40/4.41: week and month chart ranges, aggregated on the board
+
+### Added — 24 h / 7 d / 30 d on every graph
+A range selector on all four chart pages (WiFi, Voltage, CPU, Mem/Disk), with the
+choice persisted in `localStorage` so it survives navigation. Dashed min/max
+lines already existed on the 24 h charts; they now apply to every span.
+
+### Added — `/agg?span=day|week|month[&cols=]`, so the ESP32 does the reduction
+A month of raw samples is ~44,600 rows and about 1.8 MB. That is not
+transmittable over this link, and `/history` at 24 h was already the largest
+transfer on the device at ~36 KB — **refetched every 30 s**, which is ~4.3 MB/h
+with a chart page open, and the original cause of the `/history` watchdog stalls.
+
+The window is divided into a fixed number of buckets and only the **mean** of
+each is sent:
+
+| span | window | buckets | source | payload (3 series, full ring) |
+|---|---|---|---|---|
+| day | 24 h | 288 × 5 min | raw sample ring | ~4.5 KB |
+| week | 7 d | 168 × 1 h | hourly archive | ~2.3 KB |
+| month | 30 d | 180 × 4 h | hourly archive | ~3.2 KB |
+
+Every span costs about the same regardless of how much time it covers, and all
+three are far smaller than the 24 h fetch they replace. Refresh cadence now
+scales with the span too — 30 s / 5 min / 30 min — because a month view does not
+change meaningfully between polls.
+
+Three deliberate choices:
+
+- **Window min/max ride in the header, not per row.** The dashed lines are
+  window-wide, so per-row extremes would be pure overhead. Computing them on the
+  board is also strictly *more accurate* than the client could manage: they come
+  from the per-hour min/max, so they are the real extremes. **The maximum of a
+  set of daily averages is not the maximum the battery reached.**
+- **Empty buckets are omitted, not padded.** The row index carries the x
+  position, so a gap in the record costs nothing to transmit. The chart lifts the
+  pen across gaps rather than drawing a line through them, which would invent a
+  reading that was never taken.
+- **The client takes column order from the response header**, not from its own
+  `PAGE.cols`. The board emits in its fixed series order, which only
+  coincidentally matches on all four pages today.
+
+### Changed — the hourly archive carries every graphed series
+It stored `{ts, v, t}` in 12 bytes, so there was no long-term record of RSSI,
+link rate, network, CPU or heap at all. Now one `HourAgg` per hour with
+mean/min/max for all eleven series, 136 B (~3.3 KB/day, ~1.2 MB/year).
+
+Floats rather than scaled ints: the drain fit needs the precision on `vbatt`, and
+at this volume packing saves nothing that matters on a 10 MB filesystem — flash
+wear is not a constraint (see 4.37).
+
+**Migration written the way 4.39 taught me:** the format is versioned by a
+`HAG1` magic, and a leading epoch can never collide with it, so the *absence* of
+a header unambiguously identifies the old records. Legacy rows are converted with
+the unrecorded series marked `NaN` rather than zero — a zero RSSI would be a lie
+on a graph — and the rewrite seeds a new file first, removing the source only on
+success. Verified live: `hourly archive: converted 2 legacy hours to the wide
+format`.
+
+### Fixed (4.41) — numeric padding wasted about a fifth of the payload
+`String(float, decimals)` formats via `dtostrf` with width `decimals + 2`, which
+**left-pads short values with spaces**: `drain=-2/ 0`, and ` 0` in every row.
+Harmless to parse, but across 288 rows × several integer-valued series it was
+close to a fifth of the transfer, which defeats the point of aggregating.
+Replaced with `snprintf("%.*f")`.
+
+Also fixed on the way: `String(float, uint8_t)` is genuinely ambiguous on this
+core — `String(float, unsigned int)` and `String(long long, unsigned char)` each
+win on one argument — and `agFromSample()` became the first function definition
+in the sketch, which is where the `.ino` auto-prototype block is inserted, so
+every type used in any function signature had to move above it.
+
+### Verified
+Against a mock serving the real HTML/CSS/JS before flashing (the fw 4.20
+workflow), with a deliberate 40-bucket hole and true extremes wider than the
+plotted means — the case that puts dashed lines off-canvas if the scaling is
+wrong:
+
+```
+day    288 pts, 40 gaps, mn=12.13 mx=12.37, lo=12.09 hi=12.41   <- extremes enclosed
+week   168 pts, step 3600, labels "7 d", tooltip "mean of 1 h"
+month  180 pts, step 14400, "180 of 180 buckets"
+hover over a gap -> tooltip hidden, no exception
+```
+
+Then on hardware: legacy conversion logged, `/agg` correct for all four pages ×
+three spans, padding confirmed gone. Costs 19 KB of DRAM for the bucket
+accumulator (19% → 24%), static rather than heap because a failed allocation in
+the HTTP path is a worse outcome than the memory.
+
+### Known limitation
+**Week and month views start nearly empty and fill over time.** RSSI, link,
+network, CPU and heap were never recorded hourly before 4.40, so that history
+does not exist and cannot be reconstructed. Voltage and temperature carry over
+only the two hours that survived. The `rgnote` coverage indicator ("N of M
+buckets") exists to make this obvious rather than looking like a bug.
+
+---
+
 ## 2026-08-14 — fw 4.39: the 4.37 migration never reached flash — 24 h of history lost
 
 ### Fixed — data loss, not a cosmetic bug

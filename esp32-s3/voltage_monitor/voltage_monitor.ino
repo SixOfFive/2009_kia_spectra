@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.39";
+const char* FW_VERSION = "4.41";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -299,9 +299,40 @@ DrainFit g_drain = {false, 0, 0, 0, 0, -1, 0};   // refreshed once per history s
 // reason as DrainFit above: the .ino auto-prototype pass emits
 // `HourFit computeHourlyDrain();` near the top of the file, so both types have
 // to exist by then. (Full rationale for the buckets is further down, at DR_MAX.)
-struct DrainHour { uint32_t ts; float v; float t; };   // 12 B per hour
+// Series carried by the hourly archive and served by /agg. The ORDER IS THE FILE
+// FORMAT -- append only, and bump HAG_MAGIC if anything is ever reordered or
+// removed. Names match the /history column names and the chart `col` fields.
+enum { AG_VBATT = 0, AG_TEMP, AG_DRAIN, AG_RSSI, AG_LINK, AG_NIN, AG_NOUT,
+       AG_CPU0, AG_CPU1, AG_HEAP, AG_DISK, AG_N };
+const char* const AG_NAME[AG_N] = { "vbatt", "temp", "drain", "rssi", "link",
+       "net_in", "net_out", "cpu0", "cpu1", "heap_kb", "disk_kb" };
+// Decimal places per series when serialised -- the difference between 12.25 and
+// 12.250000 over a poor link, across ~180 rows, is most of the payload.
+const uint8_t AG_DEC[AG_N] = { 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+// 136 B per hour. Deliberately floats rather than scaled ints: the drain fit
+// needs the precision on vbatt, and at 3.3 KB/day the packing saves nothing that
+// matters on a 10 MB filesystem. Flash wear is not a constraint here (see 4.37).
+struct HourAgg {
+  uint32_t ts;                                   // midpoint of the hour covered
+  float    mean[AG_N], mn[AG_N], mx[AG_N];
+};
+
 struct HourFit   { bool ok; float mvph; float r2; int n; uint32_t span_s; float mvpc; };
 HourFit g_hfit = {false, 0, 0, 0, 0, 0};
+
+// The single place a Sample is mapped onto the series vector. Both the hourly
+// accumulator and /agg's day span go through here, so they cannot drift apart.
+// NOTE: this is the FIRST function definition in the file, which is where the
+// .ino auto-prototype block gets inserted -- so every type used in any function
+// signature (HourFit, DrainFit, HourAgg, Sample) must be declared ABOVE it.
+static inline void agFromSample(float* av, const Sample& s) {
+  av[AG_VBATT] = s.vbatt;   av[AG_TEMP] = s.temp;      av[AG_DRAIN] = s.drain;
+  av[AG_RSSI]  = s.rssi;    av[AG_LINK] = s.link_mbps;
+  av[AG_NIN]   = s.net_in;  av[AG_NOUT] = s.net_out;
+  av[AG_CPU0]  = s.cpu0;    av[AG_CPU1] = s.cpu1;
+  av[AG_HEAP]  = s.heap_kb; av[AG_DISK] = s.disk_kb;
+}
 
 // ---------- rolling event log (bounded RAM ring; never touches flash) ----------
 // A fixed ring of the most recent lines -- can't grow, so it can't fill RAM or
@@ -665,18 +696,28 @@ const uint32_t DR_SETTLE_S = 12UL * 3600UL;               // skip post-run settl
 const int      DR_MIN_PTS  = 6;                           // need this many to report
 const char*    DR_FILE     = "/hourly.bin";               // long-term archive
 const char*    DR_OLD      = "/hourly.old";               // one prior generation
-DrainHour*     g_dr   = nullptr;                          // PSRAM ring (rolls at DR_MAX)
+HourAgg*       g_dr   = nullptr;                          // PSRAM ring (rolls at DR_MAX), ~204 KB
 int            g_drN  = 0;
-double         g_drVs = 0, g_drTs = 0;                    // in-progress hour
+double         g_agSum[AG_N];                             // in-progress hour
+float          g_agMin[AG_N], g_agMax[AG_N];
 uint32_t       g_drCnt = 0, g_drHour = 0;
 volatile bool  g_drPending = false;                       // a bucket awaits flash (loop core)
-DrainHour      g_drPend;
+HourAgg        g_drPend;
 
+// File format. The legacy 12 B {ts,v,t} records written by 4.36-4.39 have no
+// header, and a leading epoch never collides with this magic, so the absence of
+// a header is itself the version marker.
+const uint32_t HAG_MAGIC = 0x48414731;                    // "HAG1"
 
-static void drPush(const DrainHour& b) {
+static void agReset() {
+  for (int i = 0; i < AG_N; i++) { g_agSum[i] = 0; g_agMin[i] = 1e30f; g_agMax[i] = -1e30f; }
+  g_drCnt = 0;
+}
+
+static void drPush(const HourAgg& b) {
   if (!g_dr) return;
   if (g_drN < DR_MAX) { g_dr[g_drN++] = b; }
-  else { memmove(g_dr, g_dr + 1, (DR_MAX - 1) * sizeof(DrainHour)); g_dr[DR_MAX - 1] = b; }
+  else { memmove(g_dr, g_dr + 1, (DR_MAX - 1) * sizeof(HourAgg)); g_dr[DR_MAX - 1] = b; }
 }
 
 // Regress V against time and temperature across the settled buckets.
@@ -694,8 +735,8 @@ HourFit computeHourlyDrain() {
   double tmin=1e9, tmax=-1e9;
   for (int i = i0; i < g_drN; i++) {
     double x = (g_dr[i].ts - t0) / 3600.0;     // hours
-    double y = g_dr[i].v;                       // volts
-    double z = g_dr[i].t;                       // degC
+    double y = g_dr[i].mean[AG_VBATT];          // volts
+    double z = g_dr[i].mean[AG_TEMP];           // degC
     sx+=x; sy+=y; sz+=z; sxx+=x*x; sxy+=x*y; sxz+=x*z; szz+=z*z; syz+=y*z;
     if (z<tmin) tmin=z; if (z>tmax) tmax=z;
   }
@@ -716,7 +757,7 @@ HourFit computeHourlyDrain() {
   double a = my - b_time*mx - b_temp*mz;
   double ssr=0, sst=0;
   for (int i = i0; i < g_drN; i++) {
-    double x=(g_dr[i].ts-t0)/3600.0, y=g_dr[i].v, z=g_dr[i].t;
+    double x=(g_dr[i].ts-t0)/3600.0, y=g_dr[i].mean[AG_VBATT], z=g_dr[i].mean[AG_TEMP];
     double e = y - (a + b_time*x + b_temp*z);
     ssr += e*e; sst += (y-my)*(y-my);
   }
@@ -1157,20 +1198,30 @@ void recordSample() {
   // owns all flash I/O, so we just flag a completed bucket for it to persist.
   if (s.ts && s.vbatt > 8.0f && s.vbatt < 16.0f) {
     uint32_t hr = s.ts / 3600;
-    if (g_drHour == 0) g_drHour = hr;
+    if (g_drHour == 0) { g_drHour = hr; agReset(); }
     if (hr != g_drHour) {
       if (g_drCnt) {
-        DrainHour b;
+        HourAgg b;
         b.ts = g_drHour * 3600 + 1800;            // midpoint of the hour it covers
-        b.v  = (float)(g_drVs / g_drCnt);
-        b.t  = (float)(g_drTs / g_drCnt);
+        for (int i = 0; i < AG_N; i++) {
+          b.mean[i] = (float)(g_agSum[i] / g_drCnt);
+          b.mn[i]   = g_agMin[i];
+          b.mx[i]   = g_agMax[i];
+        }
         drPush(b);
         g_drPend = b; g_drPending = true;         // loop appends it to flash
         g_hfit = computeHourlyDrain();            // refresh once per hour, not per poll
       }
-      g_drVs = g_drTs = 0; g_drCnt = 0; g_drHour = hr;
+      agReset(); g_drHour = hr;
     }
-    g_drVs += s.vbatt; g_drTs += s.temp; g_drCnt++;
+    float av[AG_N];
+    agFromSample(av, s);
+    for (int i = 0; i < AG_N; i++) {
+      g_agSum[i] += av[i];
+      if (av[i] < g_agMin[i]) g_agMin[i] = av[i];
+      if (av[i] > g_agMax[i]) g_agMax[i] = av[i];
+    }
+    g_drCnt++;
   }
 
   // Board-health warning: log if free heap crosses below a floor (a leak or
@@ -1384,16 +1435,77 @@ static void logRingPush(const char* line) {
 void flushDrainToFlash() {
   if (!g_drPending) return;
   g_drPending = false;
+  bool fresh = !LittleFS.exists(DR_FILE);
   File f = LittleFS.open(DR_FILE, FILE_APPEND);
   if (!f) return;
-  f.write((uint8_t*)&g_drPend, sizeof(DrainHour));
+  if (fresh) { uint32_t m = HAG_MAGIC, r = (uint32_t)sizeof(HourAgg);
+               f.write((uint8_t*)&m, 4); f.write((uint8_t*)&r, 4); }
+  f.write((uint8_t*)&g_drPend, sizeof(HourAgg));
   size_t sz = f.size();
   f.close();
-  g_fsBytes += sizeof(DrainHour); g_fsCommits++;
-  if (sz >= DR_MAX * sizeof(DrainHour)) {        // ~62 days per generation
+  g_fsBytes += sizeof(HourAgg) + (fresh ? 8 : 0); g_fsCommits++;
+  if (sz >= 8 + DR_MAX * sizeof(HourAgg)) {      // ~62 days per generation
     LittleFS.remove(DR_OLD);
     LittleFS.rename(DR_FILE, DR_OLD);
   }
+}
+
+// Write the whole ring to `path` in the current format. Used by the legacy
+// migration -- and, per the 4.39 lesson, the source is only removed AFTER this
+// has succeeded.
+static int seedHourlyFile(const char* path) {
+  if (!g_dr || g_drN <= 0) return 0;
+  LittleFS.remove(path);
+  File f = LittleFS.open(path, FILE_WRITE);
+  if (!f) return 0;
+  uint32_t m = HAG_MAGIC, r = (uint32_t)sizeof(HourAgg);
+  f.write((uint8_t*)&m, 4); f.write((uint8_t*)&r, 4);
+  for (int i = 0; i < g_drN; i++) f.write((uint8_t*)&g_dr[i], sizeof(HourAgg));
+  f.close();
+  g_fsBytes += 8 + sizeof(HourAgg) * g_drN; g_fsCommits++;
+  return g_drN;
+}
+
+// Read one archive generation into the ring. Returns the number of LEGACY
+// (pre-4.40, 12 B {ts,v,t}) records it had to convert, so the caller knows the
+// file needs rewriting. A leading epoch can never equal HAG_MAGIC, so a missing
+// header is an unambiguous "this is the old format".
+struct LegacyHour { uint32_t ts; float v; float t; };     // 4.36-4.39 on-disk record
+
+static int readHourlyFile(const char* path) {
+  if (!g_dr || !LittleFS.exists(path)) return 0;
+  File f = LittleFS.open(path, FILE_READ);
+  if (!f) return 0;
+
+  uint32_t magic = 0, rec = 0;
+  f.read((uint8_t*)&magic, 4); f.read((uint8_t*)&rec, 4);
+  int conv = 0;
+
+  if (magic == HAG_MAGIC && rec == sizeof(HourAgg)) {
+    size_t n = (f.size() - 8) / sizeof(HourAgg);
+    size_t skip = (n > (size_t)DR_MAX) ? (n - DR_MAX) : 0;      // keep the newest
+    f.seek(8 + skip * sizeof(HourAgg));
+    HourAgg b;
+    while (f.read((uint8_t*)&b, sizeof(HourAgg)) == sizeof(HourAgg))
+      if (b.ts > 1700000000UL) drPush(b);
+  } else if (magic != HAG_MAGIC) {
+    size_t n = f.size() / sizeof(LegacyHour);
+    size_t skip = (n > (size_t)DR_MAX) ? (n - DR_MAX) : 0;
+    f.seek(skip * sizeof(LegacyHour));
+    LegacyHour L;
+    while (f.read((uint8_t*)&L, sizeof(LegacyHour)) == sizeof(LegacyHour)) {
+      if (L.ts <= 1700000000UL || L.v < 8.0f || L.v > 16.0f) continue;
+      HourAgg b; b.ts = L.ts;
+      // Only voltage and temperature were ever recorded. Everything else is
+      // marked absent rather than zero -- a zero RSSI would be a lie on a graph.
+      for (int i = 0; i < AG_N; i++) b.mean[i] = b.mn[i] = b.mx[i] = NAN;
+      b.mean[AG_VBATT] = b.mn[AG_VBATT] = b.mx[AG_VBATT] = L.v;
+      b.mean[AG_TEMP]  = b.mn[AG_TEMP]  = b.mx[AG_TEMP]  = L.t;
+      drPush(b); conv++;
+    }
+  }
+  f.close();
+  return conv;
 }
 
 // Restore buckets at boot. This is the point of the whole design: a reboot --
@@ -1414,18 +1526,22 @@ void loadDrainFromFlash() {
   }
 
   g_drN = 0;
+  int legacy = 0;
   const char* files[2] = { DR_OLD, DR_FILE };    // oldest generation first
-  for (int i = 0; i < 2; i++) {
-    File f = LittleFS.open(files[i], FILE_READ);
-    if (!f) continue;
-    size_t n = f.size() / sizeof(DrainHour);
-    size_t skip = (n > (size_t)DR_MAX) ? (n - DR_MAX) : 0;   // keep the newest
-    f.seek(skip * sizeof(DrainHour));
-    DrainHour b;
-    while (f.read((uint8_t*)&b, sizeof(DrainHour)) == sizeof(DrainHour)) {
-      if (b.ts > 1700000000UL && b.v > 8.0f && b.v < 16.0f) drPush(b);
+  for (int i = 0; i < 2; i++) legacy += readHourlyFile(files[i]);
+
+  // A legacy file was read: rewrite both generations in the current format so
+  // this conversion happens exactly once. Seed first, remove only on success --
+  // the 4.39 lesson. /hourly.old is dropped rather than converted; its contents
+  // are already in the ring and one generation of history is enough to keep.
+  if (legacy > 0 && g_drN > 0) {
+    if (seedHourlyFile("/hourly.new") > 0) {
+      LittleFS.remove(DR_FILE); LittleFS.remove(DR_OLD);
+      LittleFS.rename("/hourly.new", DR_FILE);
+      logLine("hourly archive: converted %d legacy hours to the wide format", legacy);
+    } else {
+      logLine("hourly archive: WIDE CONVERSION FAILED, keeping the legacy file");
     }
-    f.close();
   }
   if (g_drN) logLine("hourly archive restored: %d hours from flash", g_drN);
 }
@@ -1435,7 +1551,7 @@ void loadDrainFromFlash() {
 // harmless to the estimate and are the only long-term record this board keeps.
 // Only the part-built hour is dropped -- it straddles the run and is meaningless.
 void resetDrainBuckets(const char* why) {
-  g_drVs = g_drTs = 0; g_drCnt = 0; g_drHour = 0;
+  agReset(); g_drHour = 0;
   g_drPending = false;
   g_hfit = {false, 0, 0, 0, 0, 0};
   logLine("hourly bucket in progress discarded (%s); %d archived hours kept", why, g_drN);
@@ -1895,6 +2011,13 @@ nav.tabs a.on{color:var(--fg);border-bottom-color:#1f6feb;font-weight:600}
 .clbl:first-child{margin-top:6px}
 canvas{width:100%;height:104px;background:var(--card);border:1px solid #262d38;border-radius:12px;display:block;cursor:crosshair}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:16px;margin:20px 0 24px}
+.rngbar{display:flex;gap:6px;align-items:center;margin:18px 0 4px}
+.rngbar b{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#8b949e;margin-right:4px}
+.rngbar button{background:#161b22;border:1px solid #30363d;color:#8b949e;border-radius:6px;
+  padding:4px 12px;font-size:12px;cursor:pointer;font-family:inherit}
+.rngbar button:hover{border-color:#58a6ff;color:#c9d1d9}
+.rngbar button.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.rngbar span.note{font-size:11px;color:#6e7681;margin-left:auto}
 .card{background:var(--card);border:1px solid #262d38;border-radius:14px;padding:16px 16px 15px;
   box-shadow:0 1px 2px rgba(0,0,0,.3);transition:border-color .15s,transform .15s,box-shadow .15s}
 .card:hover{border-color:#3a4658;transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.4)}
@@ -1995,8 +2118,8 @@ function fmtEta(s){if(s===undefined||s===null||s<0)return null;if(s<3600)return 
 // ---- graph engine (mirrors the original single-page one; min/max lines on all) ----
 var PAD=8, CHARTS={}, TS=[], hoverIdx=-1;
 var IDS=(window.PAGE&&window.PAGE.charts||[]).map(function(c){return c.id});
-function fmtWhen(i){var t=TS[i];if(t&&t>1700000000){return new Date(t*1000).toLocaleString();}
-  var m=(TS.length-1-i);return m>=60?(Math.floor(m/60)+"h "+(m%60)+"m ago"):(m+"m ago");}
+function fmtWhen(i){var t=AGT0+i*AGSTEP;if(t>1700000000){return new Date(t*1000).toLocaleString();}
+  var m=Math.round((AGN-1-i)*AGSTEP/60);return m>=60?(Math.floor(m/60)+"h "+(m%60)+"m ago"):(m+"m ago");}
 function drawChart(id){
   var ch=CHARTS[id];if(!ch)return;var c=$(id);if(!c)return;
   var x=c.getContext("2d"),W=c.width,Ht=c.height;x.clearRect(0,0,W,Ht);
@@ -2008,8 +2131,12 @@ function drawChart(id){
       x.fillStyle="#8b949e";x.fillText(m[0]+" "+m[1].toFixed(ch.dec)+" "+ch.unit,W-118,yy+m[2])});
     x.setLineDash([])}
   x.strokeStyle=ch.color;x.lineWidth=1.5;x.beginPath();
-  data.forEach(function(v,i){i?x.lineTo(gx(i),gy(v)):x.moveTo(gx(i),gy(v))});x.stroke();
-  if(hoverIdx>=0&&hoverIdx<N){var hx=gx(hoverIdx),hy=gy(data[hoverIdx]);
+  // Buckets with no data are null, not zero -- lift the pen rather than draw a
+  // line through a gap, which would invent a reading that was never taken.
+  var pen=false;
+  data.forEach(function(v,i){if(v===null||v===undefined){pen=false;return;}
+    if(pen){x.lineTo(gx(i),gy(v))}else{x.moveTo(gx(i),gy(v));pen=true}});x.stroke();
+  if(hoverIdx>=0&&hoverIdx<N&&data[hoverIdx]!==null&&data[hoverIdx]!==undefined){var hx=gx(hoverIdx),hy=gy(data[hoverIdx]);
     x.strokeStyle="#6e7681";x.lineWidth=1;x.beginPath();x.moveTo(hx,PAD);x.lineTo(hx,Ht-PAD);x.stroke();
     x.fillStyle=ch.color;x.beginPath();x.arc(hx,hy,3.5,0,6.2832);x.fill();}
 }
@@ -2019,30 +2146,97 @@ function idxFromEvent(ev,id){var ch=CHARTS[id];if(!ch||ch.data.length<2)return -
   var xint=(ev.clientX-r.left)/r.width*W;var i=Math.round((xint-PAD)/((W-2*PAD)/(N-1)));
   return Math.max(0,Math.min(N-1,i));}
 function showTip(ev,id){var ch=CHARTS[id];if(!ch||hoverIdx<0)return;
-  H("tip","<b>"+ch.data[hoverIdx].toFixed(ch.dec)+" "+ch.unit+"</b><br>"+fmtWhen(hoverIdx));
+  var hv=ch.data[hoverIdx];if(hv===null||hv===undefined){var tp0=$("tip");if(tp0)tp0.style.display="none";return}
+  H("tip","<b>"+hv.toFixed(ch.dec)+" "+ch.unit+"</b><br>"+fmtWhen(hoverIdx)
+    +(AGSTEP>300?("<br><span class='tk'>mean of "+(AGSTEP/3600)+" h</span>"):""));
   var tp=$("tip");if(!tp)return;tp.className="";tp.style.display="block";   // not a rich card tip
   var tx=ev.clientX+12;if(tx+170>window.innerWidth)tx=ev.clientX-160;
   tp.style.left=tx+"px";tp.style.top=(ev.clientY+12)+"px";}
 function setupHover(){IDS.forEach(function(id){var c=$(id);if(!c)return;
   c.addEventListener("mousemove",function(ev){hoverIdx=idxFromEvent(ev,id);drawAll();showTip(ev,id)});
   c.addEventListener("mouseleave",function(){hoverIdx=-1;drawAll();var tp=$("tip");if(tp)tp.style.display="none"});})}
+// ---- ranged history via /agg ---------------------------------------------
+// Everything comes pre-aggregated from the board: a month of raw samples would
+// be ~1.8 MB, and even the old 24 h /history fetch was ~36 KB every 30 s. All
+// three spans now cost a few KB. See handleAgg() for the format.
+var SPANS={day:{lbl:"24 h",ms:30000},week:{lbl:"7 d",ms:300000},month:{lbl:"30 d",ms:1800000}};
+var SPAN=(function(){try{return localStorage.getItem("vroomSpan")||"day"}catch(e){return "day"}})();
+if(!SPANS[SPAN])SPAN="day";
+var AGT0=0,AGSTEP=300,AGN=288,agTimer=null;
+
 function loadHistory(){
   if(!window.PAGE||!window.PAGE.charts||!window.PAGE.charts.length)return;
-  fetch("/history?cols="+window.PAGE.cols.join(","),{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
+  fetch("/agg?span="+SPAN+"&cols="+window.PAGE.cols.join(","),{cache:"no-store"})
+  .then(function(r){return r.text()}).then(function(t){
     var ln=t.trim().split("\n");if(ln.length<2)return;
-    var hdr=ln[0].split(","),idx={};hdr.forEach(function(h,i){idx[h]=i});
-    var rows=[];for(var i=1;i<ln.length;i++){rows.push(ln[i].split(",").map(Number))}
-    if(!rows.length)return;TS=rows.map(function(r){return r[idx.ts]});
-    window.PAGE.charts.forEach(function(cfg){var ci=idx[cfg.col];if(ci===undefined)return;
-      var data=rows.map(function(r){return r[ci]});
-      var mn=Math.min.apply(null,data),mx=Math.max.apply(null,data);
+    var m=/t0=(\d+),step=(\d+),n=(\d+)/.exec(ln[0]);if(!m)return;
+    AGT0=+m[1];AGSTEP=+m[2];AGN=+m[3];
+    // Window min/max come from the board's per-hour extremes -- the true values,
+    // not the extremes of the means we are about to plot.
+    // Line 2 lists one entry per column IN THE ORDER THE ROWS USE. Take the
+    // column order from it rather than from PAGE.cols -- the board emits in its
+    // own fixed series order, which only coincidentally matches today.
+    var ext={},cols=[];
+    (ln[1]||"").replace(/^#/,"").split(",").forEach(function(p){
+      var q=p.split("=");if(q.length<2)return;
+      cols.push(q[0]);
+      var r=q[1].split("/");
+      if(r[0]!==""&&r[1]!=="")ext[q[0]]=[+r[0],+r[1]];});
+    if(!cols.length)return;
+    var series={};cols.forEach(function(c){series[c]=new Array(AGN).fill(null)});
+    for(var i=2;i<ln.length;i++){var f=ln[i].split(",");var bi=+f[0];
+      if(!(bi>=0&&bi<AGN))continue;
+      cols.forEach(function(c,ci){var v=f[ci+1];if(v!==undefined&&v!=="")series[c][bi]=+v;});}
+    window.PAGE.charts.forEach(function(cfg){
+      var data=series[cfg.col];if(!data)return;
+      var e=ext[cfg.col],mn,mx;
+      if(e){mn=e[0];mx=e[1]}
+      else{var vals=data.filter(function(v){return v!==null});
+           if(!vals.length){CHARTS[cfg.id]=null;return}
+           mn=Math.min.apply(null,vals);mx=Math.max.apply(null,vals)}
+      // Scale to cover the dashed lines too, or they land off-canvas.
       var lo=mn,hi=mx;if(hi-lo<1e-6){hi+=1;lo-=1}
       if(cfg.anchor0){lo=0;hi=Math.max(cfg.floor||10,hi)}
       if(cfg.keep0){lo=Math.min(0,lo);hi=Math.max(0,hi);if(hi-lo<1e-6){hi+=1;lo-=1}}
       var pad=Math.max((hi-lo)*0.15,0.02);lo-=pad;hi+=pad;
-      CHARTS[cfg.id]={data:data,lo:lo,hi:hi,color:cfg.color,dec:cfg.dec,unit:cfg.unit,mn:mn,mx:mx,minmax:true};});
+      CHARTS[cfg.id]={data:data,lo:lo,hi:hi,color:cfg.color,dec:cfg.dec,unit:cfg.unit,
+                      mn:mn,mx:mx,minmax:true};});
     drawAll();
+    var nb=0;for(var k=0;k<AGN;k++){var any=false;
+      for(var c2 in series){if(series[c2][k]!==null){any=true;break}}if(any)nb++}
+    var nt=$("rgnote");if(nt)nt.textContent=nb+" of "+AGN+" buckets"+(nb<AGN?" - rest not recorded yet":"");
   }).catch(function(e){});
+}
+
+function setSpan(sp){
+  if(!SPANS[sp])return;
+  SPAN=sp;try{localStorage.setItem("vroomSpan",sp)}catch(e){}
+  Array.prototype.forEach.call(document.querySelectorAll(".rngbar button"),function(b){
+    b.className=(b.getAttribute("data-s")===sp)?"on":"";});
+  Array.prototype.forEach.call(document.querySelectorAll(".rspan"),function(e){
+    e.textContent=SPANS[sp].lbl;});
+  CHARTS={};hoverIdx=-1;drawAll();
+  loadHistory();
+  if(agTimer)clearInterval(agTimer);
+  agTimer=setInterval(loadHistory,SPANS[sp].ms);   // week/month barely move; don't poll them like the live view
+}
+
+function buildRangeBar(){
+  if(!window.PAGE||!window.PAGE.charts||!window.PAGE.charts.length)return;
+  var first=document.querySelector("canvas");if(!first)return;
+  var host=first.parentNode,anchor=first.previousElementSibling||first;
+  var bar=document.createElement("div");bar.className="rngbar";
+  var html="<b>Range</b>";
+  ["day","week","month"].forEach(function(k){
+    html+='<button data-s="'+k+'">'+SPANS[k].lbl+"</button>";});
+  html+='<span class="note" id="rgnote"></span>';
+  bar.innerHTML=html;
+  host.insertBefore(bar,anchor);
+  bar.addEventListener("click",function(ev){
+    var b=ev.target.closest("button");if(b)setSpan(b.getAttribute("data-s"));});
+  TIP("rgnote","<b>Coverage</b><br>How many buckets in this window actually hold data. "
+    +"Long ranges fill in over time - the hourly archive only started recording every series in fw 4.40, "
+    +"so week and month views will be sparse until enough hours accumulate.");
 }
 
 // ---- live values (every assignment guarded; a page only has some of these) ----
@@ -2406,14 +2600,14 @@ function attachHandlers(){
     if(a.getAttribute("data-p")===p)a.classList.add("on");});
   attachHandlers();setupHover();
   poll();setInterval(poll,2000);
-  if(window.PAGE&&window.PAGE.charts&&window.PAGE.charts.length){loadHistory();setInterval(loadHistory,30000);}
+  if(window.PAGE&&window.PAGE.charts&&window.PAGE.charts.length){buildRangeBar();setSpan(SPAN);}
   if($("startbox")){loadStarts();setInterval(loadStarts,15000);}
 })();
 )JS";
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2522,13 +2716,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=436"></script>
+<script src="/app.js?v=441"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2606,10 +2800,10 @@ here is stored in NVS and survives reboots.
 </div>
 </div>
 
-<div class="clbl">WiFi RSSI dBm (24 h)</div><canvas id="g_rssi" width="800" height="104"></canvas>
-<div class="clbl">WiFi link rate Mbps (24 h) &mdash; from negotiated PHY</div><canvas id="g_link" width="800" height="104"></canvas>
-<div class="clbl">Network in B/min (24 h)</div><canvas id="g_nin" width="800" height="104"></canvas>
-<div class="clbl">Network out B/min (24 h)</div><canvas id="g_nout" width="800" height="104"></canvas>
+<div class="clbl">WiFi RSSI dBm (<span class="rspan">24 h</span>)</div><canvas id="g_rssi" width="800" height="104"></canvas>
+<div class="clbl">WiFi link rate Mbps (<span class="rspan">24 h</span>) &mdash; from negotiated PHY</div><canvas id="g_link" width="800" height="104"></canvas>
+<div class="clbl">Network in B/min (<span class="rspan">24 h</span>)</div><canvas id="g_nin" width="800" height="104"></canvas>
+<div class="clbl">Network out B/min (<span class="rspan">24 h</span>)</div><canvas id="g_nout" width="800" height="104"></canvas>
 </div>
 <footer>fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
 <script>window.PAGE={cols:["rssi","link","net_in","net_out"],charts:[
@@ -2617,13 +2811,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=436"></script>
+<script src="/app.js?v=441"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2675,9 +2869,9 @@ dissipates, and measures the slope from there to now. Both ends live in flash, s
 and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline before it will report.
 </div>
 </div>
-<div class="clbl">Voltage (24 h)</div><canvas id="g_v" width="800" height="104"></canvas>
-<div class="clbl">Temperature &deg;C (24 h)</div><canvas id="g_t" width="800" height="104"></canvas>
-<div class="clbl">Battery drain rate mV/h (24 h) &mdash; below 0 = discharging</div><canvas id="g_d" width="800" height="104"></canvas>
+<div class="clbl">Voltage (<span class="rspan">24 h</span>)</div><canvas id="g_v" width="800" height="104"></canvas>
+<div class="clbl">Temperature &deg;C (<span class="rspan">24 h</span>)</div><canvas id="g_t" width="800" height="104"></canvas>
+<div class="clbl">Battery drain rate mV/h (<span class="rspan">24 h</span>) &mdash; below 0 = discharging</div><canvas id="g_d" width="800" height="104"></canvas>
 <div class="grid">
 <div class="card"><div class="k">ADC node</div><div class="v"><span id="adc">--</span> mV</div></div>
 <div class="card"><div class="k">Voltage status</div><div class="v" id="vstat2">--</div></div>
@@ -2688,13 +2882,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=436"></script>
+<script src="/app.js?v=441"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2719,20 +2913,20 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <div class="card"><div class="k">Chip temp</div><div class="v"><span id="temp">--</span> &deg;C</div></div>
 <div class="card"><div class="k">Clock (NTP)</div><div class="v" id="ntp">--</div></div>
 </div>
-<div class="clbl">CPU core 0 load % (24 h)</div><canvas id="g_c0" width="800" height="104"></canvas>
-<div class="clbl">CPU core 1 load % (24 h)</div><canvas id="g_c1" width="800" height="104"></canvas>
+<div class="clbl">CPU core 0 load % (<span class="rspan">24 h</span>)</div><canvas id="g_c0" width="800" height="104"></canvas>
+<div class="clbl">CPU core 1 load % (<span class="rspan">24 h</span>)</div><canvas id="g_c1" width="800" height="104"></canvas>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=436"></script>
+<script src="/app.js?v=441"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2751,14 +2945,14 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <div class="card"><div class="k">Free PSRAM</div><div class="v"><span id="psram">--</span></div></div>
 <div class="card"><div class="k">Disk used</div><div class="v"><span id="disk">--</span></div></div>
 </div>
-<div class="clbl">Free memory KB (24 h)</div><canvas id="g_heap" width="800" height="104"></canvas>
-<div class="clbl">Disk used KB (24 h)</div><canvas id="g_disk" width="800" height="104"></canvas>
+<div class="clbl">Free memory KB (<span class="rspan">24 h</span>)</div><canvas id="g_heap" width="800" height="104"></canvas>
+<div class="clbl">Disk used KB (<span class="rspan">24 h</span>)</div><canvas id="g_disk" width="800" height="104"></canvas>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=436"></script>
+<script src="/app.js?v=441"></script>
 </body></html>
 )HTML";
 
@@ -2894,6 +3088,140 @@ void handleHistory() {
     }
     if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   }
+  server.sendContent("");
+}
+
+// GET /agg?span=day|week|month[&cols=a,b,c]
+// Pre-aggregated series for the long-range chart views.
+//
+// The point is that the ESP32 does the reduction. A month of raw samples is
+// ~44,600 rows and about 1.8 MB; this link cannot afford that, and /history at
+// 24 h is already the biggest transfer on the device. So the window is divided
+// into a fixed number of buckets and only the MEAN of each is sent:
+//
+//   day    24 h  288 buckets x  5 min   from the raw sample ring
+//   week    7 d  168 buckets x  1 h     from the hourly archive
+//   month  30 d  180 buckets x  4 h     from the hourly archive
+//
+// Every span costs roughly the same few KB regardless of how much time it
+// covers, and all three are far smaller than the 24 h /history fetch they
+// replace.
+//
+// The window min/max ride in the header rather than per row, because the dashed
+// lines the dashboard draws are window-wide. Computing them here is also strictly
+// MORE accurate than the client could manage: these come from the per-hour min
+// and max, so they are the real extremes. The maximum of a set of daily averages
+// is not the maximum the battery actually reached.
+//
+// Buckets with no data are omitted entirely rather than padded, so a gap in the
+// record costs nothing to transmit. The row index carries the x position.
+// String(float, decimals) formats via dtostrf with width (decimals + 2), which
+// LEFT-PADS short values with spaces -- " 0" instead of "0". Harmless to parse,
+// but across ~288 rows x several series it is close to a fifth of the payload on
+// integer-valued series, which defeats the point of aggregating at all.
+static void appendNum(String& out, float v, uint8_t dec) {
+  char b[16];
+  snprintf(b, sizeof(b), "%.*f", (int)dec, (double)v);
+  out += b;
+}
+
+void handleAgg() {
+  trackReq();
+  boundSendStall();
+
+  String sp = server.arg("span");
+  uint32_t step; int n;
+  if      (sp == "week")  { step = 3600;         n = 168; }
+  else if (sp == "month") { step = 4UL * 3600UL; n = 180; }
+  else                    { step = 300;          n = 288; }   // day
+
+  bool sel[AG_N]; int nsel = 0;
+  String want = server.arg("cols");
+  for (int i = 0; i < AG_N; i++) {
+    sel[i] = want.length() ? (want.indexOf(AG_NAME[i]) >= 0) : true;
+    if (sel[i]) nsel++;
+  }
+
+  uint32_t now = timeIsValid() ? (uint32_t)time(nullptr) : 0;
+  if (!now || !nsel) { server.send(200, "text/csv", "#t0=0,step=0,n=0\n"); return; }
+  uint32_t t0 = now - (uint32_t)n * step;
+
+  // 288 x 11 floats + counts, ~19 KB. Static rather than heap: this runs in the
+  // HTTP path and a failed allocation there is a worse outcome than the DRAM.
+  static float    sum[288 * AG_N];
+  static uint16_t cnt[288 * AG_N];
+  static float    wmn[AG_N], wmx[AG_N];
+  memset(sum, 0, sizeof(float)    * n * AG_N);
+  memset(cnt, 0, sizeof(uint16_t) * n * AG_N);
+  for (int i = 0; i < AG_N; i++) { wmn[i] = 1e30f; wmx[i] = -1e30f; }
+
+  if (step == 300) {                                  // day: raw ring
+    if (hist) {
+      int oldest = (histCount < HIST_N) ? 0 : histHead;
+      for (int k = 0; k < histCount; k++) {
+        Sample& sm = hist[(oldest + k) % HIST_N];
+        if (!sm.ts || sm.ts < t0) continue;
+        int b = (int)((sm.ts - t0) / step);
+        if (b < 0 || b >= n) continue;
+        float av[AG_N]; agFromSample(av, sm);
+        for (int i = 0; i < AG_N; i++) {
+          if (!sel[i]) continue;
+          sum[b * AG_N + i] += av[i]; cnt[b * AG_N + i]++;
+          if (av[i] < wmn[i]) wmn[i] = av[i];
+          if (av[i] > wmx[i]) wmx[i] = av[i];
+        }
+      }
+    }
+  } else if (g_dr) {                                  // week/month: hourly archive
+    for (int k = 0; k < g_drN; k++) {
+      HourAgg& h = g_dr[k];
+      if (h.ts < t0) continue;
+      int b = (int)((h.ts - t0) / step);
+      if (b < 0 || b >= n) continue;
+      for (int i = 0; i < AG_N; i++) {
+        if (!sel[i] || !isfinite(h.mean[i])) continue;   // legacy rows lack most series
+        sum[b * AG_N + i] += h.mean[i]; cnt[b * AG_N + i]++;
+        if (h.mn[i] < wmn[i]) wmn[i] = h.mn[i];          // TRUE extremes, not extremes of means
+        if (h.mx[i] > wmx[i]) wmx[i] = h.mx[i];
+      }
+    }
+  }
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  String hdr = "#t0=" + String(t0 + step / 2) + ",step=" + String(step) + ",n=" + String(n) + "\n#";
+  bool first = true;
+  for (int i = 0; i < AG_N; i++) {
+    if (!sel[i]) continue;
+    if (!first) hdr += ',';
+    first = false;
+    hdr += AG_NAME[i]; hdr += '=';
+    if (wmn[i] < 1e29f) { appendNum(hdr, wmn[i], AG_DEC[i]); hdr += '/';
+                          appendNum(hdr, wmx[i], AG_DEC[i]); }
+    else hdr += '/';                                   // no data for this series yet
+  }
+  hdr += '\n';
+  g_out_total += hdr.length(); server.sendContent(hdr);
+
+  String chunk; chunk.reserve(2048);
+  for (int b = 0; b < n; b++) {
+    bool any = false;
+    for (int i = 0; i < AG_N; i++) if (sel[i] && cnt[b * AG_N + i]) { any = true; break; }
+    if (!any) continue;                                // empty bucket: omitted, not padded
+    chunk += b;
+    for (int i = 0; i < AG_N; i++) {
+      if (!sel[i]) continue;
+      chunk += ',';
+      uint16_t c = cnt[b * AG_N + i];
+      if (c) appendNum(chunk, sum[b * AG_N + i] / c, AG_DEC[i]);
+    }
+    chunk += '\n';
+    if (chunk.length() > 1500) {
+      if (!waitWritable(4000)) break;                  // stalled client -> abort rather than block
+      g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset();
+    }
+  }
+  if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
   server.sendContent("");
 }
 
@@ -3348,7 +3676,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=436">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=441">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -3531,7 +3859,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -3827,7 +4155,7 @@ void setup() {
   loadLogFromFlash();                              // replay pre-reboot log tail into the ring
   Serial.printf("Restored %d prior log lines from flash.\n", g_logCount);
   loadHistory();
-  g_dr = (DrainHour*)ps_malloc(DR_MAX * sizeof(DrainHour));   // ~18 KB in PSRAM
+  g_dr = (HourAgg*)ps_malloc(DR_MAX * sizeof(HourAgg));       // ~204 KB in PSRAM
   if (g_dr) { loadDrainFromFlash(); g_hfit = computeHourlyDrain(); }
   else      { Serial.println("drain buckets: PSRAM alloc FAILED -- falling back to the 2-point anchor"); }
   Serial.printf("Loaded %d prior samples from flash.\n", histCount);
@@ -3882,6 +4210,7 @@ void setup() {
   server.on("/app.js", HTTP_GET, handleAppJs);         // shared cached engine
   server.on("/json", handleJson);
   server.on("/history", handleHistory);
+  server.on("/agg",     handleAgg);
   server.on("/update", HTTP_GET, []() { trackReq(); server.send_P(200, "text/html; charset=utf-8", UPDATE_HTML); });
   server.on("/update", HTTP_POST,
     []() {                                    // runs after the upload finishes

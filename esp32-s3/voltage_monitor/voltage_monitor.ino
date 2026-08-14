@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.36";
+const char* FW_VERSION = "4.37";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -608,6 +608,29 @@ const uint32_t    WDT_TIMEOUT_MS = 300000;  // 5 min; see the note above
 RTC_NOINIT_ATTR static char     g_loopMark[28];
 RTC_NOINIT_ATTR static char     g_safetyMark[28];
 RTC_NOINIT_ATTR static uint32_t g_markMagic;
+
+// ---- Tier 1 of sample storage: RTC slow RAM -------------------------------
+// Newly-taken samples land here and NOTHING is written to flash until the batch
+// is full. RTC_NOINIT survives a watchdog reset, a software reset and an OTA
+// reboot -- every reset this board has actually taken -- so batching costs no
+// data. Only pulling the battery loses the tail, and that also stops the car.
+//
+// This replaces a 46 KB rewrite of the whole ring every 10 minutes. That was
+// ~6.6 MB/day, and it also meant any reboot threw away up to ten minutes of
+// history. Now a reboot costs nothing and a day costs 46 KB.
+const int SB_N = 30;                                   // 30 min of samples, 960 B of RTC RAM
+const uint32_t SB_MAGIC = 0x53424631;                  // "SBF1"
+RTC_NOINIT_ATTR static Sample   g_sb[SB_N];
+RTC_NOINIT_ATTR static uint16_t g_sbN;
+RTC_NOINIT_ATTR static uint32_t g_sbMagic;
+volatile bool g_sbFlush = false;                        // safety task asks, loop writes
+// The safety task appends to g_sb while the loop is writing it out, so the count
+// needs its own lock -- same arrangement as g_logMux for the event log.
+static portMUX_TYPE g_sbMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Written-bytes counters, so wear is observable rather than assumed. Reset on
+// boot; exposed in /json as fs_wr_b / fs_wr_n.
+uint32_t g_fsBytes = 0, g_fsCommits = 0;
 static const uint32_t MARK_MAGIC = 0x574D4B31;   // "WMK1"
 static inline void loopMark(const char* s)   { strncpy(g_loopMark,   s, sizeof(g_loopMark) - 1);   g_loopMark[sizeof(g_loopMark) - 1] = 0; }
 static inline void safetyMark(const char* s) { strncpy(g_safetyMark, s, sizeof(g_safetyMark) - 1); g_safetyMark[sizeof(g_safetyMark) - 1] = 0; }
@@ -640,7 +663,8 @@ uint8_t   g_asFails     = 0;               // consecutive unverified starts  NVS
 const int      DR_MAX      = 1500;                        // ~62 days
 const uint32_t DR_SETTLE_S = 12UL * 3600UL;               // skip post-run settling
 const int      DR_MIN_PTS  = 6;                           // need this many to report
-const char*    DR_FILE     = "/drain.bin";
+const char*    DR_FILE     = "/hourly.bin";               // long-term archive
+const char*    DR_OLD      = "/hourly.old";               // one prior generation
 DrainHour*     g_dr   = nullptr;                          // PSRAM ring (rolls at DR_MAX)
 int            g_drN  = 0;
 double         g_drVs = 0, g_drTs = 0;                    // in-progress hour
@@ -1116,6 +1140,17 @@ void recordSample() {
   hist[histHead] = s;
   histHead = (histHead + 1) % HIST_N;
   if (histCount < HIST_N) histCount++;
+
+  // Tier 1: park it in RTC RAM. No flash traffic here -- this is the safety task
+  // on core 0, which must never touch the filesystem. When the batch fills, ask
+  // the loop to write it.
+  portENTER_CRITICAL(&g_sbMux);
+  if (g_sbMagic != SB_MAGIC) { g_sbMagic = SB_MAGIC; g_sbN = 0; }
+  if (g_sbN < SB_N) g_sb[g_sbN++] = s;
+  bool full = (g_sbN >= SB_N);
+  portEXIT_CRITICAL(&g_sbMux);
+  if (full) g_sbFlush = true;
+
   g_drain = computeDrain();     // refresh once per sample, not per HTTP poll
 
   // Fold this sample into the current hourly bucket. RAM only -- the loop core
@@ -1146,31 +1181,121 @@ void recordSample() {
   else if (heapWarned && freeHeap > 60000)  { logLine("heap recovered (%lu bytes)", (unsigned long)freeHeap); heapWarned = false; }
 }
 
-void saveHistory() {
-  if (!hist) return;
-  File f = LittleFS.open("/history.bin", FILE_WRITE);
-  if (!f) return;
-  uint32_t magic = 0x564F4C36;                 // "VOL6" (adds per-sample WiFi link rate)
-  f.write((uint8_t*)&magic, 4);
-  f.write((uint8_t*)&histCount, 4);
-  f.write((uint8_t*)&histHead, 4);
-  f.write((uint8_t*)hist, sizeof(Sample) * HIST_N);
-  f.close();
+// ---- Tier 2 of sample storage: append-only journal ------------------------
+// Two generations, rotated, never rewritten in place -- the same shape as the
+// event log above, for the same reason. A full-file rewrite costs its whole
+// length in flash traffic every time; an append costs one record.
+static const char* JRN_FILE = "/hist.jrn";
+static const char* JRN_OLD  = "/hist.old";
+static const uint32_t JRN_MAGIC = 0x564A5232;          // "VJR2" -- bumped if Sample changes
+
+// One generation holds a full ring, so .old + .jrn always cover >= HIST_N.
+static const size_t JRN_CAP = 8 + sizeof(Sample) * HIST_N;
+
+static void jrnHeader(File& f) {
+  uint32_t m = JRN_MAGIC; uint32_t sz = (uint32_t)sizeof(Sample);
+  f.write((uint8_t*)&m, 4); f.write((uint8_t*)&sz, 4);
 }
 
-void loadHistory() {
-  if (!hist || !LittleFS.exists("/history.bin")) return;
-  File f = LittleFS.open("/history.bin", FILE_READ);
+// Drain the RTC batch to flash. LOOP CORE ONLY -- the safety task sets g_sbFlush
+// and never touches the filesystem itself.
+void flushSamplesToFlash() {
+  if (!g_sbFlush) return;
+  g_sbFlush = false;
+  uint16_t n = g_sbN;
+  if (!n) return;
+  if (n > SB_N) n = SB_N;                              // corrupt count: salvage what fits
+
+  bool fresh = !LittleFS.exists(JRN_FILE);
+  File f = LittleFS.open(JRN_FILE, FILE_APPEND);
   if (!f) return;
-  uint32_t magic = 0;
-  f.read((uint8_t*)&magic, 4);
-  if (magic == 0x564F4C36) {           // older formats are discarded (layout changed)
-    f.read((uint8_t*)&histCount, 4);
-    f.read((uint8_t*)&histHead, 4);
-    f.read((uint8_t*)hist, sizeof(Sample) * HIST_N);
-    if (histCount < 0 || histCount > HIST_N) { histCount = 0; histHead = 0; }
+  if (fresh) jrnHeader(f);
+  f.write((uint8_t*)g_sb, sizeof(Sample) * n);
+  size_t sz = f.size();
+  f.close();
+  g_fsBytes += sizeof(Sample) * n + (fresh ? 8 : 0);
+  g_fsCommits++;
+
+  // Consume exactly the n we wrote. A sample taken by the safety task during the
+  // write is still at the tail, so shift it down rather than zeroing the count --
+  // zeroing would drop it from flash while leaving it in the RAM ring, and the
+  // two would disagree after the next reboot.
+  portENTER_CRITICAL(&g_sbMux);
+  if (g_sbN > n) memmove(g_sb, g_sb + n, (g_sbN - n) * sizeof(Sample));
+  g_sbN = (g_sbN > n) ? (uint16_t)(g_sbN - n) : 0;
+  portEXIT_CRITICAL(&g_sbMux);
+
+  if (sz >= JRN_CAP) {                                 // keep exactly one prior generation
+    LittleFS.remove(JRN_OLD);
+    LittleFS.rename(JRN_FILE, JRN_OLD);
+  }
+}
+
+// Replay one journal generation into the ring. Chronological order across the
+// two files is guaranteed by the caller (.old first).
+static int replayJournal(const char* path) {
+  if (!hist || !LittleFS.exists(path)) return 0;
+  File f = LittleFS.open(path, FILE_READ);
+  if (!f) return 0;
+  uint32_t m = 0, sz = 0;
+  f.read((uint8_t*)&m, 4); f.read((uint8_t*)&sz, 4);
+  if (m != JRN_MAGIC || sz != sizeof(Sample)) { f.close(); return 0; }  // format changed
+  int n = 0;
+  Sample s;
+  while (f.read((uint8_t*)&s, sizeof(Sample)) == (int)sizeof(Sample)) {
+    hist[histHead] = s;
+    histHead = (histHead + 1) % HIST_N;
+    if (histCount < HIST_N) histCount++;
+    n++;
   }
   f.close();
+  return n;
+}
+
+// Rebuild the ring at boot, oldest source first: the pre-4.37 snapshot (once),
+// then both journal generations, then whatever is still sitting in RTC RAM.
+void loadHistory() {
+  if (!hist) return;
+
+  // One-time migration off /history.bin so upgrading does not throw away the
+  // last 24 h. The file is removed after reading; from then on it is journal only.
+  if (LittleFS.exists("/history.bin")) {
+    File f = LittleFS.open("/history.bin", FILE_READ);
+    if (f) {
+      uint32_t magic = 0;
+      f.read((uint8_t*)&magic, 4);
+      if (magic == 0x564F4C36) {       // older formats are discarded (layout changed)
+        f.read((uint8_t*)&histCount, 4);
+        f.read((uint8_t*)&histHead, 4);
+        f.read((uint8_t*)hist, sizeof(Sample) * HIST_N);
+        if (histCount < 0 || histCount > HIST_N) { histCount = 0; histHead = 0; }
+      }
+      f.close();
+    }
+    LittleFS.remove("/history.bin");
+    Serial.println("history: migrated /history.bin -> append-only journal");
+  }
+
+  int a = replayJournal(JRN_OLD);
+  int b = replayJournal(JRN_FILE);
+
+  // The RTC batch that had not reached flash when we reset. This is the whole
+  // point of the RTC tier -- a watchdog reboot now loses nothing.
+  int c = 0;
+  if (g_sbMagic == SB_MAGIC && g_sbN > 0 && g_sbN <= SB_N) {
+    for (uint16_t i = 0; i < g_sbN; i++) {
+      hist[histHead] = g_sb[i];
+      histHead = (histHead + 1) % HIST_N;
+      if (histCount < HIST_N) histCount++;
+      c++;
+    }
+    g_sbFlush = true;                  // and get them onto flash on the first loop
+  } else {
+    g_sbMagic = SB_MAGIC; g_sbN = 0;   // cold boot: initialise the buffer
+  }
+  if (a || b || c)
+    Serial.printf("history: replayed %d old + %d journal + %d RTC = %d samples\n",
+                  a, b, c, a + b + c);
 }
 
 // ---------- start-event log (LittleFS, survives reboot/brownout) ----------
@@ -1234,33 +1359,45 @@ void flushDrainToFlash() {
   File f = LittleFS.open(DR_FILE, FILE_APPEND);
   if (!f) return;
   f.write((uint8_t*)&g_drPend, sizeof(DrainHour));
+  size_t sz = f.size();
   f.close();
+  g_fsBytes += sizeof(DrainHour); g_fsCommits++;
+  if (sz >= DR_MAX * sizeof(DrainHour)) {        // ~62 days per generation
+    LittleFS.remove(DR_OLD);
+    LittleFS.rename(DR_FILE, DR_OLD);
+  }
 }
 
 // Restore buckets at boot. This is the point of the whole design: a reboot --
 // watchdog, brownout or OTA -- must not reset the measurement.
 void loadDrainFromFlash() {
   if (!g_dr) return;
-  File f = LittleFS.open(DR_FILE, FILE_READ);
-  if (!f) return;
-  size_t n = f.size() / sizeof(DrainHour);
-  size_t skip = (n > (size_t)DR_MAX) ? (n - DR_MAX) : 0;   // keep the newest
-  f.seek(skip * sizeof(DrainHour));
   g_drN = 0;
-  while (g_drN < DR_MAX && f.read((uint8_t*)&g_dr[g_drN], sizeof(DrainHour)) == sizeof(DrainHour)) {
-    if (g_dr[g_drN].ts > 1700000000UL && g_dr[g_drN].v > 8.0f && g_dr[g_drN].v < 16.0f) g_drN++;
+  const char* files[2] = { DR_OLD, DR_FILE };    // oldest generation first
+  for (int i = 0; i < 2; i++) {
+    File f = LittleFS.open(files[i], FILE_READ);
+    if (!f) continue;
+    size_t n = f.size() / sizeof(DrainHour);
+    size_t skip = (n > (size_t)DR_MAX) ? (n - DR_MAX) : 0;   // keep the newest
+    f.seek(skip * sizeof(DrainHour));
+    DrainHour b;
+    while (f.read((uint8_t*)&b, sizeof(DrainHour)) == sizeof(DrainHour)) {
+      if (b.ts > 1700000000UL && b.v > 8.0f && b.v < 16.0f) drPush(b);
+    }
+    f.close();
   }
-  f.close();
-  if (g_drN) logLine("drain buckets restored: %d hours from flash", g_drN);
+  if (g_drN) logLine("hourly archive restored: %d hours from flash", g_drN);
 }
 
-// A run invalidates the whole park record -- start a fresh one.
+// A run ends the current park, but it does NOT invalidate the archive: the fit
+// already skips everything before g_lastRunTs + DR_SETTLE_S, so old buckets are
+// harmless to the estimate and are the only long-term record this board keeps.
+// Only the part-built hour is dropped -- it straddles the run and is meaningless.
 void resetDrainBuckets(const char* why) {
-  g_drN = 0; g_drVs = g_drTs = 0; g_drCnt = 0; g_drHour = 0;
+  g_drVs = g_drTs = 0; g_drCnt = 0; g_drHour = 0;
   g_drPending = false;
   g_hfit = {false, 0, 0, 0, 0, 0};
-  LittleFS.remove(DR_FILE);
-  logLine("drain buckets cleared (%s)", why);
+  logLine("hourly bucket in progress discarded (%s); %d archived hours kept", why, g_drN);
 }
 
 void flushLogToFlash() {
@@ -1413,6 +1550,7 @@ void evalAutoStart(float v) {
     g_lastRunTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
     if (g_lastRunTs) prefs.putUInt("last_run", g_lastRunTs);
     logLine("ENGINE ON: alternator charging at %.2f V", v);
+    g_sbFlush = true;                             // don't strand the transition in RAM
     // The engine is running but WE did not ask for it -- key, FOB or someone
     // else. Record it in the start history so the log is a complete account of
     // every run, not just board-fired ones. Guarded on g_verifying so a start
@@ -1434,6 +1572,7 @@ void evalAutoStart(float v) {
     uint32_t ran = (millis() - engOnMs) / 1000;
     logLine("ENGINE OFF: charging ended at %.2f V after %lum %lus",
             v, (unsigned long)(ran / 60), (unsigned long)(ran % 60));
+    g_sbFlush = true;                             // ditto -- this edge starts the drain clock
     if (timeIsValid()) {                          // arm the settled reference
       g_ltDue = (uint32_t)time(nullptr) + LT_SETTLE_S;
       prefs.putUInt("lt_due", g_ltDue);
@@ -2637,7 +2776,8 @@ void handleJson() {
     "\"drain_win_s\":%lu,\"drain_days\":%.2f,\"drain_mvpc\":%.1f,"
     "\"lt_ref_ts\":%lu,\"lt_ref_v\":%.2f,\"lt_mvph\":%.2f,\"lt_eta_s\":%ld,"
     "\"hr_ok\":%s,\"hr_n\":%d,\"hr_r2\":%.3f,\"hr_span_h\":%lu,\"hr_mvpc\":%.1f,"
-    "\"hr_buckets\":%d,\"build\":\"%s\"}",
+    "\"hr_buckets\":%d,\"build\":\"%s\","
+    "\"fs_wr_b\":%lu,\"fs_wr_n\":%lu,\"sb_n\":%d}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
@@ -2660,7 +2800,8 @@ void handleJson() {
     (unsigned long)g_drain.win_s, g_drain.days, g_drain.mv_per_c,
     (unsigned long)g_ltRefTs, g_ltRefV, longTermMvph(v), longTermEtaS(v),
     g_hfit.ok ? "true" : "false", g_hfit.n, g_hfit.r2,
-    (unsigned long)(g_hfit.span_s / 3600), g_hfit.mvpc, g_drN, FW_BUILD);
+    (unsigned long)(g_hfit.span_s / 3600), g_hfit.mvpc, g_drN, FW_BUILD,
+    (unsigned long)g_fsBytes, (unsigned long)g_fsCommits, (int)g_sbN);
   g_out_total += strlen(json);
   server.send(200, "application/json", json);
 }
@@ -3948,7 +4089,12 @@ void loop() {
   // Sampling + the low-voltage auto-start decision now run in safetyTaskFn on
   // core 0, so a WiFi/HTTP stall in this loop can no longer starve them. The loop
   // keeps history persistence, the LED, CPU-load sampling, and the heartbeat.
-  if (now - lastSave  >= SAVE_MS) { lastSave = now; saveHistory(); }
+  // History is no longer snapshotted on a timer -- flushSamplesToFlash() writes
+  // a batch only when one is ready, which is ~48 times a day instead of 144
+  // rewrites of the entire ring. SAVE_MS is now only a backstop so a partly-full
+  // batch still reaches flash if sampling stops for some reason.
+  flushSamplesToFlash();
+  if (now - lastSave >= SAVE_MS) { lastSave = now; if (g_sbN) g_sbFlush = true; }
   if (now - lastPrint >= 2000) {
     lastPrint = now;
     float v = g_lastV;         // sampled by the safety task (ADC owner)

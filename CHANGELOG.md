@@ -82,6 +82,88 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — fw 4.37: tiered sample storage (RTC RAM → journal → hourly archive)
+
+### Changed — the history ring is no longer rewritten whole, every 10 minutes
+`saveHistory()` wrote the **entire** 1440-sample ring — 46,092 bytes — to
+`/history.bin` every `SAVE_MS` (600 s). Measured cost:
+
+| | before | after |
+|---|---|---|
+| bytes/day | **6.64 MB** | **46 KB** (144× less) |
+| bytes/year | 2.42 GB | 16.8 MB |
+| filesystem commits/day | 144 | 48 |
+| block erases/day | ~1,728 | ~24 (72× less) |
+| history lost per reboot | **up to 10 min** | **nothing** |
+
+Being straight about the motivation: **flash wear was never the failure mode.**
+Spread over the partition's 2,528 blocks, 1,728 erases/day is 0.68 per block per
+day — about **400 years** to a 100k-cycle endurance limit. The board, the car and
+the battery all lose that race. The rewrite was worth killing for the last row of
+that table: this board has taken a lot of watchdog reboots, and each one silently
+discarded up to ten minutes of history.
+
+Three tiers, each with different survival properties:
+
+- **Tier 1 — RTC slow RAM** (`g_sb[30]`, 960 B). Every sample lands here first
+  and touches no flash. `RTC_NOINIT` survives a watchdog reset, a software reset
+  and an OTA reboot — every reset this board has actually taken — so batching 30
+  samples costs no data. Only disconnecting the battery loses the tail, and that
+  stops the car anyway. Replayed into the ring at boot.
+- **Tier 2 — `/hist.jrn`**, append-only, two generations (`.jrn` + `.old`,
+  ~46 KB each), rotated and never rewritten in place. Same shape as the event
+  log, for the same reason. Written by the loop core only; the safety task sets a
+  flag and never touches the filesystem.
+- **Tier 3 — `/hourly.bin`**, one 12 B record per hour (~105 KB/year), rotated at
+  62 days per generation.
+
+The batch is also flushed on both engine edges, so an ENGINE ON/OFF transition is
+never left stranded in RAM.
+
+### Changed — the hourly archive survives an engine start
+`resetDrainBuckets()` used to `LittleFS.remove()` the whole bucket file on engine
+start. That was unnecessary: `computeHourlyDrain()` already skips everything
+before `g_lastRunTs + DR_SETTLE_S`, so old buckets cannot influence the estimate.
+Deleting them only destroyed the one long-term record the board keeps. Now just
+the part-built hour is dropped — it straddles the run and is meaningless — and
+`/drain.bin` becomes `/hourly.bin`, an archive that accumulates across parks.
+
+### Added
+- One-time migration: `/history.bin` is read once on first 4.37 boot, replayed
+  into the ring, then removed, so upgrading does not throw away the last 24 h.
+- `fs_wr_b` / `fs_wr_n` / `sb_n` in `/json` — bytes written, commits, and samples
+  currently held in RTC RAM. Wear is now measured rather than assumed.
+
+### Concurrency note
+`g_sb` is written by the safety task on core 0 and drained by the loop on core 1,
+so the count is guarded by its own `portMUX` (`g_sbMux`) exactly like `g_logMux`.
+The flush consumes precisely the `n` records it wrote and shifts any sample taken
+*during* the write down to the front, rather than zeroing the count — zeroing
+would drop that sample from flash while leaving it in the RAM ring, and the two
+would disagree after the next reboot.
+
+### Build environment note (2026-08-14) — no change made
+A **full core rebuild is slow, and that is expected.** Changing the FQBN (here,
+the partition scheme) invalidates the warm build path and forces all ~200 core
+objects to recompile. The share answers a directory listing in ~7.5 s and is
+mounted `actimeo=1`, so each of those objects re-stats all five `-I` include
+paths over SMB; a full rebuild runs 40+ minutes. Incremental builds hide this
+entirely, because only the sketch recompiles when `~/.cache/vroom-build` is warm.
+
+Locations are deliberate and stay as they are — libraries on the share (shared
+with the Windows setup), core toolchain on local disk (CIFS `nounix` cannot hold
+the symlinks it contains). Budget the time instead of moving things:
+
+```
+arduino-cli --config-file .../arduino-cli-linux.yaml compile \
+  --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=custom" \
+  --build-path ~/.cache/vroom-build \
+  --output-dir esp32-s3/voltage_monitor/build-out \
+  esp32-s3/voltage_monitor
+```
+
+---
+
 ## 2026-08-14 — correction: the partition scheme in the docs was right all along
 
 **Retracting the note under fw 4.24 below**, which said

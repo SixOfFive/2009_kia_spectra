@@ -82,6 +82,37 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — fw 4.43: the auto-start fire path had no record that survives
+
+### Fixed — the one-shot event was about to go unrecorded
+Auto-start has never fired in this vehicle. Checking the fire path ahead of an
+expected first trigger, **every outcome went to `Serial.printf` and nowhere
+else** — and the board sits in a car with nothing attached to serial:
+
+```
+*** AUTO-START FIRED at %.2f V (tx %s) ***          Serial only
+start verified: engine running (charging seen)       Serial only
+auto-start: no charging after 180 s -- fail N of 2    Serial only
+*** auto-start LOCKED OUT ***                        Serial only
+```
+
+`/logtext` would have shown `LOW-V countdown STARTED` and then nothing at all
+about the fire or whether the engine caught. The `/starts` row would still record
+`src`, `ok` and `ver`, but the sequence — transmit result, the 180 s verification
+window, the fail count, the lockout latch and its reason — existed only on a
+serial port nobody is reading.
+
+All five are now mirrored to `logLine()`, so they reach the RAM ring, `/logtext`,
+and flash via the loop's flush. Calling `logLine` from the safety task on core 0
+is safe and already precedented (4.34's `clearLow`): it writes the ring under
+`g_logMux` and never touches the filesystem.
+
+The fire line also now states what happens next — `waiting 180s for charge` — so
+a log read after the fact shows the expected next event rather than requiring the
+reader to know `AS_VERIFY_S`.
+
+---
+
 ## 2026-08-14 — fw 4.42: hovering a sparse graph now finds the nearest reading
 
 ### Fixed

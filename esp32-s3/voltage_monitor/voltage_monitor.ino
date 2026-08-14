@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.42";
+const char* FW_VERSION = "4.43";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -1779,20 +1779,27 @@ void evalAutoStart(float v) {
       g_verifying = false; g_pendingIdx = -1;
       if (g_verifyAuto) { g_asFails = 0; prefs.putUChar("as_fails", 0); }
       Serial.println("start verified: engine running (charging seen)");
+      logLine("start VERIFIED: engine running, charging at %.2f V", v);
     } else if (now - g_verifyMs >= AS_VERIFY_S * 1000UL) {
       if (g_pendingIdx >= 0) { g_starts[g_pendingIdx].ver = 2; saveStarts(); }
       g_verifying = false; g_pendingIdx = -1;
       if (!g_verifyAuto) {                      // manual press -- record it, but never latch
         Serial.printf("manual start: no charging after %lu s (not counted toward lockout)\n",
                       (unsigned long)AS_VERIFY_S);
+        logLine("manual start UNVERIFIED: no charging after %lus (not counted toward lockout)",
+                (unsigned long)AS_VERIFY_S);
       } else {
         if (g_asFails < 255) g_asFails++;
         prefs.putUChar("as_fails", g_asFails);
         Serial.printf("auto-start: no charging after %lu s -- fail %u of %u\n",
                       (unsigned long)AS_VERIFY_S, g_asFails, AS_MAX_FAILS);
+        logLine("auto-start FAILED: no charging after %lus -- fail %u of %u, next attempt in %lus",
+                (unsigned long)AS_VERIFY_S, g_asFails, AS_MAX_FAILS, (unsigned long)g_as_cool);
         if (g_asFails >= AS_MAX_FAILS) {        // it isn't going to start; stop cranking it
           g_asLock = true; prefs.putBool("as_lock", true);
           Serial.println("*** auto-start LOCKED OUT after repeated failed starts ***");
+          logLine("*** auto-start LOCKED OUT after %u failed starts -- will not fire again until cleared ***",
+                  AS_MAX_FAILS);
         }
       }
     }
@@ -1854,6 +1861,10 @@ void evalAutoStart(float v) {
   Serial.printf("*** AUTO-START FIRED at %.2f V (tx %s) -- cooldown %lu s, fire %u today (cap %s) ***\n",
                 v, sent ? "ok" : "FAILED", (unsigned long)g_as_cool, g_fires24,
                 g_as_max24 > 0 ? String(g_as_max24).c_str() : "none");
+  // Serial goes nowhere in the car. Every line below is the only account of what
+  // happened that survives to /logtext and across a reboot.
+  logLine("*** AUTO-START FIRED at %.2f V -- RF transmit %s, waiting %lus for charge ***",
+          v, sent ? "ok" : "FAILED", (unsigned long)AS_VERIFY_S);
 }
 
 // ---------- safety task + watchdog ----------

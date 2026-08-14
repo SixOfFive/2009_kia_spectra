@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.33";            // 4.33 = default/recommended trigger 12.4 -> 12.2 V (12.4 sits above this battery's resting voltage)
+const char* FW_VERSION = "4.34";            // 4.34 = live sustain countdown on Main + every countdown start/reset logged with its reason
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -1269,19 +1269,31 @@ void evalAutoStart(float v) {
   if (now - g_win24Ms >= 86400000UL) { g_win24Ms = now; g_fires24 = 0; }
 
   // --- gating ---
-  if (!g_as_en)                                                { g_lowSince = 0; return; }
-  if (g_asLock)                                                { g_lowSince = 0; return; }
-  if (!(RF_ENABLED && rfReady && COMPUSTAR_PATTERNS_CAPTURED)) { g_lowSince = 0; return; }
-  if (now < AS_BOOT_GRACE_MS)                                  { g_lowSince = 0; return; }
-  if (!valid)                                                  { g_lowSince = 0; return; }
-  if (g_verifying)                                             { g_lowSince = 0; return; }
-  if (g_needRearm)                                             { g_lowSince = 0; return; }
-  if (g_parkS < AS_PARK_S)                                     { g_lowSince = 0; return; }
-  if (g_as_max24 > 0 && g_fires24 >= g_as_max24)               { g_lowSince = 0; return; }
-  if (!(v < g_as_volts))                                       { g_lowSince = 0; return; }
+  // clearLow() instead of a bare assignment so that ABANDONING a countdown is
+  // recorded with the reason. A countdown that silently restarts is the thing
+  // you most want explained after the fact -- especially the common case, the
+  // battery recovering above the threshold.
+  #define clearLow(why) do { \
+      if (g_lowSince) logLine("LOW-V countdown RESET after %lus of %lus (%s) at %.2f V", \
+                              (unsigned long)((now - g_lowSince) / 1000), \
+                              (unsigned long)g_as_hold, (why), v); \
+      g_lowSince = 0; } while (0)
+
+  if (!g_as_en)                                                { clearLow("auto-start off");   return; }
+  if (g_asLock)                                                { clearLow("lockout");          return; }
+  if (!(RF_ENABLED && rfReady && COMPUSTAR_PATTERNS_CAPTURED)) { clearLow("RF not ready");      return; }
+  if (now < AS_BOOT_GRACE_MS)                                  { clearLow("boot grace");        return; }
+  if (!valid)                                                  { clearLow("reading invalid");   return; }
+  if (g_verifying)                                             { clearLow("verifying a start"); return; }
+  if (g_needRearm)                                             { clearLow("awaiting re-arm");   return; }
+  if (g_parkS < AS_PARK_S)                                     { clearLow("park-confirm");      return; }
+  if (g_as_max24 > 0 && g_fires24 >= g_as_max24)               { clearLow("24 h cap");          return; }
+  if (!(v < g_as_volts))                                       { clearLow("voltage recovered"); return; }
 
   if (g_lowSince == 0) {                        // first low reading -- start the clock
     g_lowSince = now;
+    logLine("LOW-V countdown STARTED: %.2f V below %.2f V, need %lus", v, g_as_volts,
+            (unsigned long)g_as_hold);
     Serial.printf("auto-start: %.2f V below %.2f V, counting %lu s\n",
                   v, g_as_volts, (unsigned long)g_as_hold);
     return;
@@ -1494,6 +1506,21 @@ function C(id,c){var e=$(id);if(e!=null)e.style.color=c}                 // safe
 function H(id,h){var e=$(id);if(e!=null)e.innerHTML=h}                   // safe innerHTML
 function fmtUp(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+"h "+m+"m":m?m+"m "+x+"s":x+"s"}
 function fmtB(b){if(b===undefined||b===null)return "--";if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(1)+" KB";return (b/1048576).toFixed(2)+" MB"}
+// ---- live sustain countdown (ticks locally between polls) ----
+var cdHold=0, cdBase=0, cdAt=0, cdWasCounting=false, cdSeenStarts=0, cdVolts=0, cdThresh=0;
+function cdTick(){
+  var w=$("cdwrap"); if(!w||w.style.display=="none"||!cdHold) return;
+  var el = cdBase + (Date.now()-cdAt)/1000;      // interpolate since the last poll
+  if(el>cdHold) el=cdHold; if(el<0) el=0;
+  var rem = Math.max(0, cdHold-el);
+  T("cdrem", rem<60 ? rem.toFixed(0)+" s"
+                    : Math.floor(rem/60)+"m "+(rem%60).toFixed(0).padStart(2,"0")+"s");
+  T("cdsub", el.toFixed(0)+" s of "+cdHold+" s held below "+cdThresh.toFixed(2)+
+             " V \u2014 now "+cdVolts.toFixed(2)+" V. Recovering above the threshold resets it to zero.");
+  var b=$("cdbar"); if(b) b.style.width=(100*el/cdHold)+"%";
+}
+setInterval(cdTick,1000);
+
 function fmtDate(ts){if(!ts)return "--";var x=new Date(ts*1000);
   return x.toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"})+" "+
          x.toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit"});}
@@ -1622,6 +1649,29 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
       T("ltcycle", d.last_run?"--":"no run recorded");
       T("ltcycledates", d.last_run?("last run "+fmtDate(d.last_run)+"  \u2192  next not projected"):"--");
     }
+  }
+  // Live sustain countdown. The board is polled every 2 s and must not be
+  // polled faster (weak link, small socket pool), so the seconds are ticked
+  // locally and RESYNCED to the board's authoritative as_low_s on every poll --
+  // the display can never drift from the device by more than one poll.
+  if(d.as_state=="counting"){
+    cdHold = d.as_hold||0; cdBase = d.as_low_s||0; cdAt = Date.now();
+    cdWasCounting = true; cdVolts = d.vbatt; cdThresh = d.as_volts;
+    var w=$("cdwrap"); if(w) w.style.display="block";
+    var r=$("cdreset"); if(r) r.style.display="none";
+    cdTick();
+  }else{
+    var w2=$("cdwrap"); if(w2) w2.style.display="none";
+    if(cdWasCounting){          // it was counting and now is not: say why
+      cdWasCounting = false;
+      var r2=$("cdreset");
+      if(r2){ r2.style.display="block";
+        r2.textContent = (d.as_state=="cooldown"||d.as_n>cdSeenStarts)
+          ? "Countdown completed \u2014 auto-start fired."
+          : "Countdown reset at "+(d.vbatt||0).toFixed(2)+" V (threshold "+(d.as_volts||0).toFixed(2)+" V). It restarts from zero next time voltage drops below.";
+      }
+    }
+    cdSeenStarts = d.as_n||0;
   }
   var ae=!!d.as_en,eta=fmtEta(d.as_eta_s);
   T("aseta",ae?(eta||(d.drain_ok?"holding":"settling")):"--");
@@ -1791,7 +1841,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1812,6 +1862,18 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 </div>
 <div class="sub" id="sub">waiting for data&hellip;</div>
 
+<div id="cdwrap" style="display:none;margin-bottom:10px">
+<div class="card" style="border-color:#f85149">
+<div class="k" style="color:#f85149">Low-voltage countdown running</div>
+<div style="display:flex;align-items:baseline;gap:10px;margin-top:4px">
+<span id="cdrem" style="font-size:38px;font-weight:700;color:#f85149">--</span>
+<span class="k" style="font-size:14px">until auto-start</span>
+</div>
+<div style="margin-top:8px;height:12px;background:#21262d;border-radius:6px;overflow:hidden">
+<div id="cdbar" style="height:100%;width:0%;background:#f85149;border-radius:6px;transition:width .9s linear"></div></div>
+<div class="k" id="cdsub" style="text-transform:none;letter-spacing:0;margin-top:6px">&nbsp;</div>
+</div></div>
+<div class="k" id="cdreset" style="display:none;margin-bottom:10px;text-transform:none;letter-spacing:0;color:#d29922">&nbsp;</div>
 <div class="clbl">Remote start &mdash; 433 MHz</div>
 <div class="card" style="margin-bottom:10px">
 <div class="k">CC1101 &middot; <span id="rfstat">&hellip;</span></div>
@@ -1888,13 +1950,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=433"></script>
+<script src="/app.js?v=434"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -1983,13 +2045,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=433"></script>
+<script src="/app.js?v=434"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2052,13 +2114,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=433"></script>
+<script src="/app.js?v=434"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2090,13 +2152,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=433"></script>
+<script src="/app.js?v=434"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2122,7 +2184,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=433"></script>
+<script src="/app.js?v=434"></script>
 </body></html>
 )HTML";
 
@@ -2706,7 +2768,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=433">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=434">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -2889,7 +2951,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=433"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=434"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

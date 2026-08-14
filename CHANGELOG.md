@@ -82,6 +82,53 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — fw 4.34: live sustain countdown on Main, and every reset explained
+
+### Added — live countdown, Main tab
+When voltage drops below the threshold a red banner appears immediately, showing
+remaining time in large type, a progress bar, and a subline reading
+*"55 s of 300 s held below 12.20 V — now 12.18 V. Recovering above the threshold
+resets it to zero."*
+
+**It ticks every second without polling the board every second.** The dashboard
+polls `/json` every 2 s and that was deliberately left alone — weak link, small
+socket pool, and a day already lost to socket-related failures. The seconds are
+interpolated locally and **resynced to the board's authoritative `as_low_s` on
+every poll**, so the display can never drift from the device by more than one
+poll.
+
+On recovery the banner clears and a persistent amber note explains what happened,
+distinguishing *"Countdown reset at 12.24 V (threshold 12.20 V)"* from
+*"Countdown completed — auto-start fired."*
+
+### Added — every countdown abandonment is logged with its reason
+There were **nine** code paths that could silently zero the sustain counter
+(recovery, park-confirm, lockout, invalid reading, 24 h cap, re-arm wait,
+verification in progress, boot grace, RF not ready). All of them just assigned
+`g_lowSince = 0` with no trace. A `clearLow()` macro now logs the abandonment,
+how far it had got, and which guard tripped:
+
+```
+LOW-V countdown STARTED: 12.18 V below 12.20 V, need 300s
+LOW-V countdown RESET after 47s of 300s (voltage recovered) at 12.21 V
+```
+
+This matters more with a longer hold: a 5-minute window is a bigger target for
+interruption than 60 s, and previously a countdown could restart repeatedly with
+nothing recorded anywhere.
+
+### Validated
+Against a mock that counts and then recovers: countdown measured ticking
+`4m 10s → 4m 05s` over four seconds with the bar advancing 16.7 % → 18.3 %,
+subline correct, and the reset note appearing with the right voltages on
+recovery. No JavaScript errors. Cache-bust `?v=434`.
+
+**Field state:** flashed first try (`HTTP=200`, 44 s, 27.8 KB/s), board back on
+its `.94` reservation, RSSI −58 (best recorded), hold already configured to
+**300 s**, battery 12.24 V against a 12.20 V threshold.
+
+---
+
 ## 2026-08-12 — fw 4.33: recommended trigger 12.4 V → 12.2 V
 
 ### Changed

@@ -82,6 +82,52 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — fw 4.39: the 4.37 migration never reached flash — 24 h of history lost
+
+### Fixed — data loss, not a cosmetic bug
+4.37's `/history.bin` migration read the old snapshot into the **RAM ring** and
+then deleted the file, without ever writing those samples to the journal. The
+`Serial` line even claimed `history: migrated /history.bin -> append-only
+journal`; it had not. Only samples taken *after* boot were journaled.
+
+So the 1440 migrated samples existed solely in volatile PSRAM. They survived for
+as long as 4.37 ran and died at the next reboot — which was the 4.38 flash.
+**~24 h of voltage history was destroyed and is not recoverable**; LittleFS has
+no undelete and the source file was already gone.
+
+Caught immediately after the 4.38 boot:
+
+```
+samples     8         <- not 1440; only the RTC batch survived
+fs_wr_b     264       <- 8 x 32 B + 8 B header: the journal's FIRST ever write
+hr_buckets  1         <- the 4.38 /drain.bin migration did work
+```
+
+`seedJournalFromRing()` now writes the entire ring into a fresh journal, oldest
+sample first, and `/history.bin` is deleted **only if that write succeeds** — a
+failed seed keeps the source so the next boot can retry instead of losing
+everything. Any future path that puts samples in the ring from outside the
+journal must call it before discarding its source.
+
+### Why this got through
+Two migration defects in three releases, from the same root cause: **treating
+"the data is in the ring" as equivalent to "the data is safe."** It is not, and
+the entire point of 4.37 was to separate those two ideas. Worse, the check that
+was supposed to verify the migration — `samples` still reading 1440 — could only
+ever confirm the RAM half, and I reported it as verification of the whole thing.
+
+The honest lesson for persistence changes here: **verify across a reboot, not
+within one.** A count that looks right on the boot that performed a migration
+proves nothing about what is on flash.
+
+### Ongoing risk: none
+The steady-state path was never affected. On boot the ring is rebuilt from
+`.old` + `.jrn` + RTC, all of which are on flash or in reset-surviving memory, so
+no further loss is possible. The defect was confined to the one-time migration,
+which has already run on this board.
+
+---
+
 ## 2026-08-14 — fw 4.38: migrate the file 4.37 renamed without a migration
 
 ### Fixed
@@ -102,9 +148,12 @@ persisted file is a data migration whether or not it feels like one.
 
 ### Verified on hardware (fw 4.37 flash, 2026-08-14 13:37)
 The parts that could only be checked by flashing:
-- **`/history.bin` migration works.** `samples` stayed at **1440** across the
+- ~~**`/history.bin` migration works.**~~ `samples` stayed at **1440** across the
   upgrade and `disk_used` fell 151,552 → 102,400, i.e. exactly 49,152 bytes
-  (12 × 4096) — the old snapshot read and removed.
+  (12 × 4096) — the old snapshot read and removed. **This conclusion was wrong,
+  see fw 4.39.** The samples reached the RAM ring, not flash; reading a healthy
+  `samples` count one boot later does not prove persistence, and calling it
+  "verified" on that basis was premature.
 - **New counters live:** `fs_wr_b 0`, `fs_wr_n 0`, `sb_n 1` seven seconds after
   boot — one sample buffered in RTC RAM, nothing written to flash yet, which is
   the intended behaviour (first flush at 30 samples).

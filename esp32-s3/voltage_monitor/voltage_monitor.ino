@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.38";
+const char* FW_VERSION = "4.39";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -1252,6 +1252,27 @@ static int replayJournal(const char* path) {
   return n;
 }
 
+// Write the whole ring into a fresh journal, oldest sample first.
+// 4.37's migration read /history.bin into the RAM ring and deleted the file
+// WITHOUT this step, so the samples lived only in volatile RAM and were lost at
+// the next reboot. Anything that puts samples in the ring from outside the
+// journal has to call this before the source is discarded.
+static int seedJournalFromRing() {
+  if (!hist || histCount <= 0) return 0;
+  LittleFS.remove(JRN_FILE);
+  File f = LittleFS.open(JRN_FILE, FILE_WRITE);
+  if (!f) return 0;
+  jrnHeader(f);
+  int idx = (histHead - histCount + HIST_N) % HIST_N;   // oldest first
+  for (int k = 0; k < histCount; k++) {
+    f.write((uint8_t*)&hist[idx], sizeof(Sample));
+    idx = (idx + 1) % HIST_N;
+  }
+  f.close();
+  g_fsBytes += 8 + sizeof(Sample) * histCount; g_fsCommits++;
+  return histCount;
+}
+
 // Rebuild the ring at boot, oldest source first: the pre-4.37 snapshot (once),
 // then both journal generations, then whatever is still sitting in RTC RAM.
 void loadHistory() {
@@ -1272,8 +1293,15 @@ void loadHistory() {
       }
       f.close();
     }
-    LittleFS.remove("/history.bin");
-    Serial.println("history: migrated /history.bin -> append-only journal");
+    // Get it onto flash BEFORE dropping the source. If the seed fails, keep
+    // /history.bin so the next boot can retry rather than losing the lot.
+    int seeded = seedJournalFromRing();
+    if (seeded > 0) {
+      LittleFS.remove("/history.bin");
+      Serial.printf("history: migrated %d samples from /history.bin into the journal\n", seeded);
+    } else {
+      Serial.println("history: journal seed FAILED -- keeping /history.bin for retry");
+    }
   }
 
   int a = replayJournal(JRN_OLD);

@@ -129,10 +129,14 @@ readable.
 
 ### Known gap
 Auto-start config changes are written to NVS and Serial but **not to the flash
-log**, so a threshold or hold change leaves no durable trace. Observed after this
-flash: the hold read 300 s before and 60 s after, with every other NVS value
-intact — and there is no way to tell from the device whether that was a person or
-a fault. Worth logging.
+log**, so a threshold or hold change leaves no durable trace.
+
+Surfaced by a real case: the hold read 300 s before this flash and 60 s after,
+with every other NVS value intact. **That turned out to be a deliberate change by
+the owner — there was no fault, and NVS persistence is working correctly.** But
+the device could not say so, and half an hour went into ruling out a persistence
+bug that never existed. A logged line naming the setting, its old value and its
+new one would have answered it instantly. Worth adding.
 
 ---
 

@@ -82,6 +82,45 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — correction: the partition scheme in the docs was right all along
+
+**Retracting the note under fw 4.24 below**, which said
+`esp32-s3/docs/voltage-monitor.md` was wrong to specify `PartitionScheme=custom`
+because the real build used `app3M_fat9M_16MB`. The docs are correct. Both
+schemes work *for OTA*, which is why the discrepancy went unnoticed for a dozen
+releases — but they are **not** interchangeable for a USB flash, and the note as
+written pointed at the one that destroys the filesystem.
+
+Verified against the installed board:
+
+```
+disk_total 10354688 = 0x9E0000        # matches voltage_monitor/partitions.csv
+LittleFS.begin(true)                  # default partition label: "spiffs"
+```
+
+- The sketch's own `partitions.csv` names that partition **`spiffs`**. Stock
+  `app3M_fat9M_16MB` names it **`ffat`**, subtype `fat`. `LittleFS.begin()` looks
+  up the label `spiffs` and would find nothing — no event log, no start history,
+  no drain buckets.
+- The two schemes have **identical app geometry** (`app0` @ `0x10000`, `app1` @
+  `0x310000`, `0x300000` each). That is the whole reason `app3M_fat9M_16MB`
+  builds have been OTA-ing successfully since 4.24.
+- **OTA never rewrites the partition table** — it writes one app slot and flips
+  `otadata`. The table on the device is still the one the original USB bootstrap
+  flash laid down, i.e. the custom one. So the compile-time scheme has been
+  irrelevant to every update actually performed.
+
+The trap is a **USB** flash with `app3M_fat9M_16MB`: it *would* rewrite the table,
+replace `spiffs` with `ffat`, and LittleFS would silently fail to mount on the
+next boot. The 4.24 note recommended exactly that, and both the CHANGELOG build
+command and `braindump.md` carried it forward.
+
+Resolution: `PartitionScheme=custom` is now the single documented FQBN everywhere
+— docs, CHANGELOG and braindump — since it is correct for both paths. No firmware
+change; `voltage_monitor.ino` is untouched.
+
+---
+
 ## 2026-08-14 — fw 4.36: build stamp, and hourly drain buckets spanning the whole park
 
 ### Added — compile stamp in the footer
@@ -743,6 +782,11 @@ Compile-verified: 1,198,907 bytes (38 % of the 3 MB app slot), globals 61,544
 > build used **`PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB`**.
 > Worth correcting in the docs: a wrong partition scheme on a 16 MB OTA board is
 > exactly the mistake that bricks an update.
+>
+> **Correction, 2026-08-14: this had it backwards — the docs were right.** Both
+> schemes share the same app geometry, so either OTAs fine, but only `custom`
+> creates the `spiffs` partition `LittleFS.begin()` mounts. See the 2026-08-14
+> correction entry at the top of this file.
 
 ### Added
 - `.gitattributes` pinning all text to LF (`* text=auto eol=lf`), with binary
@@ -768,9 +812,13 @@ reason inline. Build command:
 
 ```
 arduino-cli --config-file .../arduino-cli-linux.yaml compile \
-  --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB" \
+  --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=custom" \
   --build-path ~/.cache/vroom-build esp32-s3/voltage_monitor
 ```
+
+> This originally read `PartitionScheme=app3M_fat9M_16MB`; corrected 2026-08-14.
+> `custom` reads the sketch's `partitions.csv` and is the only scheme that is safe
+> over **both** USB and OTA.
 
 Note that `arduino-cli core install` is a **no-op when the version matches** — it
 checks only that the platform is present, not that the binaries match the host

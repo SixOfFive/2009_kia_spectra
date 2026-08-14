@@ -108,6 +108,15 @@ arduino-cli compile --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,Partitio
 On boot the serial monitor (115200) prints the assigned IP, e.g. `WiFi OK. IP = 192.168.x.x`.
 
 > **Partition scheme:** use `PartitionScheme=custom` — it reads `partitions.csv` in the sketch folder: **two 3 MB OTA app slots + ~9.9 MB LittleFS**. This first flash must be over **USB**; every update after that goes over WiFi (next section).
+>
+> ⚠️ **Do not "fix" this to `app3M_fat9M_16MB`.** The two schemes have identical
+> app geometry, so a build made with either one will OTA fine — which makes the
+> difference invisible until it isn't. But `partitions.csv` names the data
+> partition **`spiffs`**, which is the label `LittleFS.begin()` mounts, while
+> `app3M_fat9M_16MB` names it `ffat` (subtype `fat`). Flashing that one over
+> **USB** rewrites the partition table and LittleFS then fails to mount on the
+> next boot — losing the event log, start history and drain buckets, with no
+> error on the dashboard. (OTA never rewrites the table, so it cannot cause this.)
 
 WiFi credentials live in `voltage_monitor/secrets.h` (gitignored — copy
 `secrets.h.example` and fill in):

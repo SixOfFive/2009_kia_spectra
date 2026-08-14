@@ -82,6 +82,52 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — fw 4.36: build stamp, and hourly drain buckets spanning the whole park
+
+### Added — compile stamp in the footer
+`fw 4.36 · built Aug 14 2026 12:12:11`, from `__DATE__`/`__TIME__`, also in
+`/json` as `build`. Two flashes can carry the same version during development, so
+the stamp is what actually identifies what is running on a board in the field.
+
+### Changed — the drain estimate now regresses hourly buckets, not two points
+The 24 h ring cannot see a multi-day drain; the fw 4.29 two-point anchor could
+span days but was hostage to noise at either end. Now: **one bucket per hour for
+the whole park**, each the mean of ~60 samples, regressed across all of them.
+
+- **Persisted to LittleFS** (`/drain.bin`, 12 B per hour, ~62 days at `DR_MAX`),
+  restored at boot. A reboot — watchdog, brownout or OTA — no longer resets the
+  measurement, which is the failure that has repeatedly destroyed it.
+- **Cleared on engine start**, since averaging across a recharge is meaningless.
+- **Reports r²**, and returns *no* ETA below 0.5 rather than a number nobody
+  should act on.
+- Flash I/O stays on the loop core via a pending-bucket flag — the safety task
+  must never touch LittleFS.
+
+Both Main and Voltage read from it, since `autoStartEtaS()` already prefers the
+long-term path. The two-point anchor survives only as a fallback for the first
+hours of a park, before six buckets exist.
+
+**Two deliberate deviations from the request:**
+
+*The 12 h exclusion was kept.* Buckets are stored from engine-off but the fit
+starts at +12 h. The first half-day is surface charge dissipating, not parasitic
+drain, and including it would overstate the slope — the owner's original instinct
+was right. The settling data stays visible.
+
+*Temperature is stored per bucket and used as a second regressor.* Averaging
+alone does not fix thermal bias: this battery moves ~5 mV/°C and the diurnal
+swing is several times the daily trend, so a time-only fit over a partial last
+day reflects the weather. `V ~ time + temp` removes it, which is why the existing
+24 h fit already did this.
+
+### Note
+`DrainHour` and `HourFit` are declared beside `DrainFit` near the top for the
+documented reason: the `.ino` auto-prototype pass emits
+`HourFit computeHourlyDrain();` above the definitions, so the types must exist by
+then.
+
+---
+
 ## 2026-08-14 — fw 4.35: tooltips everywhere, log flap consolidation, UI spacing
 
 ### Added — an explanation on every visible value

@@ -105,7 +105,11 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.35";            // 4.34 = live sustain countdown on Main + every countdown start/reset logged with its reason
+const char* FW_VERSION = "4.36";
+// Compile stamp, so a board in the field can be matched to a build without
+// guessing from the version alone (two flashes can share a version during
+// development). Shown in the footer of every page and in /json.
+const char* FW_BUILD   = __DATE__ " " __TIME__;            // 4.34 = live sustain countdown on Main + every countdown start/reset logged with its reason
 
 // ----- NTP time sync (only when WiFi STA is connected) -----
 const char* NTP_SERVER1 = "time.windows.com";
@@ -290,6 +294,14 @@ struct DrainFit {
   float    mv_per_c;// temperature coefficient the fit found, mV/degC (diagnostic)
 };
 DrainFit g_drain = {false, 0, 0, 0, 0, -1, 0};   // refreshed once per history sample
+
+// Hourly drain bucket + its regression result. Declared up here for the SAME
+// reason as DrainFit above: the .ino auto-prototype pass emits
+// `HourFit computeHourlyDrain();` near the top of the file, so both types have
+// to exist by then. (Full rationale for the buckets is further down, at DR_MAX.)
+struct DrainHour { uint32_t ts; float v; float t; };   // 12 B per hour
+struct HourFit   { bool ok; float mvph; float r2; int n; uint32_t span_s; float mvpc; };
+HourFit g_hfit = {false, 0, 0, 0, 0, 0};
 
 // ---------- rolling event log (bounded RAM ring; never touches flash) ----------
 // A fixed ring of the most recent lines -- can't grow, so it can't fill RAM or
@@ -608,6 +620,91 @@ uint32_t  g_rearmS      = 0;               // seconds continuously at/above AS_R
 bool      g_needRearm   = false;           // set after a start; blocks refiring until recovered
 bool      g_asLock      = false;           // latched lockout  NVS "as_lock"
 uint8_t   g_asFails     = 0;               // consecutive unverified starts  NVS "as_fails"
+// ---- Hourly drain buckets -------------------------------------------------
+// The 24 h sample ring cannot see a drain that plays out over days, and a
+// two-point anchor (fw 4.29) is hostage to noise at either end. So keep one
+// averaged bucket per hour for the WHOLE park and regress across all of them.
+//
+// Each bucket is 60 samples averaged, which kills the per-sample ADC
+// quantisation (~5.5 mV) outright. Buckets persist to LittleFS, so a reboot --
+// the thing that has repeatedly destroyed this measurement -- costs nothing.
+//
+// Two deliberate choices:
+//   * Buckets are stored from engine-off, but the FIT starts at +12 h. The first
+//     half-day is surface charge dissipating, not parasitic drain; including it
+//     would badly overstate the slope. The data is still there to look at.
+//   * Temperature is stored per bucket and used as a second regressor. This
+//     battery moves ~5 mV/degC and the diurnal swing is several times the daily
+//     trend, so a time-only fit over a partial last day is biased by whatever
+//     the weather did. V ~ time + temp removes it.
+const int      DR_MAX      = 1500;                        // ~62 days
+const uint32_t DR_SETTLE_S = 12UL * 3600UL;               // skip post-run settling
+const int      DR_MIN_PTS  = 6;                           // need this many to report
+const char*    DR_FILE     = "/drain.bin";
+DrainHour*     g_dr   = nullptr;                          // PSRAM ring (rolls at DR_MAX)
+int            g_drN  = 0;
+double         g_drVs = 0, g_drTs = 0;                    // in-progress hour
+uint32_t       g_drCnt = 0, g_drHour = 0;
+volatile bool  g_drPending = false;                       // a bucket awaits flash (loop core)
+DrainHour      g_drPend;
+
+
+static void drPush(const DrainHour& b) {
+  if (!g_dr) return;
+  if (g_drN < DR_MAX) { g_dr[g_drN++] = b; }
+  else { memmove(g_dr, g_dr + 1, (DR_MAX - 1) * sizeof(DrainHour)); g_dr[DR_MAX - 1] = b; }
+}
+
+// Regress V against time and temperature across the settled buckets.
+// Returns mV/h (negative = discharging), r2, and the temp coefficient.
+HourFit computeHourlyDrain() {
+  HourFit f = {false, 0, 0, 0, 0, 0};
+  if (!g_dr || g_drN < DR_MIN_PTS) return f;
+  uint32_t from = g_lastRunTs ? (g_lastRunTs + DR_SETTLE_S) : 0;
+  int i0 = 0; while (i0 < g_drN && g_dr[i0].ts < from) i0++;
+  int n = g_drN - i0;
+  if (n < DR_MIN_PTS) return f;
+
+  double t0 = g_dr[i0].ts;
+  double sx=0, sy=0, sz=0, sxx=0, sxy=0, sxz=0, szz=0, syz=0;
+  double tmin=1e9, tmax=-1e9;
+  for (int i = i0; i < g_drN; i++) {
+    double x = (g_dr[i].ts - t0) / 3600.0;     // hours
+    double y = g_dr[i].v;                       // volts
+    double z = g_dr[i].t;                       // degC
+    sx+=x; sy+=y; sz+=z; sxx+=x*x; sxy+=x*y; sxz+=x*z; szz+=z*z; syz+=y*z;
+    if (z<tmin) tmin=z; if (z>tmax) tmax=z;
+  }
+  double N = n;
+  // Centre everything, then solve the 2x2 normal equations for [b_time, b_temp].
+  double mx=sx/N, my=sy/N, mz=sz/N;
+  double Sxx=sxx-N*mx*mx, Szz=szz-N*mz*mz, Sxz=sxz-N*mx*mz;
+  double Sxy=sxy-N*mx*my, Szy=syz-N*mz*my;
+  double b_time, b_temp = 0;
+  double det = Sxx*Szz - Sxz*Sxz;
+  if ((tmax - tmin) > 3.0 && fabs(det) > 1e-9) {        // enough temp spread to separate
+    b_time = (Sxy*Szz - Szy*Sxz) / det;
+    b_temp = (Szy*Sxx - Sxy*Sxz) / det;
+  } else {
+    if (fabs(Sxx) < 1e-9) return f;
+    b_time = Sxy / Sxx;                                  // temp flat -> plain fit
+  }
+  double a = my - b_time*mx - b_temp*mz;
+  double ssr=0, sst=0;
+  for (int i = i0; i < g_drN; i++) {
+    double x=(g_dr[i].ts-t0)/3600.0, y=g_dr[i].v, z=g_dr[i].t;
+    double e = y - (a + b_time*x + b_temp*z);
+    ssr += e*e; sst += (y-my)*(y-my);
+  }
+  f.ok     = true;
+  f.mvph   = (float)(b_time * 1000.0);
+  f.mvpc   = (float)(b_temp * 1000.0);
+  f.r2     = sst > 0 ? (float)(1.0 - ssr/sst) : 0.0f;
+  f.n      = n;
+  f.span_s = g_dr[g_drN-1].ts - g_dr[i0].ts;
+  return f;
+}
+
 // ---- Long-term drain reference -------------------------------------------
 // A 24 h RAM ring cannot measure a drain that plays out over days, and every
 // reboot restarts it -- which is exactly what the /history watchdog stalls were
@@ -1021,6 +1118,26 @@ void recordSample() {
   if (histCount < HIST_N) histCount++;
   g_drain = computeDrain();     // refresh once per sample, not per HTTP poll
 
+  // Fold this sample into the current hourly bucket. RAM only -- the loop core
+  // owns all flash I/O, so we just flag a completed bucket for it to persist.
+  if (s.ts && s.vbatt > 8.0f && s.vbatt < 16.0f) {
+    uint32_t hr = s.ts / 3600;
+    if (g_drHour == 0) g_drHour = hr;
+    if (hr != g_drHour) {
+      if (g_drCnt) {
+        DrainHour b;
+        b.ts = g_drHour * 3600 + 1800;            // midpoint of the hour it covers
+        b.v  = (float)(g_drVs / g_drCnt);
+        b.t  = (float)(g_drTs / g_drCnt);
+        drPush(b);
+        g_drPend = b; g_drPending = true;         // loop appends it to flash
+        g_hfit = computeHourlyDrain();            // refresh once per hour, not per poll
+      }
+      g_drVs = g_drTs = 0; g_drCnt = 0; g_drHour = hr;
+    }
+    g_drVs += s.vbatt; g_drTs += s.temp; g_drCnt++;
+  }
+
   // Board-health warning: log if free heap crosses below a floor (a leak or
   // memory pressure would show here) -- latched so it fires once per crossing.
   static bool heapWarned = false;
@@ -1109,6 +1226,43 @@ static void logRingPush(const char* line) {
 
 // Append any ring lines not yet on flash. LOOP-CORE ONLY (single-threaded file
 // I/O). Cheap when idle -- the fast path returns before taking the lock.
+// Append the one pending hourly bucket. Loop core only -- same rule as the
+// event log: the safety task must never touch LittleFS.
+void flushDrainToFlash() {
+  if (!g_drPending) return;
+  g_drPending = false;
+  File f = LittleFS.open(DR_FILE, FILE_APPEND);
+  if (!f) return;
+  f.write((uint8_t*)&g_drPend, sizeof(DrainHour));
+  f.close();
+}
+
+// Restore buckets at boot. This is the point of the whole design: a reboot --
+// watchdog, brownout or OTA -- must not reset the measurement.
+void loadDrainFromFlash() {
+  if (!g_dr) return;
+  File f = LittleFS.open(DR_FILE, FILE_READ);
+  if (!f) return;
+  size_t n = f.size() / sizeof(DrainHour);
+  size_t skip = (n > (size_t)DR_MAX) ? (n - DR_MAX) : 0;   // keep the newest
+  f.seek(skip * sizeof(DrainHour));
+  g_drN = 0;
+  while (g_drN < DR_MAX && f.read((uint8_t*)&g_dr[g_drN], sizeof(DrainHour)) == sizeof(DrainHour)) {
+    if (g_dr[g_drN].ts > 1700000000UL && g_dr[g_drN].v > 8.0f && g_dr[g_drN].v < 16.0f) g_drN++;
+  }
+  f.close();
+  if (g_drN) logLine("drain buckets restored: %d hours from flash", g_drN);
+}
+
+// A run invalidates the whole park record -- start a fresh one.
+void resetDrainBuckets(const char* why) {
+  g_drN = 0; g_drVs = g_drTs = 0; g_drCnt = 0; g_drHour = 0;
+  g_drPending = false;
+  g_hfit = {false, 0, 0, 0, 0, 0};
+  LittleFS.remove(DR_FILE);
+  logLine("drain buckets cleared (%s)", why);
+}
+
 void flushLogToFlash() {
   if (g_logSeq == g_logPersistedSeq) return;         // nothing pending (unlocked read, benign)
   static char pend[16][LOG_LEN];                      // loop-only -> static is safe, keeps it off the stack
@@ -1271,9 +1425,11 @@ void evalAutoStart(float v) {
       }
     }
     // A run invalidates the long-term reference; a fresh one is taken 12 h after
-    // this run ends.
+    // this run ends. The hourly buckets describe a park that has just ended, so
+    // they go too -- mixing two parks would average across a recharge.
     g_ltRefTs = 0; g_ltRefV = 0; g_ltDue = 0;
     prefs.putUInt("lt_ref_ts", 0); prefs.putUInt("lt_due", 0);
+    resetDrainBuckets("engine started");
   } else if (!nowRun && engRunning) {
     uint32_t ran = (millis() - engOnMs) / 1000;
     logLine("ENGINE OFF: charging ended at %.2f V after %lum %lus",
@@ -1735,7 +1891,11 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
       +(r2<0.6?" -- leave it sitting longer before comparing":""));
     C("dmeta",(r2<0.6)?"#d29922":"#8b949e");}
   T("sub","divider x"+d.divider+" | cal "+d.cal+" | ADC "+d.adc_mv+" mV | 1 sample/"+d.interval_s+"s");
-  T("net",(d.mode?d.mode.toUpperCase():"")+" | "+(d.ip||""));T("ns",d.samples);T("fw",d.fw||"?");
+  T("net",(d.mode?d.mode.toUpperCase():"")+" | "+(d.ip||""));T("ns",d.samples);
+  T("fw",(d.fw||"?")+(d.build?"  \u00b7 built "+d.build:""));
+  var fwe=$("fw"); if(fwe&&d.build) fwe.setAttribute("data-tip",
+    "<b>Firmware "+d.fw+"</b><br>Compiled "+d.build+".<br><span class='tk'>Two flashes can carry the same "
+    +"version during development, so the build stamp is what actually identifies what is running.</span>");
   T("clk",d.time_ok?new Date(d.epoch*1000).toLocaleTimeString():"no NTP");
   var RF={armed:"armed",blocked:"present, no patterns",absent:"not detected",off:"disabled"};
   T("rfstat",RF[d.rf]||d.rf||"?");C("rfstat",(d.rf=="armed")?"#3fb950":(d.rf=="blocked"?"#d29922":"#8b949e"));
@@ -1752,6 +1912,23 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
     T("ltmv", d.lt_ref_ts?d.lt_mvph.toFixed(2):"--");
     T("ltref", d.lt_ref_ts?new Date(d.lt_ref_ts*1000).toLocaleString():"waiting 12 h after last run");
     T("ltrefv", d.lt_ref_ts?d.lt_ref_v.toFixed(2):"--");
+    // hourly-bucket regression: the span-of-the-whole-park number
+    if(d.hr_ok){
+      T("hrq","r\u00b2 "+d.hr_r2.toFixed(2));
+      C("hrq", d.hr_r2>=0.8?"#3fb950":(d.hr_r2>=0.5?"#d29922":"#f85149"));
+      T("hrn", d.hr_span_h+" h ("+d.hr_n+" pts)");
+    } else {
+      T("hrq", d.hr_buckets>0?("building ("+d.hr_buckets+" h)"):"no data yet");
+      C("hrq","#8b949e"); T("hrn", (d.hr_buckets||0)+" buckets stored");
+    }
+    TIP("hrq","<b>Fit quality (r\u00b2)</b><br>How well a straight line explains the hourly averages. "
+      +"1.00 is perfect; below ~0.5 the scatter swamps the trend and no ETA is reported at all."
+      +"<br><span class='tk'>"+(d.hr_ok?("Now "+d.hr_r2.toFixed(2)+" over "+d.hr_span_h+" h from "+d.hr_n
+      +" hourly points, temp coefficient "+d.hr_mvpc.toFixed(1)+" mV/degC."):"Not enough buckets yet.")+"</span>");
+    TIP("hrn","<b>Hours measured</b><br>One bucket per hour, each the average of ~60 samples, spanning the whole "
+      +"park since the engine last ran. Buckets persist to flash, so a reboot no longer resets the measurement."
+      +"<br><span class='tk'>The fit deliberately starts 12 h after shutdown - the first half-day is surface "
+      +"charge dissipating, not parasitic drain. "+(d.hr_buckets||0)+" buckets stored.</span>");
     // Actual calendar dates, not countdowns. as_eta_s is the canonical time to
     // auto-start (it respects enable/lockout and now sources the long-term
     // anchor), so the projected date is simply now + that.
@@ -2056,7 +2233,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2165,13 +2342,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=435"></script>
+<script src="/app.js?v=436"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2260,13 +2437,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=435"></script>
+<script src="/app.js?v=436"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2300,6 +2477,8 @@ const char VOLT_HTML[] PROGMEM = R"HTML(
 <div class="card"><div class="k">Long-term rate</div><div class="v"><span id="ltmv">--</span> mV/h</div></div>
 <div class="card"><div class="k">Baseline anchored</div><div class="v" style="font-size:13px" id="ltref">--</div></div>
 <div class="card"><div class="k">Baseline voltage</div><div class="v"><span id="ltrefv">--</span> V</div></div>
+<div class="card"><div class="k">Fit quality</div><div class="v"><span id="hrq">--</span></div></div>
+<div class="card"><div class="k">Hours measured</div><div class="v"><span id="hrn">--</span></div></div>
 <div class="card"><div class="k">Next auto-start</div><div class="v" style="font-size:15px" id="ltnext">--</div></div>
 <div class="card"><div class="k">Last auto-start</div><div class="v" style="font-size:15px" id="ltlastauto">--</div></div>
 <div class="card" style="grid-column:span 2"><div class="k">Last run &rarr; next auto-start</div>
@@ -2329,13 +2508,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=435"></script>
+<script src="/app.js?v=436"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2367,13 +2546,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=435"></script>
+<script src="/app.js?v=436"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2399,7 +2578,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=435"></script>
+<script src="/app.js?v=436"></script>
 </body></html>
 )HTML";
 
@@ -2456,7 +2635,9 @@ void handleJson() {
     "\"net_in\":%lu,\"net_out\":%lu,\"as_last\":%lu,\"last_run\":%lu,"
     "\"drain_ok\":%s,\"drain_mvph\":%.2f,\"drain_r2\":%.3f,\"drain_n\":%d,"
     "\"drain_win_s\":%lu,\"drain_days\":%.2f,\"drain_mvpc\":%.1f,"
-    "\"lt_ref_ts\":%lu,\"lt_ref_v\":%.2f,\"lt_mvph\":%.2f,\"lt_eta_s\":%ld}",
+    "\"lt_ref_ts\":%lu,\"lt_ref_v\":%.2f,\"lt_mvph\":%.2f,\"lt_eta_s\":%ld,"
+    "\"hr_ok\":%s,\"hr_n\":%d,\"hr_r2\":%.3f,\"hr_span_h\":%lu,\"hr_mvpc\":%.1f,"
+    "\"hr_buckets\":%d,\"build\":\"%s\"}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
@@ -2477,7 +2658,9 @@ void handleJson() {
     (unsigned long)g_lastStartTs, (unsigned long)g_lastRunTs,
     g_drain.ok ? "true" : "false", g_drain.mvph, g_drain.r2, g_drain.n,
     (unsigned long)g_drain.win_s, g_drain.days, g_drain.mv_per_c,
-    (unsigned long)g_ltRefTs, g_ltRefV, longTermMvph(v), longTermEtaS(v));
+    (unsigned long)g_ltRefTs, g_ltRefV, longTermMvph(v), longTermEtaS(v),
+    g_hfit.ok ? "true" : "false", g_hfit.n, g_hfit.r2,
+    (unsigned long)(g_hfit.span_s / 3600), g_hfit.mvpc, g_drN, FW_BUILD);
   g_out_total += strlen(json);
   server.send(200, "application/json", json);
 }
@@ -2983,7 +3166,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=435">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=436">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -3166,7 +3349,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=435"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=436"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -3308,6 +3491,10 @@ float smoothedVoltsRecent(int n) {
 // is only a fallback -- the smoothed average is used whenever history exists,
 // deliberately, so the reported rate barely moves between polls.
 float longTermMvph(float vFallback) {
+  // Prefer the hourly regression: it spans the whole park, averages 60 samples
+  // per point, and carries an r2 you can judge it by. The two-point anchor below
+  // is the fallback for the first hours of a park, before enough buckets exist.
+  if (g_hfit.ok && g_hfit.n >= DR_MIN_PTS) return g_hfit.mvph;
   if (!g_ltRefTs || !timeIsValid()) return 0.0f;
   uint32_t nowS = (uint32_t)time(nullptr);
   if (nowS <= g_ltRefTs + LT_MIN_S)  return 0.0f;
@@ -3320,6 +3507,8 @@ float longTermMvph(float vFallback) {
 long longTermEtaS(float vFallback) {
   float r = longTermMvph(vFallback);
   if (r >= -0.05f) return -1;                    // flat or rising -> no estimate
+  // A slope nobody should act on: too few points, or the scatter swamps it.
+  if (g_hfit.ok && g_hfit.n >= DR_MIN_PTS && g_hfit.r2 < 0.5f) return -1;
   float vNow = (hist && histCount > 2) ? smoothedVoltsRecent(LT_SMOOTH_N) : vFallback;
   float mv = (vNow - g_as_volts) * 1000.0f;      // smoothed here too, same reason
   if (mv <= 0) return 0;
@@ -3456,6 +3645,9 @@ void setup() {
   loadLogFromFlash();                              // replay pre-reboot log tail into the ring
   Serial.printf("Restored %d prior log lines from flash.\n", g_logCount);
   loadHistory();
+  g_dr = (DrainHour*)ps_malloc(DR_MAX * sizeof(DrainHour));   // ~18 KB in PSRAM
+  if (g_dr) { loadDrainFromFlash(); g_hfit = computeHourlyDrain(); }
+  else      { Serial.println("drain buckets: PSRAM alloc FAILED -- falling back to the 2-point anchor"); }
   Serial.printf("Loaded %d prior samples from flash.\n", histCount);
   loadStarts();
   Serial.printf("Loaded %d prior start events from flash.\n", g_startCount);
@@ -3679,6 +3871,7 @@ void loop() {
   loopMark("http");   server.handleClient();       // top suspect: a slow client on a weak link
   if (SNMP_ENABLED) { loopMark("snmp"); snmp.poll(); }
   loopMark("logflush"); flushLogToFlash();          // persist any new event-log lines (idle-cheap)
+  flushDrainToFlash();                              // and the hourly drain bucket, if one completed
   loopMark("loop");
   uint32_t now = millis();
 

@@ -82,6 +82,33 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-14 — fw 4.42: hovering a sparse graph now finds the nearest reading
+
+### Fixed
+Reported after flashing 4.41: only the 24 h range appeared to have per-point
+mouseover. The tooltip was working; there was simply almost nothing to hover.
+The week view holds **2 populated buckets out of 168**, so an exact-bucket hit
+was required across a graph that is 99 % empty, and `showTip` correctly hid
+itself everywhere else. Correct behaviour, unusable result.
+
+- **Hover snaps to the nearest populated bucket** (`nearestIdx`). The snap is
+  unbounded on purpose: the crosshair and dot move to whatever it landed on, so
+  which reading is shown is never ambiguous. Hovering the far left of a week
+  graph now reports the reading at bucket 166 rather than nothing.
+- **A series with nothing recorded says so.** `drain` has no hourly history at
+  all — the two surviving buckets came from the legacy conversion, which only
+  ever held voltage and temperature — so its canvas was simply blank, which reads
+  as broken. It now draws "not recorded for this range yet", and does not respond
+  to hover.
+- **A lone reading draws as a dot.** A polyline of one point renders nothing at
+  all, so a range containing exactly one bucket was invisible.
+
+Verified against a mock reproducing the live board exactly (2 trailing buckets of
+168, `drain` absent): far-left hover → index 166 with the tooltip shown, empty
+series → 807 lit pixels of placeholder text and `hoverIdx -1`, no exceptions.
+
+---
+
 ## 2026-08-14 — fw 4.40/4.41: week and month chart ranges, aggregated on the board
 
 ### Added — 24 h / 7 d / 30 d on every graph

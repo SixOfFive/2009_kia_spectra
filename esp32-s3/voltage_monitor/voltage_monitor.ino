@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.41";
+const char* FW_VERSION = "4.42";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -2123,6 +2123,8 @@ function fmtWhen(i){var t=AGT0+i*AGSTEP;if(t>1700000000){return new Date(t*1000)
 function drawChart(id){
   var ch=CHARTS[id];if(!ch)return;var c=$(id);if(!c)return;
   var x=c.getContext("2d"),W=c.width,Ht=c.height;x.clearRect(0,0,W,Ht);
+  if(ch.empty){x.fillStyle="#6e7681";x.font="12px system-ui";x.textAlign="center";
+    x.fillText("not recorded for this range yet",W/2,Ht/2+4);x.textAlign="left";return}
   var data=ch.data,N=data.length;if(N<2)return;var lo=ch.lo,hi=ch.hi;
   function gx(i){return PAD+i*(W-2*PAD)/(N-1)}function gy(v){return Ht-PAD-(v-lo)/(hi-lo)*(Ht-2*PAD)}
   if(ch.minmax){x.setLineDash([4,3]);x.lineWidth=1;x.font="11px system-ui";
@@ -2133,18 +2135,34 @@ function drawChart(id){
   x.strokeStyle=ch.color;x.lineWidth=1.5;x.beginPath();
   // Buckets with no data are null, not zero -- lift the pen rather than draw a
   // line through a gap, which would invent a reading that was never taken.
-  var pen=false;
+  var pen=false,nseg=0,lone=-1;
   data.forEach(function(v,i){if(v===null||v===undefined){pen=false;return;}
+    nseg++;lone=i;
     if(pen){x.lineTo(gx(i),gy(v))}else{x.moveTo(gx(i),gy(v));pen=true}});x.stroke();
+  if(nseg===1){x.fillStyle=ch.color;x.beginPath();x.arc(gx(lone),gy(data[lone]),3,0,6.2832);x.fill()}
   if(hoverIdx>=0&&hoverIdx<N&&data[hoverIdx]!==null&&data[hoverIdx]!==undefined){var hx=gx(hoverIdx),hy=gy(data[hoverIdx]);
     x.strokeStyle="#6e7681";x.lineWidth=1;x.beginPath();x.moveTo(hx,PAD);x.lineTo(hx,Ht-PAD);x.stroke();
     x.fillStyle=ch.color;x.beginPath();x.arc(hx,hy,3.5,0,6.2832);x.fill();}
 }
 function drawAll(){IDS.forEach(drawChart)}
-function idxFromEvent(ev,id){var ch=CHARTS[id];if(!ch||ch.data.length<2)return -1;
+// Nearest bucket that actually holds a reading. Long ranges are sparse until the
+// archive fills, so requiring an exact hit means no tooltip across almost the
+// whole graph -- which reads as "mouseover is broken" rather than "no data here".
+// The snap is unbounded on purpose: the crosshair and dot move to whatever it
+// landed on, so which reading is being shown is never ambiguous.
+function nearestIdx(data,i){
+  if(data[i]!==null&&data[i]!==undefined)return i;
+  for(var d=1;d<data.length;d++){
+    var a=i-d,b=i+d;
+    if(a>=0&&data[a]!==null&&data[a]!==undefined)return a;
+    if(b<data.length&&data[b]!==null&&data[b]!==undefined)return b;
+  }
+  return -1;
+}
+function idxFromEvent(ev,id){var ch=CHARTS[id];if(!ch||ch.empty||ch.data.length<2)return -1;
   var c=$(id),r=c.getBoundingClientRect(),W=c.width,N=ch.data.length;
   var xint=(ev.clientX-r.left)/r.width*W;var i=Math.round((xint-PAD)/((W-2*PAD)/(N-1)));
-  return Math.max(0,Math.min(N-1,i));}
+  return nearestIdx(ch.data,Math.max(0,Math.min(N-1,i)));}
 function showTip(ev,id){var ch=CHARTS[id];if(!ch||hoverIdx<0)return;
   var hv=ch.data[hoverIdx];if(hv===null||hv===undefined){var tp0=$("tip");if(tp0)tp0.style.display="none";return}
   H("tip","<b>"+hv.toFixed(ch.dec)+" "+ch.unit+"</b><br>"+fmtWhen(hoverIdx)
@@ -2189,11 +2207,13 @@ function loadHistory(){
       cols.forEach(function(c,ci){var v=f[ci+1];if(v!==undefined&&v!=="")series[c][bi]=+v;});}
     window.PAGE.charts.forEach(function(cfg){
       var data=series[cfg.col];if(!data)return;
+      var vals=data.filter(function(v){return v!==null});
+      if(!vals.length){
+        CHARTS[cfg.id]={data:data,empty:true,color:cfg.color,dec:cfg.dec,unit:cfg.unit,
+                        lo:0,hi:1,mn:0,mx:0,minmax:false};return}
       var e=ext[cfg.col],mn,mx;
       if(e){mn=e[0];mx=e[1]}
-      else{var vals=data.filter(function(v){return v!==null});
-           if(!vals.length){CHARTS[cfg.id]=null;return}
-           mn=Math.min.apply(null,vals);mx=Math.max.apply(null,vals)}
+      else{mn=Math.min.apply(null,vals);mx=Math.max.apply(null,vals)}
       // Scale to cover the dashed lines too, or they land off-canvas.
       var lo=mn,hi=mx;if(hi-lo<1e-6){hi+=1;lo-=1}
       if(cfg.anchor0){lo=0;hi=Math.max(cfg.floor||10,hi)}
@@ -2607,7 +2627,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2716,13 +2736,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=441"></script>
+<script src="/app.js?v=442"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2811,13 +2831,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=441"></script>
+<script src="/app.js?v=442"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2882,13 +2902,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=441"></script>
+<script src="/app.js?v=442"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2920,13 +2940,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=441"></script>
+<script src="/app.js?v=442"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2952,7 +2972,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=441"></script>
+<script src="/app.js?v=442"></script>
 </body></html>
 )HTML";
 
@@ -3676,7 +3696,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=441">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=442">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -3859,7 +3879,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=441"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

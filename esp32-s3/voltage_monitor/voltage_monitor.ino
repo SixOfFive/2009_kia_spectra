@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.45";
+const char* FW_VERSION = "4.46";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -330,6 +330,67 @@ struct HourAgg {
 
 struct HourFit   { bool ok; float mvph; float r2; int n; uint32_t span_s; float mvpc; };
 HourFit g_hfit = {false, 0, 0, 0, 0, 0};
+
+// ---- Run history ----------------------------------------------------------
+// Engine starts, stops and failed attempts ONLY, kept separately from the event
+// log because they answer a different question over a much longer window: how
+// long does this car sit between runs, and how often does a start not take?
+// The event log rotates at 48 KB x 2 and would lose that inside a fortnight.
+//
+// 16 B per event, appended, two generations of 2000 -- roughly 4000 events, or
+// years at the handful per day this car produces.
+enum { RUN_CMD = 0, RUN_ON = 1, RUN_OFF = 2, RUN_FAIL = 3 };
+enum { RSRC_AUTO = 0, RSRC_MANUAL = 1, RSRC_EXT = 2 };
+struct RunEvent {
+  uint32_t ts;                 // unix epoch (0 = clock not yet valid; dropped)
+  uint8_t  kind, src, flags;   // flags bit0 on RUN_CMD = the CC1101 accepted the burst
+  uint8_t  _rsv;
+  float    v;                  // battery volts at the event
+  uint32_t dur_s;              // RUN_OFF: how long it ran; otherwise 0
+};
+const uint8_t  RUN_F_TX_OK    = 0x01;         // the CC1101 accepted the burst
+const uint8_t  RUN_F_BACKFILL = 0x80;         // reconstructed, NOT recorded live
+const char*    RUN_FILE = "/runs.bin";
+const char*    RUN_OLD  = "/runs.old";
+const uint32_t RUN_MAGIC = 0x52554E31;        // "RUN1"
+const int      RUN_ROTATE = 2000;             // records per generation
+
+// One-time reconstruction, written only if no run file exists at all.
+//
+// The run history starts empty because nothing durable ever recorded engine
+// events -- that is the gap this feature closes. These entries are recovered
+// from other evidence and are flagged RUN_F_BACKFILL so the dashboard marks them
+// as reconstructed; they must never be mistaken for live records.
+//
+// Provenance:
+//   2026-08-08 16:52  the value of `last_run` in NVS, read off /json on 08-14/15
+//                     before the 08-15 run overwrote it. Auto-start had never
+//                     fired at that point, so the source was the key or the FOB.
+//                     No end time was ever stored, so there is no matching OFF.
+//   2026-08-15        the first automatic start. Timestamps and voltages cross-
+//                     checked against the /starts ring (1786806639, 1786808727)
+//                     and last_run (1786808746); the derived times agree exactly.
+//
+// Anything older is genuinely unrecoverable: the 1000-line log ring had already
+// rolled back only as far as 08:21 that morning, and the sample ring holds 24 h.
+struct RunSeed { uint32_t ts; uint8_t kind, src, flags; float v; uint32_t dur; };
+const RunSeed RUN_SEED[] = {
+  { 1786229571, RUN_ON,   RSRC_EXT,  RUN_F_BACKFILL,                  0.00f,    0 },
+  { 1786806639, RUN_CMD,  RSRC_AUTO, RUN_F_BACKFILL | RUN_F_TX_OK,   12.14f,    0 },
+  { 1786806819, RUN_FAIL, RSRC_AUTO, RUN_F_BACKFILL,                 12.16f,  180 },
+  { 1786808727, RUN_CMD,  RSRC_AUTO, RUN_F_BACKFILL | RUN_F_TX_OK,   12.16f,    0 },
+  { 1786808746, RUN_ON,   RSRC_AUTO, RUN_F_BACKFILL,                 13.29f,    0 },
+  { 1786810288, RUN_OFF,  RSRC_AUTO, RUN_F_BACKFILL,                 12.89f, 1541 },
+};
+const int RUN_SEED_N = sizeof(RUN_SEED) / sizeof(RUN_SEED[0]);
+
+// The engine edges are detected on the safety task (core 0), which must never
+// touch the filesystem. Queue here, let the loop write. A ring rather than a
+// single slot because a fire and its ENGINE ON can land close together.
+const int      RUNQ_N = 8;
+RunEvent       g_runq[RUNQ_N];
+volatile int   g_runqHead = 0, g_runqTail = 0;
+static portMUX_TYPE g_runqMux = portMUX_INITIALIZER_UNLOCKED;
 
 // The single place a Sample is mapped onto the series vector. Both the hourly
 // accumulator and /agg's day span go through here, so they cannot drift apart.
@@ -1448,6 +1509,64 @@ static void logRingPush(const char* line) {
 
 // Append any ring lines not yet on flash. LOOP-CORE ONLY (single-threaded file
 // I/O). Cheap when idle -- the fast path returns before taking the lock.
+// Write the reconstruction, once, if there is no run history at all yet.
+void seedRunHistory() {
+  if (LittleFS.exists(RUN_FILE) || LittleFS.exists(RUN_OLD)) return;
+  File f = LittleFS.open(RUN_FILE, FILE_WRITE);
+  if (!f) return;
+  uint32_t m = RUN_MAGIC, r = (uint32_t)sizeof(RunEvent);
+  f.write((uint8_t*)&m, 4); f.write((uint8_t*)&r, 4);
+  for (int i = 0; i < RUN_SEED_N; i++) {
+    RunEvent e;
+    e.ts = RUN_SEED[i].ts; e.kind = RUN_SEED[i].kind; e.src = RUN_SEED[i].src;
+    e.flags = RUN_SEED[i].flags; e._rsv = 0;
+    e.v = RUN_SEED[i].v; e.dur_s = RUN_SEED[i].dur;
+    f.write((uint8_t*)&e, sizeof(RunEvent));
+  }
+  f.close();
+  g_fsBytes += 8 + sizeof(RunEvent) * RUN_SEED_N; g_fsCommits++;
+  logLine("run history seeded with %d reconstructed events (marked as such)", RUN_SEED_N);
+}
+
+// Queue a run event. Safe from either core: RAM only, no allocation.
+void runLog(uint8_t kind, uint8_t src, float v, uint32_t dur_s, uint8_t flags) {
+  if (!timeIsValid()) return;                 // an event with no date is not worth keeping
+  RunEvent e;
+  e.ts = (uint32_t)time(nullptr);
+  e.kind = kind; e.src = src; e.flags = flags; e._rsv = 0;
+  e.v = v; e.dur_s = dur_s;
+  portENTER_CRITICAL(&g_runqMux);
+  int nxt = (g_runqHead + 1) % RUNQ_N;
+  if (nxt != g_runqTail) { g_runq[g_runqHead] = e; g_runqHead = nxt; }   // full -> drop, never block
+  portEXIT_CRITICAL(&g_runqMux);
+}
+
+// Drain the queue to flash. LOOP CORE ONLY.
+void flushRunsToFlash() {
+  for (;;) {
+    RunEvent e;
+    portENTER_CRITICAL(&g_runqMux);
+    bool has = (g_runqTail != g_runqHead);
+    if (has) { e = g_runq[g_runqTail]; g_runqTail = (g_runqTail + 1) % RUNQ_N; }
+    portEXIT_CRITICAL(&g_runqMux);
+    if (!has) return;
+
+    bool fresh = !LittleFS.exists(RUN_FILE);
+    File f = LittleFS.open(RUN_FILE, FILE_APPEND);
+    if (!f) return;
+    if (fresh) { uint32_t m = RUN_MAGIC, r = (uint32_t)sizeof(RunEvent);
+                 f.write((uint8_t*)&m, 4); f.write((uint8_t*)&r, 4); }
+    f.write((uint8_t*)&e, sizeof(RunEvent));
+    size_t sz = f.size();
+    f.close();
+    g_fsBytes += sizeof(RunEvent) + (fresh ? 8 : 0); g_fsCommits++;
+    if (sz >= 8 + (size_t)RUN_ROTATE * sizeof(RunEvent)) {
+      LittleFS.remove(RUN_OLD);
+      LittleFS.rename(RUN_FILE, RUN_OLD);
+    }
+  }
+}
+
 // Append the one pending hourly bucket. Loop core only -- same rule as the
 // event log: the safety task must never touch LittleFS.
 void flushDrainToFlash() {
@@ -1731,6 +1850,10 @@ void evalAutoStart(float v) {
     g_lastRunTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
     if (g_lastRunTs) prefs.putUInt("last_run", g_lastRunTs);
     logLine("ENGINE ON: alternator charging at %.2f V", v);
+    // Attribute the run: a start we are verifying is ours, anything else is the
+    // key or the FOB. This is what makes "time between manual and auto starts"
+    // answerable months later.
+    runLog(RUN_ON, g_verifying ? (g_verifyAuto ? RSRC_AUTO : RSRC_MANUAL) : RSRC_EXT, v, 0, 0);
     g_sbFlush = true;                             // don't strand the transition in RAM
     // The engine is running but WE did not ask for it -- key, FOB or someone
     // else. Record it in the start history so the log is a complete account of
@@ -1753,6 +1876,7 @@ void evalAutoStart(float v) {
     uint32_t ran = (millis() - engOnMs) / 1000;
     logLine("ENGINE OFF: charging ended at %.2f V after %lum %lus",
             v, (unsigned long)(ran / 60), (unsigned long)(ran % 60));
+    runLog(RUN_OFF, RSRC_EXT, v, ran, 0);
     g_sbFlush = true;                             // ditto -- this edge starts the drain clock
     if (timeIsValid()) {                          // arm the settled reference
       g_ltDue = (uint32_t)time(nullptr) + LT_SETTLE_S;
@@ -1823,11 +1947,13 @@ void evalAutoStart(float v) {
                       (unsigned long)AS_VERIFY_S);
         logLine("manual start UNVERIFIED: no charging after %lus (not counted toward lockout)",
                 (unsigned long)AS_VERIFY_S);
+        runLog(RUN_FAIL, RSRC_MANUAL, v, AS_VERIFY_S, 0);
       } else {
         if (g_asFails < 255) g_asFails++;
         prefs.putUChar("as_fails", g_asFails);
         Serial.printf("auto-start: no charging after %lu s -- fail %u of %u\n",
                       (unsigned long)AS_VERIFY_S, g_asFails, g_as_maxfails);
+        runLog(RUN_FAIL, RSRC_AUTO, v, AS_VERIFY_S, 0);
         logLine("auto-start FAILED: no charging after %lus -- fail %u of %s, next attempt in %lus",
                 (unsigned long)AS_VERIFY_S, g_asFails,
                 g_as_maxfails ? String(g_as_maxfails).c_str() : "off",
@@ -1902,6 +2028,7 @@ void evalAutoStart(float v) {
   // happened that survives to /logtext and across a reboot.
   logLine("*** AUTO-START FIRED at %.2f V -- RF transmit %s, waiting %lus for charge ***",
           v, sent ? "ok" : "FAILED", (unsigned long)AS_VERIFY_S);
+  runLog(RUN_CMD, RSRC_AUTO, v, 0, sent ? 1 : 0);
 }
 
 // ---------- safety task + watchdog ----------
@@ -2689,7 +2816,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=445"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2806,13 +2933,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=445"></script>
+<script src="/app.js?v=446"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=445"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2901,13 +3028,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=445"></script>
+<script src="/app.js?v=446"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=445"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2972,13 +3099,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=445"></script>
+<script src="/app.js?v=446"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=445"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3010,13 +3137,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=445"></script>
+<script src="/app.js?v=446"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=445"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3042,7 +3169,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=445"></script>
+<script src="/app.js?v=446"></script>
 </body></html>
 )HTML";
 
@@ -3350,6 +3477,7 @@ void handleTransmit() {
                                       RF_START_DATAREPS, RF_START_BURSTS, RF_GUARD_MS,
                                       RF_START_PKT_GAP_MS, RF_TAIL_CARRIER_MS);
     beginVerify(recordStart(g_lastV, 1, sent), false);   // log the attempt
+    runLog(RUN_CMD, RSRC_MANUAL, g_lastV, 0, sent ? 1 : 0);
   } else {
     sent = radio.transmitButton(pattern, RF_REPEATS, RF_GUARD_MS);
   }
@@ -3768,7 +3896,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=445">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=446">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -3777,6 +3905,14 @@ void handleLogsPage() {
 .pg button:disabled{opacity:.4;cursor:default}
 .pg .k{color:var(--mut);font-size:13px}
 select.inp{width:auto}
+table.rh{border-collapse:collapse;width:100%;font-size:12.5px}
+table.rh td,table.rh th{padding:6px 10px;border-bottom:1px solid #1c2128;white-space:nowrap;text-align:left}
+table.rh th{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.07em;font-weight:600}
+table.rh tr.gap td{background:#0d1117;color:var(--mut);font-style:italic}
+.pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;border:1px solid}
+.p-on{color:#3fb950;border-color:#238636}.p-off{color:#8b949e;border-color:#30363d}
+.p-cmd{color:#58a6ff;border-color:#1f6feb}.p-fail{color:#f85149;border-color:#da3633}
+.bf{color:#d29922;font-size:11px;margin-left:6px}
 </style></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Event Log</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3810,6 +3946,14 @@ select.inp{width:auto}
 </div>
 </div>
 <footer>newest first &middot; 25 lines/page &middot; persisted to flash, survives reboot</footer>
+<div class="clbl" style="margin-top:30px">Run history &mdash; every start, stop and failed attempt</div>
+<div class="k" style="margin:0 0 8px;text-transform:none;letter-spacing:0;line-height:1.6">
+Kept separately from the log above and never rotated out with it, so this answers how long the car sits between
+runs going back months. <span id="rhcount"></span>
+</div>
+<div style="overflow-x:auto"><table id="rhtab" class="rh"><tbody><tr><td class="k">loading&hellip;</td></tr></tbody></table></div>
+<div class="pg"><span class="k" id="rhnote"></span><button id="rhmore" style="margin-left:auto">Load more</button></div>
+
 <script>
 function $(i){return document.getElementById(i)}
 var PS=25, page=0, total=0, timer=null;
@@ -3843,6 +3987,49 @@ $("prev").onclick=$("prev2").onclick=function(){if(page>0){page--;load();window.
 $("next").onclick=$("next2").onclick=function(){page++;load();window.scrollTo(0,0)};
 $("refresh").onclick=load;
 $("iv").onchange=function(){setIv(+this.value)};
+
+// ---- run history ---------------------------------------------------------
+// Rows arrive oldest-first and render newest-first, with an explicit "sat for"
+// row between a shutdown and the next start -- the number this table exists to
+// make visible.
+var rhN=100;
+function fmtDur(x){ if(x<0)return "--";
+  var d=Math.floor(x/86400),h=Math.floor(x%86400/3600),m=Math.floor(x%3600/60),sec=Math.floor(x%60);
+  if(d)return d+"d "+h+"h"; if(h)return h+"h "+m+"m"; if(m)return m+"m "+sec+"s"; return sec+"s"; }
+var KIND=[["Start sent","p-cmd"],["Engine ON","p-on"],["Engine OFF","p-off"],["No start","p-fail"]];
+var SRC=["auto","manual","key / FOB"];
+function loadRuns(){
+  fetch("/runs?n="+rhN,{cache:"no-store"}).then(function(r){return r.text()}).then(function(t){
+    var ln=t.replace(/\s+$/,"").split("\n");
+    var m=/n=(\d+),total=(\d+)/.exec(ln[0]||""); if(!m)return;
+    var shown=+m[1],tot=+m[2],rows=[];
+    for(var i=1;i<ln.length;i++){var f=ln[i].split(","); if(f.length<6)continue;
+      rows.push({ts:+f[0],kind:+f[1],src:+f[2],flags:+f[3],v:+f[4],dur:+f[5]});}
+    $("rhcount").textContent=tot?("Showing "+shown+" of "+tot+" events."):"";
+    $("rhmore").style.display=(shown<tot)?"":"none";
+    if(!rows.length){$("rhtab").innerHTML='<tbody><tr><td class="k">no runs recorded yet</td></tr></tbody>';return}
+    var h='<thead><tr><th>When</th><th>Event</th><th>Source</th><th>Volts</th><th>Detail</th></tr></thead><tbody>';
+    for(var i=rows.length-1;i>=0;i--){
+      var r=rows[i],k=KIND[r.kind]||["?","p-off"];
+      if(r.kind===1||r.kind===0){
+        for(var j=i-1;j>=0;j--){ if(rows[j].kind===2){
+          h+='<tr class="gap"><td colspan="5">&darr; sat '+fmtDur(r.ts-rows[j].ts)+' between runs</td></tr>'; break;}
+          if(rows[j].kind===1)break; }
+      }
+      var det="";
+      if(r.kind===2)det="ran "+fmtDur(r.dur);
+      else if(r.kind===3)det="no charge after "+fmtDur(r.dur);
+      else if(r.kind===0)det=(r.flags&1)?"RF sent ok":"RF transmit FAILED";
+      h+='<tr><td>'+new Date(r.ts*1000).toLocaleString()
+        +(r.flags&128?'<span class="bf" title="reconstructed from other evidence, not recorded live">reconstructed</span>':'')
+        +'</td><td><span class="pill '+k[1]+'">'+k[0]+'</span></td><td>'+(SRC[r.src]||"?")
+        +'</td><td>'+(r.v>0?r.v.toFixed(2)+" V":"--")+'</td><td>'+det+'</td></tr>';
+    }
+    $("rhtab").innerHTML=h+'</tbody>';
+  }).catch(function(e){});
+}
+$("rhmore").onclick=function(){rhN=Math.min(1000,rhN*3);loadRuns()};
+loadRuns();
 document.querySelectorAll("nav.tabs a").forEach(function(a){if(a.getAttribute("data-p")===location.pathname)a.classList.add("on")});
 var iv=5; try{if(localStorage.vroomLogIv!==undefined)iv=+localStorage.vroomLogIv;}catch(e){}
 $("iv").value=iv; setIv(iv); load();
@@ -3850,6 +4037,64 @@ $("iv").value=iv; setIv(iv); load();
 </body></html>)HTML";
   g_out_total += strlen_P(PAGE);
   server.send_P(200, "text/html; charset=utf-8", PAGE);
+}
+
+// GET /runs[?n=N] -- the run history, newest LAST, as compact CSV.
+// Separate from /logtext because it answers a different question over a much
+// longer window: how long does this car sit between runs, and how often does a
+// start not take? Sends at most N records (default 200, cap 1000) so a months-
+// deep history never becomes a megabyte transfer on this link.
+//   ts,kind,src,flags,v,dur
+//   kind 0=command 1=engine-on 2=engine-off 3=no-start
+//   src  0=auto 1=manual 2=external(key/FOB)
+//   flags bit0 = RF accepted, bit7 = reconstructed rather than recorded
+void handleRuns() {
+  trackReq();
+  boundSendStall();
+  long want = server.hasArg("n") ? server.arg("n").toInt() : 200;
+  if (want < 1) want = 1;
+  if (want > 1000) want = 1000;
+
+  auto recs = [](const char* p) -> long {
+    if (!LittleFS.exists(p)) return 0;
+    File f = LittleFS.open(p, FILE_READ);
+    if (!f) return 0;
+    long n = (f.size() >= 8) ? (long)((f.size() - 8) / sizeof(RunEvent)) : 0;
+    f.close();
+    return n;
+  };
+  long nOld = recs(RUN_OLD), nNew = recs(RUN_FILE), total = nOld + nNew;
+  long takeNew = (want < nNew) ? want : nNew;
+  long takeOld = want - takeNew; if (takeOld > nOld) takeOld = nOld;
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  String hdr = "#n=" + String(takeOld + takeNew) + ",total=" + String(total) + "\n";
+  g_out_total += hdr.length(); server.sendContent(hdr);
+
+  String chunk; chunk.reserve(1024);
+  auto emit = [&](const char* path, long skip, long take) {
+    if (take <= 0 || !LittleFS.exists(path)) return;
+    File f = LittleFS.open(path, FILE_READ);
+    if (!f) return;
+    f.seek(8 + skip * sizeof(RunEvent));
+    RunEvent e;
+    for (long i = 0; i < take && f.read((uint8_t*)&e, sizeof(RunEvent)) == (int)sizeof(RunEvent); i++) {
+      char b[80];
+      snprintf(b, sizeof(b), "%lu,%u,%u,%u,%.2f,%lu\n",
+               (unsigned long)e.ts, e.kind, e.src, e.flags, (double)e.v, (unsigned long)e.dur_s);
+      chunk += b;
+      if (chunk.length() > 1200) {
+        if (!waitWritable(4000)) break;
+        g_out_total += chunk.length(); server.sendContent(chunk); chunk = ""; esp_task_wdt_reset();
+      }
+    }
+    f.close();
+  };
+  emit(RUN_OLD,  nOld - takeOld, takeOld);
+  emit(RUN_FILE, nNew - takeNew, takeNew);
+  if (chunk.length()) { g_out_total += chunk.length(); server.sendContent(chunk); }
+  server.sendContent("");
 }
 
 // POST /autostart?en=0|1&volts=12.2&hold=60&cool=7200
@@ -3969,7 +4214,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=445"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -4270,6 +4515,7 @@ void setup() {
   g_dr = (HourAgg*)ps_malloc(DR_MAX * sizeof(HourAgg));       // ~204 KB in PSRAM
   if (g_dr) { loadDrainFromFlash(); g_hfit = computeHourlyDrain(); }
   else      { Serial.println("drain buckets: PSRAM alloc FAILED -- falling back to the 2-point anchor"); }
+  seedRunHistory();                                // one-time, no-op once a run file exists
   Serial.printf("Loaded %d prior samples from flash.\n", histCount);
   loadStarts();
   Serial.printf("Loaded %d prior start events from flash.\n", g_startCount);
@@ -4359,6 +4605,7 @@ void setup() {
   server.on("/powerup", HTTP_POST, handlePowerup);
   server.on("/logs", HTTP_GET, handleLogsPage);
   server.on("/logtext", HTTP_GET, handleLogText);
+  server.on("/runs",    HTTP_GET, handleRuns);
   server.on("/logpage", HTTP_GET, handleLogPage);   // server-side paged log (25/req)
   server.on("/autostart", HTTP_POST, handleAutoStart);
   server.on("/starts", HTTP_GET, handleStarts);
@@ -4495,6 +4742,7 @@ void loop() {
   if (SNMP_ENABLED) { loopMark("snmp"); snmp.poll(); }
   loopMark("logflush"); flushLogToFlash();          // persist any new event-log lines (idle-cheap)
   flushDrainToFlash();                              // and the hourly drain bucket, if one completed
+  flushRunsToFlash();                               // and any engine start/stop events
   loopMark("loop");
   uint32_t now = millis();
 

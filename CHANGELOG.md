@@ -82,6 +82,79 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-15 — fw 4.46: a dedicated run history, kept for years
+
+### Added — engine starts, stops and failed attempts in their own log
+The event log answers "what happened recently" and rotates at 48 KB × 2, which
+on this board is under a fortnight. "How long does this car sit between runs, and
+how often does a start not take?" needs months. Those are different retention
+problems, so they now have different stores.
+
+`/runs.bin` + `/runs.old`, **16 B per event**, two generations of 2000 — roughly
+4000 events, or years at the handful per day this car produces. Recorded:
+
+| kind | when |
+|---|---|
+| `Start sent` | a burst was transmitted (flag records whether the CC1101 accepted it) |
+| `Engine ON` | alternator came up, attributed **auto / manual / key-FOB** |
+| `Engine OFF` | charging ended, with the run length |
+| `No start` | fired, no charging inside the verification window |
+
+Attribution is what makes "time between manual and auto starts" answerable later:
+a start being verified is ours, anything else is the key or the FOB.
+
+Engine edges are detected on the safety task (core 0), which must never touch the
+filesystem, so `runLog()` queues into an 8-slot ring under its own `portMUX` and
+the loop drains it — the same split already used for the drain buckets and the
+sample journal. A full queue drops rather than blocks.
+
+`GET /runs?n=N` returns newest-last CSV, default 200, capped at 1000, streamed
+from the file tail so a months-deep history is never a megabyte transfer.
+
+### Added — the run history section on the Logs tab
+A table below the event log: when, event, source, volts, detail — plus an
+explicit **"sat 6d 17h between runs"** row inserted between a shutdown and the
+next start, which is the number the whole feature exists to surface.
+
+### Added — one-time backfill of what could be recovered
+The history would otherwise start empty. Six events were reconstructed and are
+written **flagged `RUN_F_BACKFILL`**, shown as *reconstructed* in the table, so
+they can never be mistaken for live records:
+
+```
+08/08 16:52:51  Engine ON   key / FOB      --      <- last_run in NVS
+15/08 09:10:39  Start sent  auto       12.14 V  RF sent ok
+15/08 09:13:39  No start    auto       12.16 V  no charge after 3m
+15/08 09:45:27  Start sent  auto       12.16 V  RF sent ok
+15/08 09:45:46  Engine ON   auto       13.29 V
+15/08 10:11:28  Engine OFF  auto       12.89 V  ran 25m 41s
+```
+
+Provenance is recorded in source beside the table. The 08-08 entry is the value
+of `last_run` read off `/json` before the 08-15 run overwrote it — auto-start had
+never fired by then, so the source was the key or the FOB, and no end time was
+ever stored. The 08-15 timestamps were derived independently and **cross-check
+exactly** against the `/starts` ring (`1786806639`, `1786808727`) and `last_run`
+(`1786808746`).
+
+**Nothing older is recoverable.** The 1000-line log ring had already rolled back
+only as far as 08:21 that morning, the sample ring holds 24 h, and the hourly
+archive 22 h. The board never stored engine events durably — which is precisely
+the gap this release closes.
+
+### Verified
+`/runs` returns all six with flags `128`/`129`; the table renders them newest
+first with the reconstructed marker; boot logged `run history seeded with 6
+reconstructed events (marked as such)`, and the seed is a no-op once a run file
+exists.
+
+**Not yet exercised:** the live path. The seed writes the file directly, so
+`runLog()` → queue → `flushRunsToFlash()` only runs on a real engine event. Same
+position the drain buckets were in after 4.36 — it will prove itself on the next
+start, and the first live row is the one to check.
+
+---
+
 ## 2026-08-15 — fw 4.45: a separate, adjustable retry gap for starts that drew no charge
 
 ### Changed — the cooldown was governing two different risks

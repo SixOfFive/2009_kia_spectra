@@ -82,6 +82,59 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-15 — fw 4.45: a separate, adjustable retry gap for starts that drew no charge
+
+### Changed — the cooldown was governing two different risks
+`as_cool` applied equally to "the engine ran, don't fire again yet" and "the
+engine never started, try again". Those are opposite situations:
+
+- After a **verified** start the engine is running. Firing again would *toggle it
+  off* — the 1WG3R start is a toggle — and waste fuel. A long gap is correct.
+- After an **unverified** start there is positive evidence the engine is not
+  running: no charging within `AS_VERIFY_S`. A further burst cannot toggle
+  anything off, and waiting a full cooldown just drains the battery.
+
+`POST /autostart?retry=N` (60–86400 s, NVS `as_retry`, default **300 s**), with a
+**Retry after no-start** field on the dashboard. `/json` reports both `as_retry`
+and `as_gap` — the gap actually in force right now.
+
+Selection is on `g_asFails > 0`, which is non-zero exactly when the last
+automatic start produced no charging, and is reset the moment one verifies.
+
+### Fixed — the retry gap alone would not have worked
+Investigating the 2026-08-15 failure properly showed the cooldown was **never the
+governing limit**. After a failed start `g_needRearm` stays set, and re-arming
+requires the battery to climb to `trigger + 0.15 V` and hold it for 600 s — a bar
+an *uncharged* battery never reaches, because nothing charged it. So the retry
+was actually released by the `AS_REARM_MAX_COOLDOWNS` escape hatch at
+**2 × 900 s = 30 min**, which matches the observed ~35 minute gap far better than
+the 900 s cooldown does.
+
+Shipping a retry gap without addressing that would have changed a number nobody
+was waiting on. So a start that fails verification now also clears the re-arm
+requirement:
+
+```cpp
+g_needRearm = false; g_rearmS = 0;
+```
+
+Safe by the same evidence: no charging within 180 s means the engine is not
+running, so a further burst cannot toggle a running engine off. Park-confirm, the
+fail streak, the lockout and the 24 h cap all still apply, and the re-arm
+hysteresis is untouched for starts that *did* work — which is the case it was
+written for (a battery sitting just above the trigger re-firing every cooldown).
+
+### Verified live
+`as_retry 300` / `as_cool 900` / `as_gap 900` with `as_fails 0` — the verified
+path selected correctly. `retry=30` rejected with
+`{"ok":false,"detail":"retry must be 60-86400 s"}`; `retry=600` accepted and
+`as_gap` correctly stayed at 900 because the last start verified.
+
+The cooldown tooltip now shows both gaps, which one is in force, and why they
+differ.
+
+---
+
 ## 2026-08-15 — fw 4.44: adjustable lockout limit, after the first real auto-start
 
 ### The first auto-start ever fired — and the first attempt missed

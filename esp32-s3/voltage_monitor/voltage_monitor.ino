@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.43";
+const char* FW_VERSION = "4.44";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -240,7 +240,7 @@ const float    AS_REARM_MARGIN  = 0.15f;    // must recover to (threshold + this
 const uint32_t AS_REARM_S       = 600;      // ...and hold it this long
 const uint8_t  AS_REARM_MAX_COOLDOWNS = 2;  // after this many cooldowns, re-arm anyway
 const uint32_t AS_VERIFY_S      = 180;      // after firing, expect charging within this
-const uint8_t  AS_MAX_FAILS     = 2;        // consecutive unverified starts -> lockout
+const uint8_t  AS_DEF_MAX_FAILS = 2;        // consecutive unverified starts -> lockout (default)
 // Optional cap on auto-starts per rolling 24 h. 0 (or any value <= 0) means
 // UNLIMITED, which is the default: if the battery genuinely needs starting six
 // times in a cold night, refusing on the seventh is its own kind of failure.
@@ -791,6 +791,13 @@ bool      g_verifyAuto  = false;           // was the pending start automatic? (
 uint32_t  g_win24Ms     = 0;               // millis() at the start of the rolling 24 h window
 uint8_t   g_fires24     = 0;               // auto-starts fired in that window (informational)
 int       g_as_max24    = AS_DEF_MAX24;    // cap per 24 h; <= 0 = unlimited  NVS "as_max24"
+// Consecutive unverified starts before the lockout latches. Adjustable because
+// the RF link to the Compustar is probabilistic, not binary: 2026-08-15 saw the
+// first attempt draw no crank at all (battery flat at 12.17 V three seconds
+// after a tx=ok burst) and the retry 35 min later bring the alternator up in
+// 19 s. A fixed 2 turns two unlucky bursts into a latched lockout on a car that
+// starts perfectly well. 0 disables the latch entirely.  NVS "as_maxf"
+uint8_t   g_as_maxfails = AS_DEF_MAX_FAILS;
 
 // One logged engine-start event. Written through to flash immediately so a
 // start is never lost to the brownout that a cranking engine can cause.
@@ -1792,14 +1799,16 @@ void evalAutoStart(float v) {
         if (g_asFails < 255) g_asFails++;
         prefs.putUChar("as_fails", g_asFails);
         Serial.printf("auto-start: no charging after %lu s -- fail %u of %u\n",
-                      (unsigned long)AS_VERIFY_S, g_asFails, AS_MAX_FAILS);
-        logLine("auto-start FAILED: no charging after %lus -- fail %u of %u, next attempt in %lus",
-                (unsigned long)AS_VERIFY_S, g_asFails, AS_MAX_FAILS, (unsigned long)g_as_cool);
-        if (g_asFails >= AS_MAX_FAILS) {        // it isn't going to start; stop cranking it
+                      (unsigned long)AS_VERIFY_S, g_asFails, g_as_maxfails);
+        logLine("auto-start FAILED: no charging after %lus -- fail %u of %s, next attempt in %lus",
+                (unsigned long)AS_VERIFY_S, g_asFails,
+                g_as_maxfails ? String(g_as_maxfails).c_str() : "off",
+                (unsigned long)g_as_cool);
+        if (g_as_maxfails && g_asFails >= g_as_maxfails) {   // it isn't going to start; stop cranking it
           g_asLock = true; prefs.putBool("as_lock", true);
           Serial.println("*** auto-start LOCKED OUT after repeated failed starts ***");
           logLine("*** auto-start LOCKED OUT after %u failed starts -- will not fire again until cleared ***",
-                  AS_MAX_FAILS);
+                  g_as_maxfails);
         }
       }
     }
@@ -2429,19 +2438,24 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
         ?("Capped at "+d.as_max24+" per 24 h - further starts are refused until the window rolls.")
         :"No cap set (0 = unlimited). The real runaway guard is the lockout below, not this counter.")+"</span>");
 
+    var mf=(d.as_maxfails===undefined)?2:d.as_maxfails;
     TIP("asfail","<b>Fail streak</b><br>Consecutive automatic starts that produced <i>no charging voltage</i> within "
-      +"180 s - meaning the engine did not actually catch.<br><span class='tk'>Now "+(d.as_fails||0)+" of 2. "
-      +"Reaching 2 latches the lockout. Any start that does bring the alternator up resets this to zero.</span>");
+      +"180 s - meaning the engine did not actually catch.<br><span class='tk'>Now "+(d.as_fails||0)
+      +(mf?(" of "+mf+". Reaching "+mf+" latches the lockout."):". Latching is disabled (0), so it will keep retrying.")
+      +" Any start that does bring the alternator up resets this to zero.</span>");
 
-    TIP("aslock","<b>Lockout</b> - the runaway guard.<br>It latches <b>ON</b> after <b>2 consecutive</b> automatic "
+    TIP("aslock","<b>Lockout</b> - the runaway guard.<br>It latches <b>ON</b> after <b>"+(mf||"-")+" consecutive</b> automatic "
       +"starts that drew no charge, i.e. the board sent Start and the engine never ran. While latched, auto-start "
       +"will not fire at all and any countdown is abandoned immediately."
+      +(mf?"":"<br><b>Latching is currently OFF</b> (fails to lock out = 0), so nothing will stop it retrying.")
       +"<br><br><span class='tk'>Right now: <b>"+(d.as_lock?"LATCHED - auto-start is disabled":"no")+"</b>"
-      +" (fail streak "+(d.as_fails||0)+" of 2).<br>"
+      +" (fail streak "+(d.as_fails||0)+(mf?(" of "+mf):"")+").<br>"
       +(d.as_lock
         ? "Clear it with the <b>Clear lockout</b> button - but find out why the engine did not catch first. A dead "
-          +"starter, no fuel, or an RF problem will simply repeat."
-        : "It would trip if the next 2 automatic starts both failed to bring the alternator up. Nothing to do.")
+          +"starter or no fuel will simply repeat. A missed RF burst will not: on 15 Aug the first attempt drew no "
+          +"crank at all and the retry started the engine in 19 s, which is why this limit is adjustable."
+        : (mf?("It would trip if the next "+mf+" automatic starts all failed to bring the alternator up. Nothing to do.")
+             :"Latching is disabled, so it will never trip."))
       +"</span>");
 
     TIP("asn","<b>Starts logged</b><br>Entries in the persistent start history below - automatic, manual (dashboard "
@@ -2507,6 +2521,7 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
   if(af!="ash"&&$("ash"))$("ash").value=d.as_hold;
   if(af!="asc"&&$("asc"))$("asc").value=d.as_cool;
   if(af!="asm"&&$("asm"))$("asm").value=d.as_max24;
+  if(af!="asfl"&&$("asfl")&&d.as_maxfails!==undefined)$("asfl").value=d.as_maxfails;
   C("dot","#3fb950");T("stxt","live");
 }).catch(function(e){C("dot","#d29922");T("stxt","reconnecting...")})}
 
@@ -2547,7 +2562,8 @@ function attachHandlers(){
       T("asmsg","auto-start "+(d.as_en?"ARMED":"disabled"));poll();
     }).catch(function(e){T("asmsg","request error")})});
   var ass=$("assave");if(ass)ass.addEventListener("click",function(){
-    var q="volts="+$("asv").value+"&hold="+$("ash").value+"&cool="+$("asc").value+"&max24="+$("asm").value;
+    var q="volts="+$("asv").value+"&hold="+$("ash").value+"&cool="+$("asc").value+"&max24="+$("asm").value
+           +"&maxfail="+$("asfl").value;
     T("asmsg","saving...");
     fetch("/autostart?"+q,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
       T("asmsg",d.ok?("saved -- start below "+d.as_volts.toFixed(1)+" V held "+d.as_hold+" s"):("save failed: "+(d.detail||"error")));poll();
@@ -2638,7 +2654,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=444"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2695,6 +2711,7 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 <div><div class="k" style="margin-bottom:4px">Held for</div><input id="ash" class="inp" type="number" step="5" min="10" max="3600"> <span class="k">sec</span></div>
 <div><div class="k" style="margin-bottom:4px">Cooldown</div><input id="asc" class="inp" type="number" step="300" min="300" max="86400"> <span class="k">sec</span></div>
 <div><div class="k" style="margin-bottom:4px">Max per 24 h</div><input id="asm" class="inp" type="number" step="1" min="-1" max="255"> <span class="k">0 = &infin;</span></div>
+<div><div class="k" style="margin-bottom:4px">Fails to lock out</div><input id="asfl" class="inp" type="number" step="1" min="0" max="255"> <span class="k">0 = never</span></div>
 <button class="tx" id="assave">Save</button>
 </div>
 <div class="k" style="margin-top:12px;line-height:1.7;text-transform:none;letter-spacing:0">
@@ -2704,7 +2721,10 @@ voltage fires immediately and then can't re-arm, so it just loops. Below about <
 crank at all. The hold time ignores the brief dip
 while the engine is <i>actually cranking</i>. It won't fire while you're driving and won't re-fire until the
 battery recovers and holds. <b>Max per 24 h</b> is off by default (<b>0</b>/<b>&minus;1</b> = unlimited). The
-real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, it latches off until you clear it.
+real runaway guard is the lockout: if <b>Fails to lock out</b> starts in a row draw no charge, it latches off until
+you clear it. Raise it if the radio link is unreliable rather than the car &mdash; a missed burst costs nothing but a
+retry, whereas a genuinely dead starter repeats every time. Setting it to <b>0</b> disables the latch completely,
+which removes the only guard against cranking a car that will never start.
 </div>
 <div class="k" id="asmsg" style="margin-top:8px">&nbsp;</div>
 </div>
@@ -2747,13 +2767,13 @@ real runaway guard is the lockout: if <b>2</b> starts in a row draw no charge, i
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=442"></script>
+<script src="/app.js?v=444"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=444"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2842,13 +2862,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=442"></script>
+<script src="/app.js?v=444"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=444"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2913,13 +2933,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=442"></script>
+<script src="/app.js?v=444"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=444"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2951,13 +2971,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=442"></script>
+<script src="/app.js?v=444"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=444"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2983,7 +3003,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=442"></script>
+<script src="/app.js?v=444"></script>
 </body></html>
 )HTML";
 
@@ -3036,7 +3056,7 @@ void handleJson() {
     "\"as_en\":%s,\"as_volts\":%.2f,\"as_hold\":%lu,\"as_cool\":%lu,"
     "\"as_state\":\"%s\",\"as_low_s\":%lu,\"as_cool_s\":%lu,\"as_n\":%d,"
     "\"as_lock\":%s,\"as_fails\":%u,\"as_park_s\":%lu,\"as_park_need\":%lu,\"as_f24\":%u,"
-    "\"as_max24\":%d,\"as_eta_s\":%ld,\"cpu0\":%.1f,\"cpu1\":%.1f,"
+    "\"as_max24\":%d,\"as_maxfails\":%u,\"as_eta_s\":%ld,\"cpu0\":%.1f,\"cpu1\":%.1f,"
     "\"net_in\":%lu,\"net_out\":%lu,\"as_last\":%lu,\"last_run\":%lu,"
     "\"drain_ok\":%s,\"drain_mvph\":%.2f,\"drain_r2\":%.3f,\"drain_n\":%d,"
     "\"drain_win_s\":%lu,\"drain_days\":%.2f,\"drain_mvpc\":%.1f,"
@@ -3059,7 +3079,7 @@ void handleJson() {
     (unsigned long)autoStartCooldownLeft(), g_startCount,
     g_asLock ? "true" : "false", g_asFails,
     (unsigned long)g_parkS, (unsigned long)AS_PARK_S, g_fires24,
-    g_as_max24, autoStartEtaS(v), g_cpu0, g_cpu1,
+    g_as_max24, (unsigned)g_as_maxfails, autoStartEtaS(v), g_cpu0, g_cpu1,
     (unsigned long)g_in_total, (unsigned long)g_out_total,
     (unsigned long)g_lastStartTs, (unsigned long)g_lastRunTs,
     g_drain.ok ? "true" : "false", g_drain.mvph, g_drain.r2, g_drain.n,
@@ -3707,7 +3727,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=442">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=444">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -3818,6 +3838,19 @@ void handleAutoStart() {
     if (c < 300 || c > 86400) { fail("cool must be 300-86400 s"); return; }
     g_as_cool = (uint32_t)c;  prefs.putUInt("as_cool", g_as_cool);
   }
+  if (server.hasArg("maxfail")) {
+    long f = server.arg("maxfail").toInt();
+    if (f < 0 || f > 255) { fail("maxfail must be 0-255 (0 = never latch)"); return; }
+    g_as_maxfails = (uint8_t)f;
+    prefs.putUChar("as_maxf", g_as_maxfails);
+    // A raised limit should not leave an already-latched lockout in place, and a
+    // lowered one should not retroactively latch: re-evaluate against the new value.
+    if (g_asLock && (g_as_maxfails == 0 || g_asFails < g_as_maxfails)) {
+      g_asLock = false; prefs.putBool("as_lock", false);
+      logLine("lockout cleared: fail limit changed to %s (streak %u)",
+              g_as_maxfails ? String(g_as_maxfails).c_str() : "off", g_asFails);
+    }
+  }
   if (server.hasArg("max24")) {
     long m = server.arg("max24").toInt();
     if (m > 255) { fail("max24 must be <= 255 (0 or -1 = unlimited)"); return; }
@@ -3890,7 +3923,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=442"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=444"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -4155,6 +4188,7 @@ void setup() {
   g_as_volts    = prefs.getFloat("as_volts", AS_DEF_VOLTS);
   g_as_hold     = prefs.getUInt("as_hold", AS_DEF_HOLD_S);
   g_as_cool     = prefs.getUInt("as_cool", AS_DEF_COOL_S);
+  g_as_maxfails = prefs.getUChar("as_maxf", AS_DEF_MAX_FAILS);
   g_lastStartTs = prefs.getUInt("as_last", 0);
   g_lastRunTs   = prefs.getUInt("last_run", 0);
   g_asLock      = prefs.getBool("as_lock", false);

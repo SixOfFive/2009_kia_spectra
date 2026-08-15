@@ -82,6 +82,79 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-15 — fw 4.44: adjustable lockout limit, after the first real auto-start
+
+### The first auto-start ever fired — and the first attempt missed
+`/starts` and the log, both of which only exist because 4.43 landed the night
+before:
+
+```
+09:10:39  AUTO-START FIRED at 12.14 V -- RF transmit ok, waiting 180s for charge
+09:13:39  auto-start FAILED: no charging after 180s -- fail 1 of 2
+09:45:27  AUTO-START FIRED at 12.16 V -- RF transmit ok
+09:45:46  ENGINE ON: alternator charging at 13.29 V          <- 19 seconds
+09:45:46  start VERIFIED: engine running, charging at 13.29 V
+10:11:28  ENGINE OFF: charging ended at 12.89 V after 25m 41s
+```
+
+**The starter never engaged on the first attempt.** Raw samples either side of it:
+
+```
+09:09:42  12.14 V
+09:10:39  <- fired
+09:10:42  12.17 V     three seconds later, HIGHER than before
+09:11:43  12.16 V
+```
+
+Cranking this engine pulls 150–250 A and would drag the battery to roughly 10 V.
+There is no dip at all, so the Compustar never acted on the command. That rules
+out the starter, fuel and the battery; `tx=ok` rules out the CC1101 and SPI. The
+burst was transmitted and not honoured.
+
+Identical conditions 35 minutes later worked in 19 s. That signature — one miss,
+then immediate success, nothing changed — is a **probabilistic RF link**, most
+likely the wake-up carrier being marginal against the receiver's duty-cycled
+listen window. Each burst has some chance of landing.
+
+Also confirmed by this run: the 25m 41s duration is measured between the two
+alternator edges, not commanded. The board sends one burst and never transmits
+again, so run length is entirely the Compustar's own timer. And
+`hourly bucket in progress discarded (engine started); 21 archived hours kept`
+shows the 4.37 archive-retention change behaving as designed across a real run.
+
+### Changed — the lockout limit is now configurable
+`AS_MAX_FAILS` was a compile-time `2`. On a link that misses bursts
+occasionally, two unlucky attempts latch the lockout on a car that starts
+perfectly well — which is precisely what nearly happened here.
+
+`POST /autostart?maxfail=N`, NVS-backed (`as_maxf`), sitting alongside `cool` and
+`max24`, with a matching **Fails to lock out** field on the dashboard.
+
+- **`0` disables latching entirely.** Both the tooltip and the help text state
+  plainly that this removes the only guard against cranking a car that will never
+  start.
+- **Changing the limit re-evaluates an existing lockout.** Raising it from 2 to 4
+  while latched at a streak of 2 clears the latch rather than leaving the board
+  locked out by a rule that no longer applies. Lowering it never latches
+  retroactively.
+- Tooltips quote the live limit instead of a hardcoded `2`, and the lockout
+  advice now separates the two cases: a dead starter repeats every time, a missed
+  burst does not.
+
+Verified live: `maxfail=4` → `as_maxfails 4`; back to `2`; `maxfail=999` →
+`{"ok":false,"detail":"maxfail must be 0-255 (0 = never latch)"}`.
+
+### Not done — worth considering separately
+`as_cool` currently governs **both** the gap after a successful start and the
+retry after a failed one, and those are not the same risk. A failed start is
+positive evidence the engine is not running, so an early retry cannot toggle a
+running engine off. A separate short retry gap for unverified attempts, keeping
+the full cooldown after a verified start, fits this failure mode better than
+raising the fail limit. Left alone because it changes firing behaviour on a real
+vehicle.
+
+---
+
 ## 2026-08-14 — fw 4.43: the auto-start fire path had no record that survives
 
 ### Fixed — the one-shot event was about to go unrecorded

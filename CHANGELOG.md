@@ -82,6 +82,40 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-16 — fw 4.48: the detail popup's tooltip was painting behind it
+
+### Fixed — a z-order bug that read as "the tooltip shows the wrong content"
+Reported after 4.47: hovering inside the detail popup produced tooltip content
+belonging to the page underneath, no matter where the pointer moved.
+
+`#tip` is `z-index:50`; the popup overlay is `z-index:60`. **The tooltip was
+rendering behind the backdrop.** What showed through the 82%-opaque overlay was
+the layer beneath, which is exactly what it looked like. `#tip` is now `80`, with
+the ordering written down where the popup is defined so it cannot drift again:
+
+```
+page  <  #gmod (60)  <  #tip (80)
+```
+
+Second, smaller cause: the delegated `data-tip` handlers fire on every document
+`mousemove`/`mouseover`, including over the popup. A card tip from the page below
+could overwrite the point being hovered. Both handlers now bail out while the
+popup is open — the popup owns `#tip` for as long as it is up.
+
+### Verified — including the WiFi page specifically
+```
+charts wired:  g_rssi, g_link, g_nin, g_nout
+popup opens:   "WiFi RSSI dBm", 248 of 288 buckets
+z-index:       tip 80 > modal 60          (was 50 < 60)
+tip class:     ""  -> the graph tooltip, not the "rich" card tooltip
+after a stray document mousemove: the popup tooltip SURVIVES
+```
+
+That last check is the regression itself: before this, a background card tooltip
+could clobber the popup's on any pointer movement.
+
+---
+
 ## 2026-08-16 — fw 4.47: click any graph for a full detail view, and a year of history
 
 ### Added — a daily tier, so "year" means something

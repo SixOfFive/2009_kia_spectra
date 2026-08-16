@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.47";
+const char* FW_VERSION = "4.48";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -2292,6 +2292,8 @@ canvas{width:100%;height:104px;background:var(--card);border:1px solid #262d38;b
 .rngbar button.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
 .rngbar span.note{font-size:11px;color:#6e7681;margin-left:auto}
 canvas{cursor:pointer}
+/* z-order: page < #gmod (60) < #tip (80). The tooltip MUST outrank the popup
+   or it paints behind the backdrop and reads as stale background content. */
 #gmod{position:fixed;inset:0;background:rgba(1,4,9,.82);z-index:60;display:none;
   align-items:center;justify-content:center;padding:16px}
 #gmod.on{display:flex}
@@ -2320,7 +2322,7 @@ button.tx{background:#21262d;color:var(--fg);border:1px solid #30363d;border-rad
 button.tx:active{background:#30363d}
 button.tx.start{background:#238636;border-color:#2ea043;font-size:18px;font-weight:600;padding:14px}
 button.tx.start:active{background:#2ea043}
-#tip{position:fixed;display:none;pointer-events:none;z-index:50;background:#1f2733;color:var(--fg);
+#tip{position:fixed;display:none;pointer-events:none;z-index:80;background:#1f2733;color:var(--fg);
   border:1px solid #3a4658;border-radius:8px;padding:9px 12px;font-size:12.5px;line-height:1.55;
   box-shadow:0 6px 22px rgba(0,0,0,.6);white-space:nowrap}
 #tip.rich{white-space:normal;max-width:330px}
@@ -2381,10 +2383,14 @@ function tipShow(el,ev){
 }
 function tipHide(){var n=$("tip");if(n){n.style.display="none";n.className="";}}
 document.addEventListener("mouseover",function(e){
+  var mo=$("gmod"); if(mo&&mo.classList.contains("on"))return;
   var el=e.target.closest?e.target.closest("[data-tip]"):null;
   if(el) tipShow(el,e);
 });
 document.addEventListener("mousemove",function(e){
+  // The detail popup owns #tip while it is open; a card tip from the page
+  // underneath would overwrite the point being hovered.
+  var mo=$("gmod"); if(mo&&mo.classList.contains("on"))return;
   var el=e.target.closest?e.target.closest("[data-tip]"):null;
   if(el) tipShow(el,e); else if(($("tip")||{}).className==="rich") tipHide();
 });
@@ -3109,7 +3115,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3226,13 +3232,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=447"></script>
+<script src="/app.js?v=448"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3321,13 +3327,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=447"></script>
+<script src="/app.js?v=448"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3392,13 +3398,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=447"></script>
+<script src="/app.js?v=448"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3430,13 +3436,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=447"></script>
+<script src="/app.js?v=448"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3462,7 +3468,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=447"></script>
+<script src="/app.js?v=448"></script>
 </body></html>
 )HTML";
 
@@ -4227,7 +4233,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=447">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=448">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -4545,7 +4551,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

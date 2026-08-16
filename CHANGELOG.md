@@ -82,6 +82,78 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-16 — fw 4.47: click any graph for a full detail view, and a year of history
+
+### Added — a daily tier, so "year" means something
+The hourly archive covers ~125 days across two generations, and a year view wants
+daily resolution anyway (365 points). So there is now a daily bucket alongside the
+hourly one: `/daily.bin` + `.old`, 400 records per generation, **~2 years**.
+
+Deliberately reuses the existing `HourAgg` record rather than introducing a
+second type — no new on-disk format, and therefore **no third format migration**.
+The first two both shipped with bugs (4.38, 4.39); not spending that risk again
+for a struct that would have been identical anyway.
+
+Unlike the hourly bucket, the daily one is **not** discarded when the engine
+starts. A day the car ran is real data, and the stored min/max make the 14 V
+excursion visible instead of burying it in the mean.
+
+### Added — `/agg?span=year` and `&full=1`
+`year` = 365 buckets × 1 day from the daily archive. `full=1` adds each bucket's
+min and max next to its mean — roughly triple the payload, which is why the
+always-on inline charts never ask for it and the click-through popup always does.
+One series, user-initiated, so it is affordable there.
+
+### Added — the detail popup
+Clicking **any** graph opens it larger with its own range selector
+(24 h / 7 d / 30 d / 1 y) and considerably more information:
+
+- **Min/max envelope** drawn as a band — the spread inside each bucket, which a
+  line of means hides entirely.
+- **Dashed window extremes, labelled in-graph** (`max 12.37 V`), scaled so they
+  are always on-canvas.
+- **Stat row**: latest, mean, minimum, maximum, range, coverage.
+- **Rich tooltip** per point: value, the bucket's own low/high and spread, where
+  it sits in the window as a percentage, the bucket's time span, and how long ago.
+
+```
+12.31 V | Sun, 15 Feb 2026 | mean over 1 day
+low 12.19 V · high 12.40 V | spread 0.21 V | 75% of the way up this range | 181d 12h ago
+```
+
+Built in JS and appended to the DOM at load, so all four chart pages get it
+without touching any page template.
+
+### Fixed during verification
+- **A day-wide bucket rendered as `02:10:26 – 02:10:26`.** The end of a 1-day
+  bucket is the same clock time as its start, so `toLocaleTimeString()` printed
+  both ends identically. Day-sized buckets now show the date alone.
+- **DRAM went 24% → 36%** when the per-bucket extreme buffers were added as
+  static arrays (~56 KB for 365 × 11 × 3). Moved to PSRAM, allocated once at
+  boot: DRAM is now **19%**, *better* than 4.46, because the old 288-sized
+  buffers moved with them. `/agg` returns 503 rather than misbehaving if that
+  allocation ever fails. Free heap on the board went 193 KB → 219 KB.
+
+### Verified
+Against a mock serving the real HTML/CSS/JS, mirroring the live board's shape —
+day and year populated, week/month nearly empty, `drain` absent entirely:
+
+```
+modal opens on click, no JS errors
+year   365 of 365 buckets · 1 day each, envelope present, 123k lit px
+week   2 of 168 buckets      (sparse path)
+drain  0 of 168 buckets -> "not recorded for this range yet"
+```
+
+Then on hardware across all four spans, inline and `full=1`.
+
+### Expect it to fill in
+The year view is empty until the **first midnight rollover** writes a daily
+bucket, then gains one point per day. Same shape as every other tier here: the
+data cannot be reconstructed, only accumulated.
+
+---
+
 ## 2026-08-15 — fw 4.46: a dedicated run history, kept for years
 
 ### Added — engine starts, stops and failed attempts in their own log

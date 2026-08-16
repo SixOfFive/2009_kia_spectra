@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.46";
+const char* FW_VERSION = "4.47";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -767,6 +767,28 @@ const uint32_t DR_SETTLE_S = 12UL * 3600UL;               // skip post-run settl
 const int      DR_MIN_PTS  = 6;                           // need this many to report
 const char*    DR_FILE     = "/hourly.bin";               // long-term archive
 const char*    DR_OLD      = "/hourly.old";               // one prior generation
+
+// Daily tier. The hourly archive covers ~125 days across two generations, so a
+// year view needs its own store -- and at 365 points a year wants daily
+// resolution anyway. Deliberately reuses HourAgg rather than introducing a
+// second record type: no new on-disk format, and therefore no third format
+// migration (the first two both shipped with bugs, see 4.38 and 4.39).
+// 400 records x 136 B = 54 KB per generation, two generations = ~2 years.
+const int      DY_MAX      = 400;
+const char*    DY_FILE     = "/daily.bin";
+const char*    DY_OLD      = "/daily.old";
+HourAgg*       g_dy   = nullptr;                          // PSRAM ring
+int            g_dyN  = 0;
+double         g_dySum[AG_N];
+float          g_dyMin[AG_N], g_dyMax[AG_N];
+uint32_t       g_dyCnt = 0, g_dyDay = 0;
+volatile bool  g_dyPending = false;
+HourAgg        g_dyPend;
+
+// /agg scratch: sums + per-bucket min/max for the largest span (365 buckets x
+// AG_N series x 3 arrays) and the counts. PSRAM, allocated once at boot.
+float*         g_agBuf = nullptr;
+uint16_t*      g_agCnt = nullptr;
 HourAgg*       g_dr   = nullptr;                          // PSRAM ring (rolls at DR_MAX), ~204 KB
 int            g_drN  = 0;
 double         g_agSum[AG_N];                             // in-progress hour
@@ -779,6 +801,17 @@ HourAgg        g_drPend;
 // header, and a leading epoch never collides with this magic, so the absence of
 // a header is itself the version marker.
 const uint32_t HAG_MAGIC = 0x48414731;                    // "HAG1"
+
+static void dyReset() {
+  for (int i = 0; i < AG_N; i++) { g_dySum[i] = 0; g_dyMin[i] = 1e30f; g_dyMax[i] = -1e30f; }
+  g_dyCnt = 0;
+}
+
+static void dyPush(const HourAgg& b) {
+  if (!g_dy) return;
+  if (g_dyN < DY_MAX) { g_dy[g_dyN++] = b; }
+  else { memmove(g_dy, g_dy + 1, (DY_MAX - 1) * sizeof(HourAgg)); g_dy[DY_MAX - 1] = b; }
+}
 
 static void agReset() {
   for (int i = 0; i < AG_N; i++) { g_agSum[i] = 0; g_agMin[i] = 1e30f; g_agMax[i] = -1e30f; }
@@ -1301,6 +1334,32 @@ void recordSample() {
       if (av[i] > g_agMax[i]) g_agMax[i] = av[i];
     }
     g_drCnt++;
+
+    // Daily tier. Unlike the hourly bucket this is NOT discarded when the engine
+    // starts: a day on which the car ran is real data, and the min/max make the
+    //14 V excursion visible rather than hiding it in the mean.
+    uint32_t dy = s.ts / 86400;
+    if (g_dyDay == 0) { g_dyDay = dy; dyReset(); }
+    if (dy != g_dyDay) {
+      if (g_dyCnt) {
+        HourAgg b;
+        b.ts = g_dyDay * 86400 + 43200;           // midday of the day it covers
+        for (int i = 0; i < AG_N; i++) {
+          b.mean[i] = (float)(g_dySum[i] / g_dyCnt);
+          b.mn[i]   = g_dyMin[i];
+          b.mx[i]   = g_dyMax[i];
+        }
+        dyPush(b);
+        g_dyPend = b; g_dyPending = true;         // loop appends it to flash
+      }
+      dyReset(); g_dyDay = dy;
+    }
+    for (int i = 0; i < AG_N; i++) {
+      g_dySum[i] += av[i];
+      if (av[i] < g_dyMin[i]) g_dyMin[i] = av[i];
+      if (av[i] > g_dyMax[i]) g_dyMax[i] = av[i];
+    }
+    g_dyCnt++;
   }
 
   // Board-health warning: log if free heap crosses below a floor (a leak or
@@ -1585,6 +1644,45 @@ void flushDrainToFlash() {
     LittleFS.remove(DR_OLD);
     LittleFS.rename(DR_FILE, DR_OLD);
   }
+}
+
+// Append the one pending daily bucket. Loop core only.
+void flushDailyToFlash() {
+  if (!g_dyPending) return;
+  g_dyPending = false;
+  bool fresh = !LittleFS.exists(DY_FILE);
+  File f = LittleFS.open(DY_FILE, FILE_APPEND);
+  if (!f) return;
+  if (fresh) { uint32_t m = HAG_MAGIC, r = (uint32_t)sizeof(HourAgg);
+               f.write((uint8_t*)&m, 4); f.write((uint8_t*)&r, 4); }
+  f.write((uint8_t*)&g_dyPend, sizeof(HourAgg));
+  size_t sz = f.size();
+  f.close();
+  g_fsBytes += sizeof(HourAgg) + (fresh ? 8 : 0); g_fsCommits++;
+  if (sz >= 8 + (size_t)DY_MAX * sizeof(HourAgg)) {
+    LittleFS.remove(DY_OLD);
+    LittleFS.rename(DY_FILE, DY_OLD);
+  }
+}
+
+void loadDailyFromFlash() {
+  if (!g_dy) return;
+  g_dyN = 0;
+  const char* files[2] = { DY_OLD, DY_FILE };
+  for (int k = 0; k < 2; k++) {
+    if (!LittleFS.exists(files[k])) continue;
+    File f = LittleFS.open(files[k], FILE_READ);
+    if (!f) continue;
+    uint32_t magic = 0, rec = 0;
+    f.read((uint8_t*)&magic, 4); f.read((uint8_t*)&rec, 4);
+    if (magic == HAG_MAGIC && rec == sizeof(HourAgg)) {
+      HourAgg b;
+      while (f.read((uint8_t*)&b, sizeof(HourAgg)) == sizeof(HourAgg))
+        if (b.ts > 1700000000UL) dyPush(b);
+    }
+    f.close();
+  }
+  if (g_dyN) logLine("daily archive restored: %d days from flash", g_dyN);
 }
 
 // Write the whole ring to `path` in the current format. Used by the legacy
@@ -2193,6 +2291,22 @@ canvas{width:100%;height:104px;background:var(--card);border:1px solid #262d38;b
 .rngbar button:hover{border-color:#58a6ff;color:#c9d1d9}
 .rngbar button.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
 .rngbar span.note{font-size:11px;color:#6e7681;margin-left:auto}
+canvas{cursor:pointer}
+#gmod{position:fixed;inset:0;background:rgba(1,4,9,.82);z-index:60;display:none;
+  align-items:center;justify-content:center;padding:16px}
+#gmod.on{display:flex}
+#gmbox{background:var(--card);border:1px solid #30363d;border-radius:14px;width:min(1100px,96vw);
+  max-height:94vh;overflow:auto;padding:18px 20px 20px;box-shadow:0 24px 70px rgba(0,0,0,.6)}
+#gmhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+#gmhead h2{margin:0;font-size:19px;font-weight:650}
+#gmsub{color:var(--mut);font-size:12px}
+#gmclose{margin-left:auto;background:#21262d;border:1px solid #30363d;color:var(--fg);
+  border-radius:8px;padding:5px 13px;cursor:pointer;font-family:inherit;font-size:13px}
+#gmclose:hover{border-color:#f85149;color:#f85149}
+#gmcv{width:100%;height:340px;display:block;margin-top:6px;cursor:crosshair}
+#gmstat{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-top:14px}
+#gmstat div{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:8px 10px}
+#gmstat .k{font-size:10px}#gmstat .v{font-size:16px;margin-top:2px}
 .card{background:var(--card);border:1px solid #262d38;border-radius:14px;padding:16px 16px 15px;
   box-shadow:0 1px 2px rgba(0,0,0,.3);transition:border-color .15s,transform .15s,box-shadow .15s}
 .card:hover{border-color:#3a4658;transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.4)}
@@ -2346,6 +2460,14 @@ function showTip(ev,id){var ch=CHARTS[id];if(!ch||hoverIdx<0)return;
   var tx=ev.clientX+12;if(tx+170>window.innerWidth)tx=ev.clientX-160;
   tp.style.left=tx+"px";tp.style.top=(ev.clientY+12)+"px";}
 function setupHover(){IDS.forEach(function(id){var c=$(id);if(!c)return;
+  c.addEventListener("click",function(){
+    var cfg=(window.PAGE.charts||[]).filter(function(k){return k.id===id})[0];
+    if(!cfg)return;
+    // carry the human label from the caption above the canvas
+    var lb=c.previousElementSibling;
+    cfg.label=lb?lb.textContent.replace(/\s*\(.*?\)\s*/," ").trim():cfg.col;
+    openGraph(cfg);});
+  c.title="Click for the full detail view (day / week / month / year)";
   c.addEventListener("mousemove",function(ev){hoverIdx=idxFromEvent(ev,id);drawAll();showTip(ev,id)});
   c.addEventListener("mouseleave",function(){hoverIdx=-1;drawAll();var tp=$("tip");if(tp)tp.style.display="none"});})}
 // ---- ranged history via /agg ---------------------------------------------
@@ -2415,6 +2537,177 @@ function setSpan(sp){
   if(agTimer)clearInterval(agTimer);
   agTimer=setInterval(loadHistory,SPANS[sp].ms);   // week/month barely move; don't poll them like the live view
 }
+
+// ---- click-through detail popup -----------------------------------------
+// Any graph opens a bigger one with its own range (day/week/month/year), the
+// min/max envelope drawn as a band, dashed extremes labelled in-graph, and a
+// tooltip carrying everything the board recorded for the hovered bucket.
+// Uses /agg&full=1, which the inline charts never request because it roughly
+// triples the payload -- affordable here because it is one series, on demand.
+var MSPANS=[["day","24 h"],["week","7 d"],["month","30 d"],["year","1 y"]];
+var mCfg=null,mSpan="day",mD=null,mHover=-1;
+
+function mBuild(){
+  if(document.getElementById("gmod"))return;
+  var d=document.createElement("div");d.id="gmod";
+  d.innerHTML='<div id="gmbox"><div id="gmhead"><h2 id="gmtitle">--</h2>'
+    +'<span id="gmsub"></span><button id="gmclose">Close &times;</button></div>'
+    +'<div class="rngbar" id="gmrange"><b>Range</b></div>'
+    +'<canvas id="gmcv"></canvas><div id="gmstat"></div></div>';
+  document.body.appendChild(d);
+  var bar=document.getElementById("gmrange");
+  MSPANS.forEach(function(sp){var b=document.createElement("button");
+    b.textContent=sp[1];b.setAttribute("data-s",sp[0]);
+    b.onclick=function(){mSpan=sp[0];mSync();mLoad()};bar.appendChild(b)});
+  document.getElementById("gmclose").onclick=mClose;
+  d.addEventListener("click",function(e){if(e.target===d)mClose()});
+  document.addEventListener("keydown",function(e){if(e.key==="Escape")mClose()});
+  var cv=document.getElementById("gmcv");
+  cv.addEventListener("mousemove",function(e){
+    if(!mD||!mD.mean.length)return;
+    var r=cv.getBoundingClientRect();
+    var i=Math.round(((e.clientX-r.left)/r.width*cv.width-14)/((cv.width-28)/(mD.n-1)));
+    i=Math.max(0,Math.min(mD.n-1,i));
+    mHover=mNearest(i);mDraw();mTip(e);});
+  cv.addEventListener("mouseleave",function(){mHover=-1;mDraw();
+    var t=document.getElementById("tip");if(t)t.style.display="none"});
+}
+function mSync(){
+  Array.prototype.forEach.call(document.querySelectorAll("#gmrange button"),function(b){
+    b.className=(b.getAttribute("data-s")===mSpan)?"on":""});
+}
+function mClose(){var d=document.getElementById("gmod");if(d)d.classList.remove("on");
+  var t=document.getElementById("tip");if(t)t.style.display="none";mHover=-1}
+function mNearest(i){
+  if(mD.mean[i]!==null)return i;
+  for(var k=1;k<mD.n;k++){var a=i-k,b=i+k;
+    if(a>=0&&mD.mean[a]!==null)return a;
+    if(b<mD.n&&mD.mean[b]!==null)return b}
+  return -1;
+}
+function openGraph(cfg){
+  mBuild();mCfg=cfg;mHover=-1;
+  document.getElementById("gmtitle").textContent=cfg.label||cfg.col;
+  document.getElementById("gmod").classList.add("on");
+  mSync();mLoad();
+}
+function mLoad(){
+  if(!mCfg)return;
+  document.getElementById("gmsub").textContent="loading\u2026";
+  fetch("/agg?span="+mSpan+"&cols="+mCfg.col+"&full=1",{cache:"no-store"})
+  .then(function(r){return r.text()}).then(function(t){
+    var ln=t.replace(/\s+$/,"").split("\n");
+    var m=/t0=(\d+),step=(\d+),n=(\d+)/.exec(ln[0]||"");if(!m)return;
+    var t0=+m[1],step=+m[2],n=+m[3];
+    var e=/=([-\d.]*)\/([-\d.]*)/.exec(ln[1]||"");
+    var wmn=(e&&e[1]!=="")?+e[1]:null,wmx=(e&&e[2]!=="")?+e[2]:null;
+    var mean=new Array(n).fill(null),lo=new Array(n).fill(null),hi=new Array(n).fill(null);
+    var got=0;
+    for(var i=2;i<ln.length;i++){var f=ln[i].split(",");var b=+f[0];
+      if(!(b>=0&&b<n))continue;
+      if(f[1]!==undefined&&f[1]!==""){mean[b]=+f[1];got++}
+      if(f[2]!==undefined&&f[2]!=="")lo[b]=+f[2];
+      if(f[3]!==undefined&&f[3]!=="")hi[b]=+f[3];}
+    mD={t0:t0,step:step,n:n,mean:mean,lo:lo,hi:hi,wmn:wmn,wmx:wmx,got:got};
+    document.getElementById("gmsub").textContent=
+      got+" of "+n+" buckets \u00b7 "+fmtStep(step)+" each";
+    mStats();mDraw();
+  }).catch(function(){document.getElementById("gmsub").textContent="failed to load"});
+}
+function fmtStep(x){return x>=86400?(x/86400+" day"):x>=3600?(x/3600+" h"):(x/60+" min")}
+function mStats(){
+  var el=document.getElementById("gmstat");if(!el||!mD)return;
+  var vals=mD.mean.filter(function(v){return v!==null});
+  var u=mCfg.unit||"",dc=mCfg.dec||0;
+  function box(k,v){return '<div><div class="k">'+k+'</div><div class="v">'+v+'</div></div>'}
+  if(!vals.length){el.innerHTML=box("Data","none recorded for this range yet");return}
+  var avg=vals.reduce(function(a,b){return a+b},0)/vals.length;
+  var latest=null;for(var i=mD.n-1;i>=0;i--){if(mD.mean[i]!==null){latest=mD.mean[i];break}}
+  el.innerHTML=box("Latest",(latest!==null?latest.toFixed(dc):"--")+" "+u)
+    +box("Mean",avg.toFixed(dc)+" "+u)
+    +box("Minimum",(mD.wmn!==null?mD.wmn.toFixed(dc):"--")+" "+u)
+    +box("Maximum",(mD.wmx!==null?mD.wmx.toFixed(dc):"--")+" "+u)
+    +box("Range",(mD.wmn!==null&&mD.wmx!==null?(mD.wmx-mD.wmn).toFixed(dc):"--")+" "+u)
+    +box("Coverage",mD.got+" / "+mD.n);
+}
+function mDraw(){
+  var cv=document.getElementById("gmcv");if(!cv||!mD)return;
+  var W=cv.clientWidth||900,H=340;
+  if(cv.width!==W||cv.height!==H){cv.width=W;cv.height=H}
+  var x=cv.getContext("2d"),PADL=14,PADT=14,PADB=22;
+  x.clearRect(0,0,W,H);
+  var vals=[];mD.mean.forEach(function(v,i){if(v!==null){vals.push(v);
+    if(mD.lo[i]!==null)vals.push(mD.lo[i]);if(mD.hi[i]!==null)vals.push(mD.hi[i])}});
+  if(mD.wmn!==null)vals.push(mD.wmn); if(mD.wmx!==null)vals.push(mD.wmx);
+  if(!vals.length){x.fillStyle="#6e7681";x.font="13px system-ui";x.textAlign="center";
+    x.fillText("not recorded for this range yet",W/2,H/2);x.textAlign="left";return}
+  var lo=Math.min.apply(null,vals),hi=Math.max.apply(null,vals);
+  if(hi-lo<1e-6){hi+=1;lo-=1}
+  if(mCfg.anchor0){lo=Math.min(0,lo)}
+  var pad=(hi-lo)*0.12;lo-=pad;hi+=pad;
+  function gx(i){return PADL+i*(W-2*PADL)/(mD.n-1)}
+  function gy(v){return H-PADB-(v-lo)/(hi-lo)*(H-PADT-PADB)}
+
+  // min/max envelope: the spread inside each bucket, which a line of means hides
+  x.fillStyle=(mCfg.color||"#58a6ff")+"33";
+  var started=false;x.beginPath();
+  for(var i=0;i<mD.n;i++){if(mD.hi[i]===null){continue}
+    if(!started){x.moveTo(gx(i),gy(mD.hi[i]));started=true}else x.lineTo(gx(i),gy(mD.hi[i]))}
+  for(var i=mD.n-1;i>=0;i--){if(mD.lo[i]===null)continue;x.lineTo(gx(i),gy(mD.lo[i]))}
+  if(started){x.closePath();x.fill()}
+
+  // dashed window extremes, labelled in-graph
+  x.setLineDash([5,4]);x.lineWidth=1;x.font="12px system-ui";
+  [["max",mD.wmx,-5],["min",mD.wmn,14]].forEach(function(m){
+    if(m[1]===null)return;var yy=gy(m[1]);
+    x.strokeStyle="#6e7681";x.beginPath();x.moveTo(PADL,yy);x.lineTo(W-PADL,yy);x.stroke();
+    x.fillStyle="#8b949e";
+    x.fillText(m[0]+" "+m[1].toFixed(mCfg.dec||0)+" "+(mCfg.unit||""),W-140,yy+m[2])});
+  x.setLineDash([]);
+
+  x.strokeStyle=mCfg.color||"#58a6ff";x.lineWidth=1.8;x.beginPath();
+  var pen=false,nseg=0,lone=-1;
+  for(var i=0;i<mD.n;i++){var v=mD.mean[i];
+    if(v===null){pen=false;continue}
+    nseg++;lone=i;
+    if(pen)x.lineTo(gx(i),gy(v));else{x.moveTo(gx(i),gy(v));pen=true}}
+  x.stroke();
+  if(nseg===1){x.fillStyle=mCfg.color;x.beginPath();x.arc(gx(lone),gy(mD.mean[lone]),4,0,6.2832);x.fill()}
+
+  if(mHover>=0&&mD.mean[mHover]!==null){
+    var hx=gx(mHover),hy=gy(mD.mean[mHover]);
+    x.strokeStyle="#6e7681";x.lineWidth=1;x.beginPath();x.moveTo(hx,PADT);x.lineTo(hx,H-PADB);x.stroke();
+    x.fillStyle=mCfg.color;x.beginPath();x.arc(hx,hy,4,0,6.2832);x.fill()}
+}
+function mTip(ev){
+  if(mHover<0||!mD)return;
+  var i=mHover,dc=mCfg.dec||0,u=mCfg.unit||"";
+  var t0=mD.t0+i*mD.step, tEnd=t0+mD.step;
+  // A day-wide bucket ends at the same clock time it started, so rendering the
+  // end as a time reads "02:10:26 - 02:10:26". Show the date alone instead.
+  var h="<b>"+mD.mean[i].toFixed(dc)+" "+u+"</b><br>";
+  if(mD.step>=86400) h+=new Date(t0*1000).toLocaleDateString(undefined,
+       {weekday:"short",day:"numeric",month:"short",year:"numeric"});
+  else{ h+=new Date(t0*1000).toLocaleString();
+        if(mD.step>300)h+=" &ndash; "+new Date(tEnd*1000).toLocaleTimeString(); }
+  h+="<br><span class='tk'>mean over "+fmtStep(mD.step);
+  if(mD.lo[i]!==null&&mD.hi[i]!==null){
+    h+="<br>low "+mD.lo[i].toFixed(dc)+" "+u+" &middot; high "+mD.hi[i].toFixed(dc)+" "+u;
+    h+="<br>spread "+(mD.hi[i]-mD.lo[i]).toFixed(dc)+" "+u;}
+  if(mD.wmn!==null&&mD.wmx!==null&&mD.wmx>mD.wmn){
+    var pct=(mD.mean[i]-mD.wmn)/(mD.wmx-mD.wmn)*100;
+    h+="<br>"+pct.toFixed(0)+"% of the way up this range";}
+  var ago=Math.max(0,Math.floor(Date.now()/1000)-tEnd);
+  h+="<br>"+(ago<60?"just now":fmtDurShort(ago)+" ago");
+  h+="</span>";
+  H("tip",h);
+  var tp=document.getElementById("tip");if(!tp)return;
+  tp.className="";tp.style.display="block";
+  var tx=ev.clientX+14;if(tx+240>window.innerWidth)tx=ev.clientX-230;
+  tp.style.left=tx+"px";tp.style.top=(ev.clientY+14)+"px";
+}
+function fmtDurShort(x){var d=Math.floor(x/86400),h=Math.floor(x%86400/3600),m=Math.floor(x%3600/60);
+  return d?(d+"d "+h+"h"):h?(h+"h "+m+"m"):(m+"m")}
 
 function buildRangeBar(){
   if(!window.PAGE||!window.PAGE.charts||!window.PAGE.charts.length)return;
@@ -2816,7 +3109,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -2933,13 +3226,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=446"></script>
+<script src="/app.js?v=447"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3028,13 +3321,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=446"></script>
+<script src="/app.js?v=447"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3099,13 +3392,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=446"></script>
+<script src="/app.js?v=447"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3137,13 +3430,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=446"></script>
+<script src="/app.js?v=447"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3169,7 +3462,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=446"></script>
+<script src="/app.js?v=447"></script>
 </body></html>
 )HTML";
 
@@ -3349,9 +3642,15 @@ void handleAgg() {
   boundSendStall();
 
   String sp = server.arg("span");
+  // full=1 adds each bucket's min and max alongside its mean. The always-on
+  // inline charts never ask for it -- it roughly triples the payload -- but the
+  // click-through detail popup is one series, user-initiated, and wants
+  // everything the board knows about each point.
+  bool full = server.arg("full") == "1";
   uint32_t step; int n;
   if      (sp == "week")  { step = 3600;         n = 168; }
   else if (sp == "month") { step = 4UL * 3600UL; n = 180; }
+  else if (sp == "year")  { step = 86400;        n = 365; }
   else                    { step = 300;          n = 288; }   // day
 
   bool sel[AG_N]; int nsel = 0;
@@ -3365,16 +3664,37 @@ void handleAgg() {
   if (!now || !nsel) { server.send(200, "text/csv", "#t0=0,step=0,n=0\n"); return; }
   uint32_t t0 = now - (uint32_t)n * step;
 
-  // 288 x 11 floats + counts, ~19 KB. Static rather than heap: this runs in the
-  // HTTP path and a failed allocation there is a worse outcome than the DRAM.
-  static float    sum[288 * AG_N];
-  static uint16_t cnt[288 * AG_N];
-  static float    wmn[AG_N], wmx[AG_N];
+  // 365 x 11 of sums, counts and per-bucket extremes is ~56 KB. That lives in
+  // PSRAM, allocated once at boot: as static DRAM it cost 12 points of the
+  // budget (24% -> 36%) for something that only runs when a page asks, and the
+  // WiFi stack needs that headroom more than this does.
+  if (!g_agBuf) { server.send(503, "text/csv", "#aggregation buffer unavailable\n"); return; }
+  float*    sum = g_agBuf;
+  float*    bmn = g_agBuf + 365 * AG_N;
+  float*    bmx = g_agBuf + 2 * 365 * AG_N;
+  uint16_t* cnt = g_agCnt;
+  static float wmn[AG_N], wmx[AG_N];
   memset(sum, 0, sizeof(float)    * n * AG_N);
   memset(cnt, 0, sizeof(uint16_t) * n * AG_N);
+  for (int i = 0; i < n * AG_N; i++) { bmn[i] = 1e30f; bmx[i] = -1e30f; }
   for (int i = 0; i < AG_N; i++) { wmn[i] = 1e30f; wmx[i] = -1e30f; }
 
-  if (step == 300) {                                  // day: raw ring
+  if (sp == "year") {                                 // year: daily archive
+    if (g_dy) for (int k = 0; k < g_dyN; k++) {
+      HourAgg& h = g_dy[k];
+      if (h.ts < t0) continue;
+      int b = (int)((h.ts - t0) / step);
+      if (b < 0 || b >= n) continue;
+      for (int i = 0; i < AG_N; i++) {
+        if (!sel[i] || !isfinite(h.mean[i])) continue;
+        sum[b * AG_N + i] += h.mean[i]; cnt[b * AG_N + i]++;
+        if (h.mn[i] < bmn[b * AG_N + i]) bmn[b * AG_N + i] = h.mn[i];
+        if (h.mx[i] > bmx[b * AG_N + i]) bmx[b * AG_N + i] = h.mx[i];
+        if (h.mn[i] < wmn[i]) wmn[i] = h.mn[i];
+        if (h.mx[i] > wmx[i]) wmx[i] = h.mx[i];
+      }
+    }
+  } else if (step == 300) {                           // day: raw ring
     if (hist) {
       int oldest = (histCount < HIST_N) ? 0 : histHead;
       for (int k = 0; k < histCount; k++) {
@@ -3386,6 +3706,8 @@ void handleAgg() {
         for (int i = 0; i < AG_N; i++) {
           if (!sel[i]) continue;
           sum[b * AG_N + i] += av[i]; cnt[b * AG_N + i]++;
+          if (av[i] < bmn[b * AG_N + i]) bmn[b * AG_N + i] = av[i];
+          if (av[i] > bmx[b * AG_N + i]) bmx[b * AG_N + i] = av[i];
           if (av[i] < wmn[i]) wmn[i] = av[i];
           if (av[i] > wmx[i]) wmx[i] = av[i];
         }
@@ -3400,6 +3722,8 @@ void handleAgg() {
       for (int i = 0; i < AG_N; i++) {
         if (!sel[i] || !isfinite(h.mean[i])) continue;   // legacy rows lack most series
         sum[b * AG_N + i] += h.mean[i]; cnt[b * AG_N + i]++;
+        if (h.mn[i] < bmn[b * AG_N + i]) bmn[b * AG_N + i] = h.mn[i];
+        if (h.mx[i] > bmx[b * AG_N + i]) bmx[b * AG_N + i] = h.mx[i];
         if (h.mn[i] < wmn[i]) wmn[i] = h.mn[i];          // TRUE extremes, not extremes of means
         if (h.mx[i] > wmx[i]) wmx[i] = h.mx[i];
       }
@@ -3408,7 +3732,8 @@ void handleAgg() {
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  String hdr = "#t0=" + String(t0 + step / 2) + ",step=" + String(step) + ",n=" + String(n) + "\n#";
+  String hdr = "#t0=" + String(t0 + step / 2) + ",step=" + String(step) + ",n=" + String(n)
+             + (full ? ",full=1" : "") + "\n#";
   bool first = true;
   for (int i = 0; i < AG_N; i++) {
     if (!sel[i]) continue;
@@ -3430,9 +3755,15 @@ void handleAgg() {
     chunk += b;
     for (int i = 0; i < AG_N; i++) {
       if (!sel[i]) continue;
-      chunk += ',';
       uint16_t c = cnt[b * AG_N + i];
+      chunk += ',';
       if (c) appendNum(chunk, sum[b * AG_N + i] / c, AG_DEC[i]);
+      if (full) {
+        chunk += ',';
+        if (c) appendNum(chunk, bmn[b * AG_N + i], AG_DEC[i]);
+        chunk += ',';
+        if (c) appendNum(chunk, bmx[b * AG_N + i], AG_DEC[i]);
+      }
     }
     chunk += '\n';
     if (chunk.length() > 1500) {
@@ -3896,7 +4227,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=446">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=447">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -4214,7 +4545,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=446"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=447"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -4515,6 +4846,11 @@ void setup() {
   g_dr = (HourAgg*)ps_malloc(DR_MAX * sizeof(HourAgg));       // ~204 KB in PSRAM
   if (g_dr) { loadDrainFromFlash(); g_hfit = computeHourlyDrain(); }
   else      { Serial.println("drain buckets: PSRAM alloc FAILED -- falling back to the 2-point anchor"); }
+  g_agBuf = (float*)   ps_malloc(3 * 365 * AG_N * sizeof(float));     // ~48 KB, /agg scratch
+  g_agCnt = (uint16_t*)ps_malloc(    365 * AG_N * sizeof(uint16_t));  // ~8 KB
+  if (!g_agBuf || !g_agCnt) Serial.println("agg scratch: PSRAM alloc FAILED -- /agg will 503");
+  g_dy = (HourAgg*)ps_malloc(DY_MAX * sizeof(HourAgg));      // ~54 KB in PSRAM
+  if (g_dy) loadDailyFromFlash();
   seedRunHistory();                                // one-time, no-op once a run file exists
   Serial.printf("Loaded %d prior samples from flash.\n", histCount);
   loadStarts();
@@ -4743,6 +5079,7 @@ void loop() {
   loopMark("logflush"); flushLogToFlash();          // persist any new event-log lines (idle-cheap)
   flushDrainToFlash();                              // and the hourly drain bucket, if one completed
   flushRunsToFlash();                               // and any engine start/stop events
+  flushDailyToFlash();                              // and the daily bucket, at midnight
   loopMark("loop");
   uint32_t now = millis();
 

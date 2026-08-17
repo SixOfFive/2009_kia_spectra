@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.50";
+const char* FW_VERSION = "4.51";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -250,6 +250,18 @@ const float    AS_REARM_MARGIN  = 0.15f;    // must recover to (threshold + this
 const uint32_t AS_REARM_S       = 600;      // ...and hold it this long
 const uint8_t  AS_REARM_MAX_COOLDOWNS = 2;  // after this many cooldowns, re-arm anyway
 const uint32_t AS_VERIFY_S      = 180;      // after firing, expect charging within this
+// An engine edge has to PERSIST, not just cross a voltage. Measured 2026-08-17:
+// one continuous drive (13:21 -> 14:57) was recorded as FOURTEEN separate runs,
+// several lasting 1-2 seconds, because the alternator dips below the off
+// threshold (AS_ALT_V - 0.3 = 12.9 V) transiently at idle and under load. Every
+// spurious OFF in that drive read 12.52-12.90 V while every ON read 13.2-14.2 V,
+// so voltage alone cannot separate them -- the signal is genuinely crossing the
+// line. Time can: the shortest gap that looked like a real stop in that drive
+// was 164 s, and every artefact was under 60 s.
+// The edge is TIMESTAMPED WHEN IT FIRST APPEARED, not when it was confirmed, so
+// run durations and the gaps between runs stay exact.
+const uint32_t AS_RUN_OFF_S     = 120;      // low must hold this long to end a run
+const uint32_t AS_RUN_ON_S      = 5;        // and high this long to start one
 const uint8_t  AS_DEF_MAX_FAILS = 2;        // consecutive unverified starts -> lockout (default)
 // Optional cap on auto-starts per rolling 24 h. 0 (or any value <= 0) means
 // UNLIMITED, which is the default: if the battery genuinely needs starting six
@@ -1688,16 +1700,20 @@ void seedRunHistory() {
 }
 
 // Queue a run event. Safe from either core: RAM only, no allocation.
-void runLog(uint8_t kind, uint8_t src, float v, uint32_t dur_s, uint8_t flags) {
+// ts = 0 means "now"; a debounced edge passes the moment it actually happened.
+void runLogAt(uint32_t ts, uint8_t kind, uint8_t src, float v, uint32_t dur_s, uint8_t flags) {
   if (!timeIsValid()) return;                 // an event with no date is not worth keeping
   RunEvent e;
-  e.ts = (uint32_t)time(nullptr);
+  e.ts = ts ? ts : (uint32_t)time(nullptr);
   e.kind = kind; e.src = src; e.flags = flags; e._rsv = 0;
   e.v = v; e.dur_s = dur_s;
   portENTER_CRITICAL(&g_runqMux);
   int nxt = (g_runqHead + 1) % RUNQ_N;
   if (nxt != g_runqTail) { g_runq[g_runqHead] = e; g_runqHead = nxt; }   // full -> drop, never block
   portEXIT_CRITICAL(&g_runqMux);
+}
+void runLog(uint8_t kind, uint8_t src, float v, uint32_t dur_s, uint8_t flags) {
+  runLogAt(0, kind, src, v, dur_s, flags);
 }
 
 // Drain the queue to flash. LOOP CORE ONLY.
@@ -2043,17 +2059,37 @@ void evalAutoStart(float v) {
   // never issued a start. 0.3 V hysteresis so it can't chatter at the threshold.
   static bool     engRunning = false;
   static uint32_t engOnMs    = 0;
-  bool nowRun = engRunning ? (v >= AS_ALT_V - 0.3f) : (valid && v >= AS_ALT_V);
+  static uint32_t candMs     = 0;          // when the pending edge was first seen
+  static bool     candTo     = false;      // the state it is heading to
+
+  bool inst = engRunning ? (v >= AS_ALT_V - 0.3f) : (valid && v >= AS_ALT_V);
+  bool nowRun = engRunning;                // only changes once an edge is CONFIRMED
+  uint32_t edgeMs = now;
+  if (inst != engRunning) {
+    if (candMs == 0 || candTo != inst) { candMs = now; candTo = inst; }
+    uint32_t need = inst ? AS_RUN_ON_S : AS_RUN_OFF_S;
+    if ((now - candMs) / 1000 >= need) { nowRun = inst; edgeMs = candMs; candMs = 0; }
+  } else {
+    candMs = 0;                            // fell back to the current state; forget it
+  }
+  // Wall-clock of the edge itself, so a 120 s confirmation does not shift the
+  // recorded time or inflate the gap to the previous run.
+  uint32_t edgeTs = 0;
+  if (timeIsValid()) {
+    uint32_t backS = (now - edgeMs) / 1000;
+    edgeTs = (uint32_t)time(nullptr) - backS;
+  }
+
   if (nowRun && !engRunning) {
-    engOnMs     = millis();
-    g_lastRunTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
+    engOnMs     = edgeMs;
+    g_lastRunTs = edgeTs;
     if (g_lastRunTs) prefs.putUInt("last_run", g_lastRunTs);
     cdMaybeFlush(now, true);
     logLine("ENGINE ON: alternator charging at %.2f V", v);
     // Attribute the run: a start we are verifying is ours, anything else is the
     // key or the FOB. This is what makes "time between manual and auto starts"
     // answerable months later.
-    runLog(RUN_ON, g_verifying ? (g_verifyAuto ? RSRC_AUTO : RSRC_MANUAL) : RSRC_EXT, v, 0, 0);
+    runLogAt(edgeTs, RUN_ON, g_verifying ? (g_verifyAuto ? RSRC_AUTO : RSRC_MANUAL) : RSRC_EXT, v, 0, 0);
     g_sbFlush = true;                             // don't strand the transition in RAM
     // The engine is running but WE did not ask for it -- key, FOB or someone
     // else. Record it in the start history so the log is a complete account of
@@ -2073,13 +2109,13 @@ void evalAutoStart(float v) {
     prefs.putUInt("lt_ref_ts", 0); prefs.putUInt("lt_due", 0);
     resetDrainBuckets("engine started");
   } else if (!nowRun && engRunning) {
-    uint32_t ran = (millis() - engOnMs) / 1000;
+    uint32_t ran = (edgeMs - engOnMs) / 1000;
     logLine("ENGINE OFF: charging ended at %.2f V after %lum %lus",
             v, (unsigned long)(ran / 60), (unsigned long)(ran % 60));
-    runLog(RUN_OFF, RSRC_EXT, v, ran, 0);
+    runLogAt(edgeTs, RUN_OFF, RSRC_EXT, v, ran, 0);
     g_sbFlush = true;                             // ditto -- this edge starts the drain clock
-    if (timeIsValid()) {                          // arm the settled reference
-      g_ltDue = (uint32_t)time(nullptr) + LT_SETTLE_S;
+    if (edgeTs) {                                 // arm the settled reference
+      g_ltDue = edgeTs + LT_SETTLE_S;
       prefs.putUInt("lt_due", g_ltDue);
       logLine("drain baseline: will anchor in %luh (after settling)",
               (unsigned long)(LT_SETTLE_S / 3600));
@@ -4544,6 +4580,25 @@ void handleRuns() {
   server.sendContent("");
 }
 
+// POST /runs?reset=1 -- discard the recorded run history and rebuild it from the
+// reconstruction table. Exists because fw <= 4.50 logged one drive as fourteen
+// runs (see AS_RUN_OFF_S); the backfilled entries are kept, the artefacts go.
+void handleRunsReset() {
+  trackReq();
+  if (server.arg("reset") != "1") {
+    server.send(400, "application/json", "{\"ok\":false,\"detail\":\"pass reset=1\"}");
+    return;
+  }
+  LittleFS.remove(RUN_FILE);
+  LittleFS.remove(RUN_OLD);
+  seedRunHistory();                                // rewrites the reconstructed entries
+  logLine("run history reset; rebuilt from the %d reconstructed entries", RUN_SEED_N);
+  char j[96];
+  snprintf(j, sizeof(j), "{\"ok\":true,\"seeded\":%d}", RUN_SEED_N);
+  g_out_total += strlen(j);
+  server.send(200, "application/json", j);
+}
+
 // POST /autostart?en=0|1&volts=12.2&hold=60&cool=7200
 // Any subset of params. Arming (en=1) is what makes the car able to start
 // itself; it ships disabled and the setting persists in NVS.
@@ -5100,7 +5155,8 @@ void setup() {
   server.on("/powerup", HTTP_POST, handlePowerup);
   server.on("/logs", HTTP_GET, handleLogsPage);
   server.on("/logtext", HTTP_GET, handleLogText);
-  server.on("/runs",    HTTP_GET, handleRuns);
+  server.on("/runs",    HTTP_GET,  handleRuns);
+  server.on("/runs",    HTTP_POST, handleRunsReset);
   server.on("/logpage", HTTP_GET, handleLogPage);   // server-side paged log (25/req)
   server.on("/autostart", HTTP_POST, handleAutoStart);
   server.on("/starts", HTTP_GET, handleStarts);

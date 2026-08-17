@@ -82,6 +82,61 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-17 — fw 4.51: one drive was logged as fourteen runs
+
+### Verified — the run history's live path works
+The 2026-08-17 drive produced 32 events with `flags=0` (no reconstructed marker)
+and `src=2` (key/FOB), confirming `runLog()` → 8-slot queue → `flushRunsToFlash()`
+from the safety task. That was the last unproven piece of 4.46.
+
+### Fixed — but the data it produced was wrong
+One continuous drive, **13:21:24 → 14:57:30, was recorded as fourteen separate
+runs**, several lasting 1–2 seconds:
+
+```
+13:22:01  OFF  12.77 V  ran 37s
+13:22:09  ON   14.16 V     (+8s)
+13:22:26  OFF  12.66 V  ran 17s
+13:22:28  ON   13.48 V     (+2s)
+...
+14:13:11  ON   13.29 V
+14:13:12  OFF  12.52 V  ran 1s
+14:13:13  ON   13.27 V     (+1s)
+```
+
+The engine-state detector had **voltage hysteresis but no time hysteresis**. The
+off edge fires at `AS_ALT_V - 0.3` = 12.9 V, and this alternator dips below that
+transiently at idle and under load. The data proves the signal really is crossing
+the line rather than measurement noise: every spurious `OFF` read **12.52–12.90 V**
+while every `ON` read **13.2–14.2 V**. Voltage alone cannot separate a dip from a
+shutdown.
+
+Time can. An edge must now persist before it counts — `AS_RUN_OFF_S = 120`,
+`AS_RUN_ON_S = 5`. Chosen against this dataset: every artefact was under 60 s,
+and the shortest gap that looked like a genuine stop was 164 s.
+
+**The edge is timestamped when it first appeared, not when it was confirmed**, so
+run durations and the gaps between runs stay exact rather than being shifted by
+the debounce. `runLogAt()` carries that timestamp; `g_lastRunTs`, the run
+duration and the 12 h drain baseline all use it.
+
+This mattered beyond cosmetics: `g_lastRunTs` moves on every ENGINE ON, so each
+false edge also reset the drain baseline and discarded the in-progress hourly
+bucket. Fourteen times in ninety minutes.
+
+### Added — `POST /runs?reset=1`
+Discards the recorded run history and rebuilds it from the reconstruction table,
+keeping the six backfilled entries and dropping the artefacts this bug wrote. Not
+invoked automatically — the junk entries are real observations of voltage
+crossings, just wrong about what they mean, and that is the owner's call.
+
+### Worth watching, unrelated to the logging
+The alternator reading **12.52 V while driving** is low. It may be nothing more
+than idle plus load on a tired battery, but it is the kind of thing this archive
+now records hourly, and the year view will show whether it drifts.
+
+---
+
 ## 2026-08-17 — fw 4.50: OTA was resetting the board, and boot lines were six hours out
 
 ### Fixed — OTA tripped the *interrupt* watchdog, not the task watchdog

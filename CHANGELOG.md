@@ -82,6 +82,73 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-17 — fw 4.50: OTA was resetting the board, and boot lines were six hours out
+
+### Fixed — OTA tripped the *interrupt* watchdog, not the task watchdog
+A dozen consecutive uploads failed, stopping at wildly varying byte counts
+(66 KB, 97 KB, 597 KB, 809 KB, sometimes the full 1.28 MB with no reply). The
+cause was in the log all along, on the boot line after one of them:
+
+```
+2026-08-17 12:36:55  boot: fw 4.48, CPU 80 MHz, reset=interrupt-watchdog
+```
+
+Not `task-watchdog` — the **interrupt** watchdog, which fires when interrupts
+stay disabled too long. `Update.write()` erases 4 KB sectors with the cache off,
+and on the S3 that stalls **both** cores. Two things were making it worse:
+
+- **Core 0 was still touching the filesystem mid-OTA.** `recordSample()` calls
+  `LittleFS.usedBytes()` for `disk_kb` every 60 s, and the loop runs five
+  `flush*ToFlash()` helpers. A second flash user during an erase is exactly how
+  that watchdog fires. A `g_otaActive` flag now suspends all of it; `disk_kb`
+  reuses its last value for the duration.
+- **No yield between chunks.** Back-to-back erases never let interrupts run. A
+  1 ms yield every 32 KB costs ~40 ms across a 1.3 MB image and stops it dead.
+
+Diagnosis was slower than it should have been because **`/update` reported
+nothing**. Failures went to `Serial`, which is unattached in a parked car, so a
+dozen attempts left no trace. Flagged as a nice-to-have days ago; it actively
+blocked this. Now `Update.errorString()` is returned in the response body *and*
+written to the event log, along with accept/abort:
+
+```
+2026-08-17 12:46:58  OTA accepted: 1279136 bytes, rebooting
+```
+
+**Verified the fix, not the workaround.** `curl --limit-rate 50k` had got a full
+image through on 4.49 — but that proved only that pacing the *sender* helped. So
+4.50 was re-flashed with **no rate limit at all**: 24.4 s, `HTTP 200 OK`, clean
+reboot. That is the in-firmware change working, at the same speed as every
+successful flash before the problem appeared.
+
+### Fixed — early boot lines were stamped in UTC
+`setenv("TZ")/tzset()` ran *after* the archive restores, so those lines were six
+hours ahead of the boot line printed in the same second:
+
+```
+2026-08-17 18:36:55  hourly archive restored: 72 hours from flash
+2026-08-17 12:36:55  boot: fw 4.49, CPU 80 MHz, reset=software
+```
+
+Cosmetic, but it reads as a clock fault in a log meant to be trusted. The
+timezone is now applied as the first thing `setup()` does, before anything can
+call `logLine()`. All three lines now agree:
+
+```
+2026-08-17 12:45:31  hourly archive restored: 72 hours from flash
+2026-08-17 12:45:31  daily archive restored: 1 days from flash
+2026-08-17 12:45:31  boot: fw 4.50, CPU 80 MHz, reset=software
+```
+
+### Correction to the 4.49 entry
+That entry blamed the failed flash on RF degradation, citing 46.7% ping loss.
+**That was wrong.** The identical figure to the gateway and to a *wired* host
+should have been the tell, and TCP to the NAS was running at 16.2 MB/s
+throughout. ICMP was being rate-limited; the link was fine. The real cause is
+above, and it was on the board.
+
+---
+
 ## 2026-08-17 — fw 4.49: countdown flapping collapses to two lines per 30 minutes
 
 ### Fixed — the flap consolidation could never collapse the countdown

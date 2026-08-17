@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.49";
+const char* FW_VERSION = "4.50";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -389,6 +389,12 @@ const int RUN_SEED_N = sizeof(RUN_SEED) / sizeof(RUN_SEED[0]);
 // single slot because a fire and its ENGINE ON can land close together.
 const int      RUNQ_N = 8;
 RunEvent       g_runq[RUNQ_N];
+// Set for the duration of an OTA. The safety task on core 0 must not touch the
+// filesystem while Update.write() is erasing: on the S3 a flash erase disables
+// the cache for BOTH cores, and a second core stalled inside a critical section
+// at that moment is exactly how the interrupt watchdog fires. Observed as
+// `boot: fw 4.48, reset=interrupt-watchdog` after a dozen failed uploads.
+volatile bool  g_otaActive = false;
 volatile int   g_runqHead = 0, g_runqTail = 0;
 static portMUX_TYPE g_runqMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -1310,7 +1316,11 @@ void recordSample() {
   s.vbatt   = readBatteryVolts();
   s.temp    = g_lastTemp;            // refreshed by the safety task just before this call
   s.heap_kb = (uint16_t)(ESP.getFreeHeap() / 1024);
-  s.disk_kb = (uint16_t)(LittleFS.usedBytes() / 1024);
+  // Reading the filesystem here means core 0 touching flash. During an OTA that
+  // races Update.write()'s erases, so reuse the last value instead.
+  static uint16_t lastDiskKb = 0;
+  if (!g_otaActive) lastDiskKb = (uint16_t)(LittleFS.usedBytes() / 1024);
+  s.disk_kb = lastDiskKb;
   s.net_in  = g_in_total  - lastInSnap;   lastInSnap  = g_in_total;
   s.net_out = g_out_total - lastOutSnap;  lastOutSnap = g_out_total;
   s.rssi    = apMode ? 0 : (int16_t)WiFi.RSSI();
@@ -4899,6 +4909,15 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
+  // Timezone FIRST, before anything can call logLine(). It used to be applied
+  // after the archive restores, so those lines were stamped in UTC while the
+  // boot line immediately after them was local -- three log entries in the same
+  // second, six hours apart, which reads as a clock fault rather than an
+  // ordering detail:
+  //   2026-08-17 18:36:55 hourly archive restored: 72 hours from flash
+  //   2026-08-17 12:36:55 boot: fw 4.49, CPU 80 MHz, reset=software
+  setenv("TZ", TZ_INFO, 1); tzset();
+
   // Restore persisted power/perf settings from NVS and apply the CPU clock
   // now (before WiFi). Falls back to the compiled defaults on first boot or
   // a bad/garbage value.
@@ -4962,7 +4981,6 @@ void setup() {
   loadStarts();
   Serial.printf("Loaded %d prior start events from flash.\n", g_startCount);
 
-  setenv("TZ", TZ_INFO, 1); tzset();               // local time for logs even before NTP replies
   sntp_set_time_sync_notification_cb(onNtpSync);   // log each NTP sync
   WiFi.onEvent(onWiFiEvent);                        // verbose WiFi diagnostics -> event log
   logLine("boot: fw %s, CPU %u MHz, reset=%s",
@@ -5015,7 +5033,12 @@ void setup() {
   server.on("/update", HTTP_POST,
     []() {                                    // runs after the upload finishes
       bool ok = !Update.hasError();
-      server.send(200, "text/plain", ok ? "OK - flashed" : "FAILED");
+      // The reason used to go only to Serial, which is unattached in the car, so
+      // a dozen failed uploads left no trace anywhere. Return it.
+      char body[96];
+      if (ok) snprintf(body, sizeof(body), "OK - flashed");
+      else    snprintf(body, sizeof(body), "FAILED: %s", Update.errorString());
+      server.send(200, "text/plain", body);
       flushLogToFlash();                          // persist pending lines before the OTA reboot
       delay(800);
       if (ok) ESP.restart();
@@ -5023,15 +5046,45 @@ void setup() {
     []() {                                    // streams the uploaded .bin into the spare OTA slot
       HTTPUpload& u = server.upload();
       if (u.status == UPLOAD_FILE_START) {
+        g_otaActive = true;                 // core 0 stops touching the filesystem
         Serial.printf("OTA start: %s\n", u.filename.c_str());
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.printError(Serial);
+          logLine("OTA REJECTED at start: %s", Update.errorString());
+          g_otaActive = false;
+        }
       } else if (u.status == UPLOAD_FILE_WRITE) {
         loopMark("ota");
         esp_task_wdt_reset();   // a 1.1 MB OTA over weak WiFi can span many seconds; keep the WDT fed
-        if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+        if (Update.write(u.buf, u.currentSize) != u.currentSize) {
+          Update.printError(Serial);
+          logLine("OTA WRITE FAILED at %u bytes: %s",
+                  (unsigned)u.totalSize, Update.errorString());
+        }
+        // Yield between chunks. Update.write() erases 4 KB sectors with the
+        // cache off; back-to-back erases starve interrupts on both cores until
+        // the interrupt watchdog resets the board mid-upload. A 1 ms yield every
+        // 32 KB costs about 40 ms across a 1.3 MB image and stops that dead.
+        static uint32_t sinceYield = 0;
+        sinceYield += u.currentSize;
+        if (sinceYield >= 32768) { sinceYield = 0; delay(1); }
       } else if (u.status == UPLOAD_FILE_END) {
-        if (Update.end(true)) Serial.printf("OTA done: %u bytes, rebooting\n", (unsigned)u.totalSize);
-        else Update.printError(Serial);
+        if (Update.end(true)) {
+          Serial.printf("OTA done: %u bytes, rebooting\n", (unsigned)u.totalSize);
+          logLine("OTA accepted: %u bytes, rebooting", (unsigned)u.totalSize);
+          flushLogToFlash();
+        } else {
+          Update.printError(Serial);
+          logLine("OTA FAILED at end (%u bytes): %s",
+                  (unsigned)u.totalSize, Update.errorString());
+          flushLogToFlash();
+        }
+        g_otaActive = false;
+      } else if (u.status == UPLOAD_FILE_ABORTED) {
+        Update.abort();
+        logLine("OTA ABORTED by client at %u bytes", (unsigned)u.totalSize);
+        flushLogToFlash();
+        g_otaActive = false;
       }
     });
   server.on("/transmit", HTTP_POST, handleTransmit);
@@ -5182,10 +5235,15 @@ void loop() {
   if (apMode) dnsServer.processNextRequest();
   loopMark("http");   server.handleClient();       // top suspect: a slow client on a weak link
   if (SNMP_ENABLED) { loopMark("snmp"); snmp.poll(); }
-  loopMark("logflush"); flushLogToFlash();          // persist any new event-log lines (idle-cheap)
-  flushDrainToFlash();                              // and the hourly drain bucket, if one completed
-  flushRunsToFlash();                               // and any engine start/stop events
-  flushDailyToFlash();                              // and the daily bucket, at midnight
+  // All filesystem writes are suspended while an OTA is streaming: Update.write()
+  // erases with the cache off, and a second flash user at that moment is how the
+  // interrupt watchdog reset the board mid-upload.
+  if (!g_otaActive) {
+    loopMark("logflush"); flushLogToFlash();        // persist any new event-log lines (idle-cheap)
+    flushDrainToFlash();                            // and the hourly drain bucket, if one completed
+    flushRunsToFlash();                             // and any engine start/stop events
+    flushDailyToFlash();                            // and the daily bucket, at midnight
+  }
   loopMark("loop");
   uint32_t now = millis();
 
@@ -5266,7 +5324,7 @@ void loop() {
   // a batch only when one is ready, which is ~48 times a day instead of 144
   // rewrites of the entire ring. SAVE_MS is now only a backstop so a partly-full
   // batch still reaches flash if sampling stops for some reason.
-  flushSamplesToFlash();
+  if (!g_otaActive) flushSamplesToFlash();           // no filesystem writes mid-OTA
   if (now - lastSave >= SAVE_MS) { lastSave = now; if (g_sbN) g_sbFlush = true; }
   if (now - lastPrint >= 2000) {
     lastPrint = now;

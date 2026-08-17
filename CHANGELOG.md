@@ -115,11 +115,10 @@ written to the event log, along with accept/abort:
 2026-08-17 12:46:58  OTA accepted: 1279136 bytes, rebooting
 ```
 
-**Verified the fix, not the workaround.** `curl --limit-rate 50k` had got a full
-image through on 4.49 — but that proved only that pacing the *sender* helped. So
-4.50 was re-flashed with **no rate limit at all**: 24.4 s, `HTTP 200 OK`, clean
-reboot. That is the in-firmware change working, at the same speed as every
-successful flash before the problem appeared.
+**What was claimed as verification does not hold.** 4.50 was re-flashed with no
+rate limit — 24.4 s, `HTTP 200 OK`, clean reboot — and that was presented as the
+in-firmware change working. The laptop's Wi-Fi had already been fixed by then, so
+the result says nothing about these changes. See the retraction below.
 
 ### Fixed — early boot lines were stamped in UTC
 `setenv("TZ")/tzset()` ran *after* the archive restores, so those lines were six
@@ -140,12 +139,35 @@ call `logLine()`. All three lines now agree:
 2026-08-17 12:45:31  boot: fw 4.50, CPU 80 MHz, reset=software
 ```
 
-### Correction to the 4.49 entry
-That entry blamed the failed flash on RF degradation, citing 46.7% ping loss.
-**That was wrong.** The identical figure to the gateway and to a *wired* host
-should have been the tell, and TCP to the NAS was running at 16.2 MB/s
-throughout. ICMP was being rate-limited; the link was fine. The real cause is
-above, and it was on the board.
+### Retracted: the "correction" to the 4.49 entry was itself wrong
+This entry originally claimed the 4.49 RF diagnosis was a mistake. **It was not.
+The link really was degraded — on the laptop, not the car.** The owner switched
+MOBILE off 5 GHz and the problem went away; measured afterwards on a healthy
+link, loss to the gateway is **0%** at 540 Mbit/s, against 46.7% during the
+failures.
+
+Two errors produced the bad retraction, both worth keeping:
+
+- **The inference was backwards.** Identical loss to the board, the gateway *and*
+  a wired host was read as "the measurement must be broken". Those three paths
+  share a first hop — the laptop's own Wi-Fi — so identical loss across all of
+  them is the strongest possible evidence that **the shared hop is the fault**.
+  It pointed straight at the answer and was used to argue the opposite.
+- **The supporting throughput number was meaningless.** "TCP to the NAS at
+  16.2 MB/s" was a `dd` of a file the compiler had written minutes earlier: page
+  cache, not network. It never touched the wire.
+
+### Consequently, the OTA fix below is NOT verified
+The 4.50 changes were declared proven because a full-speed flash succeeded in
+24.4 s without a rate limit. **That test is confounded** — the laptop's link had
+been repaired by then, which alone explains it. The changes remain defensible on
+their own terms (a second core must not touch the filesystem while
+`Update.write()` erases with the cache off, and `/update` must report failures
+somewhere that survives), but there is **no evidence yet that they fixed
+anything**, and the `interrupt-watchdog` reset may well have been a *consequence*
+of a stalling upload rather than an independent fault.
+
+Treat the OTA fix as untested hardening until a flash fails again, or does not.
 
 ---
 

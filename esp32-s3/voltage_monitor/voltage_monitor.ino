@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.48";
+const char* FW_VERSION = "4.49";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -391,6 +391,41 @@ const int      RUNQ_N = 8;
 RunEvent       g_runq[RUNQ_N];
 volatile int   g_runqHead = 0, g_runqTail = 0;
 static portMUX_TYPE g_runqMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ---- countdown flap windows ----------------------------------------------
+// A battery dithering across the trigger emits a STARTED/RESET pair every few
+// seconds. The generic flap consolidation further down cannot collapse these
+// because it keys on the FULL line text and every line carries its own voltage
+// -- 12.19 V and 12.20 V are different strings, so the count never accumulates
+// and the ring fills with near-identical lines.
+//
+// So the countdown stops logging per event entirely. Events accumulate and each
+// window emits exactly TWO lines -- one for starts, one for resets. Voltages
+// become a range, so a start at 12.15 V and one at 12.20 V fold into the same
+// line instead of splitting it, which is what defeated the old mechanism.
+//
+// A window is also closed early, before an auto-start fires or an engine edge is
+// logged, so a summary never lands after the event it led up to. That is what
+// keeps the log readable in order despite the batching.
+//
+// Lines are kept short deliberately: LOG_LEN is 108 including a 20-character
+// timestamp, so the reset line has an 88-character budget and the reason list is
+// truncated rather than allowed to push the counts off the end.
+const uint32_t CD_WIN_MS   = 1800000UL;   // 30 min
+const int      CD_VERBOSE  = 0;           // 0 = never log individually; one summary per kind
+const int      CD_WHY_N    = 4;           // distinct reset reasons tracked per window
+
+struct CdWin {
+  uint32_t t0ms;                  // window start (millis; 0 = no window open)
+  uint16_t n;                     // events seen in this window
+  uint16_t suppressed;            // of which this many were not logged individually
+  float    vmin, vmax;
+  uint32_t smax;                  // RESET only: longest countdown reached, seconds
+  const char* why[CD_WHY_N];      // RESET only: distinct reasons (string literals)
+  uint16_t whyN[CD_WHY_N];
+  uint8_t  whys;
+};
+CdWin g_cdStart = {0}, g_cdReset = {0};
 
 // The single place a Sample is mapped onto the series vector. Both the hourly
 // accumulator and /agg's day span go through here, so they cannot drift apart.
@@ -1515,6 +1550,61 @@ void loadHistory() {
                   a, b, c, a + b + c);
 }
 
+// ---- countdown window bookkeeping ----------------------------------------
+// Returns true if the caller should log this event individually.
+static bool cdNote(CdWin& w, uint32_t nowMs, float v, uint32_t secs, const char* why) {
+  if (w.t0ms == 0 || (uint32_t)(nowMs - w.t0ms) >= CD_WIN_MS) {
+    w.t0ms = nowMs; w.n = 0; w.suppressed = 0;
+    w.vmin = 1e30f; w.vmax = -1e30f; w.smax = 0; w.whys = 0;
+  }
+  w.n++;
+  if (v < w.vmin) w.vmin = v;
+  if (v > w.vmax) w.vmax = v;
+  if (secs > w.smax) w.smax = secs;
+  if (why) {
+    int slot = -1;
+    for (int i = 0; i < w.whys; i++) if (strcmp(w.why[i], why) == 0) { slot = i; break; }
+    if (slot < 0 && w.whys < CD_WHY_N) { slot = w.whys++; w.why[slot] = why; w.whyN[slot] = 0; }
+    if (slot >= 0) w.whyN[slot]++;
+  }
+  if (w.n <= CD_VERBOSE) return true;
+  w.suppressed++;
+  return false;
+}
+
+// Emit the summary for a window that has anything suppressed, and clear it.
+static void cdFlush(CdWin& w, bool isReset) {
+  if (w.t0ms == 0) { return; }
+  if (w.n == 0) { w.t0ms = 0; return; }
+  uint32_t mins = CD_WIN_MS / 60000UL;
+  if (isReset) {
+    char reasons[40]; reasons[0] = 0;          // budget-capped; truncates, never overruns
+    for (int i = 0; i < w.whys; i++) {
+      size_t l = strlen(reasons);
+      if (l + 8 >= sizeof(reasons)) break;
+      snprintf(reasons + l, sizeof(reasons) - l, "%s%s x%u",
+               l ? ", " : "", w.why[i], (unsigned)w.whyN[i]);
+    }
+    logLine("countdown: %u reset%s/%lum, %.2f-%.2f V, max %lus/%lus -- %s",
+            (unsigned)w.n, w.n == 1 ? "" : "s", (unsigned long)mins,
+            w.vmin, w.vmax, (unsigned long)w.smax, (unsigned long)g_as_hold,
+            reasons[0] ? reasons : "recovered");
+  } else {
+    logLine("countdown: %u start%s/%lum, %.2f-%.2f V (trigger %.2f, need %lus)",
+            (unsigned)w.n, w.n == 1 ? "" : "s", (unsigned long)mins,
+            w.vmin, w.vmax, g_as_volts, (unsigned long)g_as_hold);
+  }
+  w.t0ms = 0;
+}
+
+// Close both windows if they have expired, or unconditionally when something
+// worth reading in order is about to be logged (a fire, an engine edge) so the
+// summary never lands after the event it preceded.
+void cdMaybeFlush(uint32_t nowMs, bool force) {
+  if (g_cdStart.t0ms && (force || (uint32_t)(nowMs - g_cdStart.t0ms) >= CD_WIN_MS)) cdFlush(g_cdStart, false);
+  if (g_cdReset.t0ms && (force || (uint32_t)(nowMs - g_cdReset.t0ms) >= CD_WIN_MS)) cdFlush(g_cdReset, true);
+}
+
 // ---------- start-event log (LittleFS, survives reboot/brownout) ----------
 
 void saveStarts() {
@@ -1921,6 +2011,7 @@ const char* autoStartState() {
 // "continuously low", never "low on and off".
 void evalAutoStart(float v) {
   uint32_t now = millis();
+  cdMaybeFlush(now, false);                     // roll the 30-minute windows
   static uint32_t lastEvalMs = 0;
   uint32_t dt = lastEvalMs ? (now - lastEvalMs) / 1000 : 0;   // seconds since last call
   lastEvalMs = now;
@@ -1947,6 +2038,7 @@ void evalAutoStart(float v) {
     engOnMs     = millis();
     g_lastRunTs = timeIsValid() ? (uint32_t)time(nullptr) : 0;
     if (g_lastRunTs) prefs.putUInt("last_run", g_lastRunTs);
+    cdMaybeFlush(now, true);
     logLine("ENGINE ON: alternator charging at %.2f V", v);
     // Attribute the run: a start we are verifying is ours, anything else is the
     // key or the FOB. This is what makes "time between manual and auto starts"
@@ -2075,9 +2167,12 @@ void evalAutoStart(float v) {
   // you most want explained after the fact -- especially the common case, the
   // battery recovering above the threshold.
   #define clearLow(why) do { \
-      if (g_lowSince) logLine("LOW-V countdown RESET after %lus of %lus (%s) at %.2f V", \
-                              (unsigned long)((now - g_lowSince) / 1000), \
-                              (unsigned long)g_as_hold, (why), v); \
+      if (g_lowSince) { \
+        uint32_t _el = (now - g_lowSince) / 1000; \
+        if (cdNote(g_cdReset, now, v, _el, (why))) \
+          logLine("LOW-V countdown RESET after %lus of %lus (%s) at %.2f V", \
+                  (unsigned long)_el, (unsigned long)g_as_hold, (why), v); \
+      } \
       g_lowSince = 0; } while (0)
 
   if (!g_as_en)                                                { clearLow("auto-start off");   return; }
@@ -2093,14 +2188,19 @@ void evalAutoStart(float v) {
 
   if (g_lowSince == 0) {                        // first low reading -- start the clock
     g_lowSince = now;
-    logLine("LOW-V countdown STARTED: %.2f V below %.2f V, need %lus", v, g_as_volts,
-            (unsigned long)g_as_hold);
+    if (cdNote(g_cdStart, now, v, 0, nullptr))
+      logLine("LOW-V countdown STARTED: %.2f V below %.2f V, need %lus", v, g_as_volts,
+              (unsigned long)g_as_hold);
     Serial.printf("auto-start: %.2f V below %.2f V, counting %lu s\n",
                   v, g_as_volts, (unsigned long)g_as_hold);
     return;
   }
   if ((now - g_lowSince) / 1000 < g_as_hold) return;    // still sustaining
   if (autoStartCooldownLeft() > 0) return;              // too soon after the last one
+
+  // Summarise any pending flapping FIRST, so the fire is not preceded in the log
+  // by a window summary that describes the seconds leading up to it.
+  cdMaybeFlush(now, true);
 
   // ---- every guard passed: fire the starter ----
   // Serialize with any manual /transmit on the loop task: the CC1101 SPI and the
@@ -3115,7 +3215,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3232,13 +3332,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=448"></script>
+<script src="/app.js?v=449"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3327,13 +3427,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=448"></script>
+<script src="/app.js?v=449"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3398,13 +3498,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=448"></script>
+<script src="/app.js?v=449"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3436,13 +3536,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=448"></script>
+<script src="/app.js?v=449"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3468,7 +3568,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=448"></script>
+<script src="/app.js?v=449"></script>
 </body></html>
 )HTML";
 
@@ -4233,7 +4333,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=448">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=449">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -4551,7 +4651,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=448"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

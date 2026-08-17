@@ -82,6 +82,61 @@ Also: `/starts` returns `[]` — **auto-start has never fired.**
 
 ---
 
+## 2026-08-17 — fw 4.49: countdown flapping collapses to two lines per 30 minutes
+
+### Fixed — the flap consolidation could never collapse the countdown
+The 4.35 mechanism keys on the **full line text including voltages**, so
+`12.19 V` and `12.20 V` are different strings and the repeat count never
+accumulates. A battery dithering across the trigger therefore filled the
+1000-line ring with near-identical pairs and buried everything worth reading:
+
+```
+11:47:22 LOW-V countdown STARTED: 12.19 V below 12.20 V, need 60s  [repeated 2 times]
+11:47:07 LOW-V countdown RESET after 1s of 60s (voltage recovered) at 12.22 V
+11:47:06 LOW-V countdown STARTED: 12.20 V below 12.20 V, need 60s
+...
+```
+
+The countdown no longer logs per event at all. Events accumulate into a
+**30-minute window** which emits exactly **two lines**, one per kind, with the
+voltages as a range so different values fold together instead of splitting:
+
+```
+countdown: 10 starts/30m, 12.18-12.20 V (trigger 12.20, need 60s)
+countdown: 15 resets/30m, 12.19-12.22 V, max 30s/60s -- voltage recovered x14, park-confirm x1
+```
+
+Reset **reasons are preserved with counts**, so the nine distinct guards that
+4.34 made visible are not lost to the batching — a window that is mostly
+`voltage recovered` but contains one `park-confirm` still says so.
+
+A window is also **closed early**, before an auto-start fires or an engine edge
+is logged, so a summary never lands after the event it led up to.
+
+Lines are deliberately terse: `LOG_LEN` is 108 including a 20-character
+timestamp, leaving 88 for the message, and the reason list is budget-capped so it
+truncates rather than pushing the counts off the end. Worst case measured at 103.
+
+Verified by simulating the aggregator against the reported burst before
+flashing: 20 log lines become 2, mixed reasons survive with counts, and a lone
+countdown still produces a correctly-singular summary.
+
+### Flash blocked — the link, not the firmware
+Could not be OTA'd when built. The board is healthy and responsive, but:
+
+```
+ping:  15 sent, 8 received, 46.7% loss, RTT to 212 ms
+rssi:  -58/-59 earlier today -> -61 to -65
+OTA:   809,697 of 1,278,839 bytes before the connection dropped
+```
+
+Small single round-trip requests still succeed (11 of 12), which is why the
+dashboard stays usable while a 1.28 MB sustained transfer cannot finish. Nothing
+in this release is implicated; it is the same RF-degradation class as the
+original `IoT` AP problem, now on `Password is Taco` ch10.
+
+---
+
 ## 2026-08-16 — fw 4.48: the detail popup's tooltip was painting behind it
 
 ### Fixed — a z-order bug that read as "the tooltip shows the wrong content"

@@ -228,6 +228,34 @@ deep-sleep mode; a bare module would sleep at µA, at which point battery self-d
 dominates anyway (~months). For a parked car, deep-sleep duty cycling is the move;
 always-on WiFi will flatten a small battery in ~2 weeks.
 
+> **Measured on the installed car, August 2026.** The table above is bench
+> estimation for the board alone. In the vehicle the *total* parked draw —
+> car plus board — measures **~280 mA**, i.e. **12.5 % of the battery per
+> day**, flat in roughly 8 days. The board is a small part of that; the car
+> has an unlocated parasitic fault. Two independent fits agree (24 h
+> least-squares **-6.3 mV/h**, long-term anchored **-5.5 mV/h**).
+> Full measurements, the healthy-charging profile, and why percent-per-day
+> is a better number than mV/h: [docs/power-budget.md](../../docs/power-budget.md)
+> section 7.
+
+### How the firmware samples — needed to read the graphs correctly
+
+Three different clocks, and the graph shows the fastest one at the slowest rate:
+
+| What | Rate |
+|---|---|
+| ADC read (64 conversions averaged) | every **250 ms** |
+| Auto-start / engine-edge evaluation | every **1 s** |
+| History sample written to the graph | every **60 s** |
+
+`recordSample()` stores **the latest single 250 ms reading, not a per-minute
+average** — so the voltage graph is a **1-in-240 snapshot**. A lone spike on it
+is a real reading, but it is *not* evidence of a sustained condition, and the
+control logic deliberately ignores excursions the graph faithfully records.
+Engine on/off is detected at **≥13.2 V held 5 s** and **<13.10 V held 120 s**,
+both timestamped at the moment the edge first appeared rather than when it was
+confirmed.
+
 ---
 
 ## 8. Roadmap / extensions

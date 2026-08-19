@@ -14,6 +14,83 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-19 — docs: the measurements land in the documentation
+
+No firmware change. Everything the board has actually recorded was still only
+in commit messages and this changelog; the docs a user reads were pure
+prediction. Three of them now carry results.
+
+### Added — `docs/power-budget.md` section 7, "Measured results"
+
+The document predicted **-1.2 to -1.9 mV/h** for car + board as designed. The
+installed board measures **-6.3 mV/h** (24 h least-squares, r² 0.80) and
+**-5.5 mV/h** (long-term anchored) — two independent fits agreeing at
+**~280 mA**. Its own section 6 already told you what that means: *"worse than
+-2.5 mV/h -> the fault is present."*
+
+Also documented there, all from real recordings:
+
+- **Drain as %/day**, and why it beats mV/h — the rested curve flattens as the
+  battery drains, so a *constant current* reads as a *steepening* mV/h.
+  Percent-per-day removes that distortion. Includes the capacity-free shortcut
+  `%/day ≈ 2.4 × |mV/h|` for mental arithmetic at the car.
+- **What healthy charging looks like** — 14.27 V peak tapering to 13.6 V, and
+  the note that the taper is the regulator backing off on a full battery, not a
+  weak alternator.
+- **Surface charge**, with the firmware bug it caused as the worked example, and
+  the general rule: any threshold compared against a resting battery must clear
+  rested-plus-surface-charge, not just rested.
+- **Why a lone graph spike is not a sustained event** (below).
+- **Why two independent debounces are needed**, using the fourteen-runs bug.
+
+### Fixed — two stale claims in `docs/power-budget.md`
+
+- *"There is no temperature compensation"* — there is now. The fit is
+  V ~ time + temp and reports `drain_mvpc`, measured at about **+7 mV/°C** on
+  this car. Larger than pure OCV tempco because it absorbs the whole day/night
+  cycle, not just battery chemistry.
+- *"The system is net restorative"* — **not on this car.** That conclusion rests
+  on ~1.5 Ah/day; the measured draw is **6.7 Ah/day, 4.5x**. One 15-minute cycle
+  returns 4.8 Ah, covering ~17 hours rather than three days. Auto-start buys
+  time until you drive; it cannot outrun the fault. Flagged in place rather than
+  rewritten, since the design logic is sound and only the input is wrong.
+
+### Added — the sampling architecture, in two docs
+
+Worth documenting because it changes how the graphs should be read:
+
+| What | Rate |
+|---|---|
+| ADC read (64 conversions averaged) | every 250 ms |
+| Auto-start / engine-edge evaluation | every 1 s |
+| History sample written to the graph | every 60 s |
+
+`recordSample()` stores **the latest single 250 ms reading, not a per-minute
+average**, so the voltage graph is a **1-in-240 snapshot**.
+
+This resolves the 13.65 V sample from the 4.57 entry, which was left unexplained
+there. It was a real reading of a **sub-5-second** excursion: the run detector
+needs 5 consecutive seconds above 13.2 V and logged no start, and 64x averaging
+inside one burst rules out a single bad conversion. The once-a-minute logger
+simply landed on it. A lone spike is a real reading but not evidence of a
+sustained condition — the control logic ignores what the graph faithfully
+records, by design.
+
+### Added — `docs/18-long-term-stability.md`, "What this car actually did"
+
+Measured values beside the design targets rather than edited into them: 0 false
+triggers, 0 watchdog reboots, case temperature 51-54 °C against a 55 °C ceiling,
+and the 280 mA row as the single thing to act on. The 2026-08-15 failed start
+is called out as *expected* behaviour for the two-cooldown design — one isolated
+failure is a missed radio burst, a run of them is a dead starter.
+
+### Added — `esp32-s3/docs/voltage-monitor.md`
+
+Its bench estimates (~59 mA drain, flat in ~32 days) now carry the installed
+counterpart, plus the sampling table and the engine-detect thresholds.
+
+---
+
 ## 2026-08-19 — fw 4.57: engine-off edge 12.90 V -> 13.10 V (surface charge straddled it)
 
 ### Fixed — a run that ended at 12:57 had not closed 37 minutes later

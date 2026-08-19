@@ -205,10 +205,15 @@ Fuse-pull procedure:
 - `DRAIN_MIN_N` = 30 means the tile goes "ok" after 30 minutes. That is far too
   short to trust. Treat `ok` as "the maths ran", not "the answer is right" —
   which is why r2 is displayed.
-- **There is no temperature compensation.** Lead-acid OCV tempco is about
-  -1 to -4 mV/°C, so a 15 °C day/night swing is 15–60 mV of pure artefact,
-  comparable to the real signal. **Always fit over whole multiples of 24 h** so
-  the window starts and ends at the same point in the thermal cycle.
+- **Temperature compensation now exists** (it did not when this document was
+  written). The fit is a two-variable least squares, V ~ time + temp, and the
+  coefficient it derives is reported as `drain_mvpc` in `/json` and printed on
+  the dashboard's drain tile. Measured on this car it runs about
+  **+7 mV/°C** — larger than the -1 to -4 mV/°C of pure OCV tempco, because it
+  is absorbing the whole day/night cycle (the battery warms, the board warms,
+  the ADC reference drifts), not just battery chemistry. Fitting over whole
+  multiples of 24 h is still the safer habit, but it is no longer the only
+  thing standing between you and a thermal artefact.
 - ADC resolution is ~5.5 mV per LSB at the battery; averaging helps, r2 gates it.
 - Any gap > 10 min, any reboot and any OTA **ends the window**.
 - **Practical resolution ~±1 mV/h, i.e. ~±50 mA.** Plenty to find a 150–300 mA
@@ -281,8 +286,127 @@ About 10 % of nominal capacity restored per cycle — comfortably more than the
 ~1.5 Ah/day the combined parked load burns. The system is **net restorative**,
 provided auto-start is actually armed.
 
+> **Measured 2026-08-19: this conclusion does not hold on this car.** The real
+> parked draw is **~280 mA, not the ~63 mA assumed above** — that is
+> **6.7 Ah/day, 4.5x the 1.5 Ah/day** this paragraph is built on. One 15-minute
+> cycle returns 4.8 Ah, so it covers about **17 hours**, not three days. Auto-start
+> alone cannot hold the line against the fault; it buys time until you drive.
+> See section 7. The design is sound — the car is not, yet.
+
 Energy spent by the controller during a trigger cycle is on the order of
 100 mAh — negligible against the 4.8 Ah returned.
+
+## 7. Measured results — August 2026
+
+Everything above section 6 is prediction. This section is what the installed
+board actually recorded, so you can see how a real one behaves.
+
+### The fault is present, and two independent methods agree
+
+| Method | Reading |
+|---|---|
+| 24 h least-squares fit (`drain_mvph`, r² 0.80, 1440 samples) | **-6.3 mV/h** |
+| Long-term anchored regression (`lt_mvph`, 103 hourly buckets) | **-5.5 mV/h** |
+| Section 6 prediction, "car + board as designed" | -1.2 to -1.9 mV/h |
+
+Converted with the section 5a rule at 50 Ah, both land near **280 mA**. Section
+6 says *"worse than -2.5 mV/h -> the fault is present and dominates everything
+in this document"*, and it does. Two fits over different spans agreeing to
+within 15 % is a much stronger statement than either alone — treat a single fit
+with suspicion, and always cross-check the two tiles against each other.
+
+### Reading the drain as % of battery per day
+
+The dashboard now prints a second line under both drain tiles: the same rate as
+a share of a full battery per day. **-5.5 mV/h is about 12.5 %/day**; a full
+battery would reach flat in roughly 8 days of sitting.
+
+This is the more useful number of the two, for a reason worth understanding.
+The rested lead-acid curve flattens as the battery drains, so **a constant
+current shows up as a steepening mV/h**. Percent-per-day removes that
+distortion and is directly proportional to current.
+
+There is also a capacity-free shortcut, which falls straight out of the
+section 5a rule:
+
+```
+%/day  ~=  2.4 x |drain mV/h|
+```
+
+The dashboard uses a proper state-of-charge curve rather than this
+linearisation, but the two agree within about 10 % and the identity is handy
+for mental arithmetic at the car.
+
+### What healthy charging looks like
+
+Recorded across a 39-minute drive on 2026-08-19:
+
+| Phase | Voltage |
+|---|---|
+| Engine start, bulk charge | **14.27 V** peak |
+| Tapering as the battery fills | 14.2 -> 13.6 V |
+| Steady late-drive float | **13.58 - 13.65 V** |
+| Immediately after shutdown | 13.11 V, decaying |
+| 20-40 min after shutdown | **12.91 - 12.99 V** |
+| Fully rested, hours later | 12.7 - 12.8 V |
+
+The taper is the voltage regulator backing off on a full battery — **normal, not
+a weak alternator.** If you see a flat 14.2 V that never tapers across a long
+drive, that is the battery still accepting current, i.e. it started deeply
+discharged.
+
+### Surface charge will fool you, and it fooled this firmware
+
+**12.73 V rested is 100 % state of charge.** A battery reading 12.95 V is not
+"better than full" — it is holding *surface charge*, which decays over several
+hours after a drive.
+
+This is not merely cosmetic. The engine-off detector originally triggered below
+12.90 V, which sits *inside* the post-charge resting band. On 2026-08-19 a run
+that ended at 12:57 had still not been recorded as finished at 13:34, because
+the battery plateaued at 12.91-12.99 V for over half an hour. The threshold is
+now **13.10 V held for 120 s** (fw 4.57).
+
+**The general rule: any threshold you compare against a resting battery must
+clear rested-plus-surface-charge, not just rested.**
+
+### Don't read a single graph point as a sustained event
+
+The firmware samples on three different clocks, and the graphs show the fastest
+one at the slowest rate:
+
+| What | Rate |
+|---|---|
+| ADC read (64 conversions averaged) | every **250 ms** |
+| Auto-start / engine-edge evaluation | every **1 s** |
+| History sample written to the graph | every **60 s** |
+
+`recordSample()` stores **the most recent single 250 ms reading — not a
+per-minute average.** The voltage graph is therefore a **1-in-240 snapshot**.
+
+A worked example from 2026-08-19: one sample read **13.65 V** seven minutes
+after shutdown, with its neighbours near 12.98 V. Nothing was wrong. The run
+detector requires 5 consecutive seconds above 13.2 V and logged no engine start,
+so the excursion lasted under 5 seconds — long enough to survive 64x averaging
+inside one burst, far too short to be the engine. The once-a-minute logger
+simply landed on it.
+
+**A lone spike on the graph is a real reading, but not evidence of a sustained
+condition.** The control logic deliberately ignores what the graph faithfully
+records, and that difference is by design.
+
+### Two independent debounces, and why both are needed
+
+Voltage hysteresis alone is not enough to tell an engine apart from a dip. On
+2026-08-17 one continuous 96-minute drive was logged as **fourteen separate
+runs**, several lasting 1-2 seconds, because the alternator genuinely crosses
+the threshold at idle and under load. Every spurious "off" read 12.52-12.90 V
+while every "on" read 13.2-14.2 V — voltage could not separate them.
+
+Time could. An edge must now persist (`AS_RUN_OFF_S` = 120 s off,
+`AS_RUN_ON_S` = 5 s on) before it counts, and it is **timestamped when it first
+appeared, not when it was confirmed**, so durations and the gaps between runs
+stay exact. The next drive logged as exactly one on/off pair.
 
 ## What invalidates this analysis
 

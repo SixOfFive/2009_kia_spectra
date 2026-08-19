@@ -48,6 +48,38 @@ running after `RUN_DURATION_S + 30 s`, the failure mode is the
 worst kind — a parked car that won't turn off — and you need to
 investigate immediately.
 
+## What this car actually did (August 2026)
+
+The table above is the design target. Here is one real installation
+after several weeks, so you can see the shape of a system that is
+working correctly but sitting on an unresolved hardware fault.
+
+| Metric | Target above | **Measured** | Verdict |
+|----|----|----|----|
+| Parked battery V | 12.4 – 12.7 | **12.5 – 12.8**, reaching 12.14 before auto-start | on target |
+| Parked drain | ~63 mA implied | **~280 mA** | **fault present** |
+| Drain as %/day | — | **12.5 %/day**, flat in ~8 days | consequence of the above |
+| Charging voltage, driving | — | 14.27 V peak, tapering to 13.6 V | healthy alternator |
+| Rested voltage after a drive | — | 12.91 – 12.99 V for ~30 min, then 12.7 – 12.8 V | surface charge, normal |
+| False triggers | 0 | **0** | on target |
+| Failed start attempts | 0 | 1 (retried 32 min later, succeeded) | see below |
+| ESP32 watchdog reboots | 0 – 3/month | **0** | on target |
+| ESP32 case temperature, summer | < 55 °C | 51 – 54 °C | at the ceiling |
+
+**The one failed start is the interesting row.** On 2026-08-15 an
+auto-start fired, drew no charge within `AS_VERIFY_S`, and was
+recorded as a failure; the retry 32 minutes later worked. This is
+exactly the behaviour the two-cooldown design exists for — a missed
+radio burst costs one retry, while a genuinely dead starter would
+repeat every attempt and hit the fail lockout. **A single isolated
+failure is not a fault. A run of them is.**
+
+**The 280 mA row is the one to act on.** Everything else here is
+nominal; that one number means the car has an unlocated parasitic
+draw roughly 4x the whole design budget. See
+[power-budget.md](power-budget.md) section 7 for the measurements
+and section 5 for the fuse-pull procedure to find it.
+
 ## Step 1 — Recheck parked-current draw after a month
 
 The bench-time power budget assumed an LM2596 with typical

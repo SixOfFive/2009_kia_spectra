@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.57";
+const char* FW_VERSION = "4.58";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -276,6 +276,13 @@ const uint32_t AS_VERIFY_S      = 180;      // after firing, expect charging wit
 const float    AS_ENG_OFF_V     = 13.10f;   // below this, held AS_RUN_OFF_S, a run ends
 const uint32_t AS_RUN_OFF_S     = 120;      // low must hold this long to end a run
 const uint32_t AS_RUN_ON_S      = 5;        // and high this long to start one
+// Longest run this car could plausibly have made. Only used at boot, to tell an
+// open run that is still going from one orphaned by the pre-4.58 static-reset bug.
+const uint32_t RUN_MAX_PLAUSIBLE_S = 12UL * 3600UL;
+// Consecutive history samples that must be above AS_ENG_OFF_V before a boot
+// reconstruction believes the engine was running then. The graph is a 1-in-240
+// snapshot, so isolated samples catch transients that are not the alternator.
+const int      RUN_RECON_MIN_N     = 3;
 const uint8_t  AS_DEF_MAX_FAILS = 2;        // consecutive unverified starts -> lockout (default)
 // Optional cap on auto-starts per rolling 24 h. 0 (or any value <= 0) means
 // UNLIMITED, which is the default: if the battery genuinely needs starting six
@@ -376,6 +383,7 @@ struct RunEvent {
 };
 const uint8_t  RUN_F_TX_OK    = 0x01;         // the CC1101 accepted the burst
 const uint8_t  RUN_F_BACKFILL = 0x80;         // reconstructed, NOT recorded live
+const uint8_t  RUN_F_RECON    = 0x40;         // edge inferred at boot, timestamp is an estimate
 const char*    RUN_FILE = "/runs.bin";
 const char*    RUN_OLD  = "/runs.old";
 const uint32_t RUN_MAGIC = 0x52554E31;        // "RUN1"
@@ -745,6 +753,12 @@ uint32_t  g_lastStartMs = 0;               // millis() of the last auto-start th
 uint32_t  g_lastStartTs = 0;               // epoch of the last auto-start  NVS "as_last"
 uint32_t  g_lastRunTs   = 0;               // epoch the engine was last seen RUNNING (charging),
                                            // whoever started it -- key/FOB/board.  NVS "last_run"
+
+// Engine on/off state. FILE SCOPE, not function-static, because reconcileOpenRun()
+// has to seed it at boot -- see the note there for why a plain static loses runs.
+bool      engRunning    = false;
+uint32_t  engOnMs       = 0;               // millis() of the confirmed ON edge
+bool      g_runRecDone  = false;           // boot reconciliation has run (or had nothing to do)
 float     g_lastV       = 0.0f;            // most recent voltage reading (owned by the safety task)
 float     g_lastTemp    = 0.0f;            // most recent chip temp C (owned by the safety task)
 
@@ -1756,6 +1770,118 @@ void flushRunsToFlash() {
   }
 }
 
+// Close a run that was left open by a reboot. LOOP CORE ONLY (touches LittleFS).
+//
+// engRunning used to be a plain function-static, so it zeroed on every boot. Two
+// ways that lost data:
+//   * Reboot (or OTA) while the engine runs -> the ON never gets its OFF, and the
+//     next start appends a SECOND ON. The log reads ON, ON, OFF and the first run
+//     has no duration at all.
+//   * Reboot just after a run -> the ON is orphaned permanently, because nothing
+//     ever re-examines it.
+// Runs once, as soon as the clock is valid and we have a real reading.
+//
+// The OFF timestamp is RECOVERED, not guessed. The history ring is restored from
+// flash at boot (loadHistory), so it still holds the samples from before the
+// reset: the last one at or above AS_ENG_OFF_V is the last moment the alternator
+// was charging, which dates the shutdown to within one sample interval. Only when
+// the ring cannot answer does this fall back to a bound, and the event is flagged
+// RUN_F_RECON either way so a reconstructed duration is never mistaken for a
+// measured one.
+void reconcileOpenRun() {
+  g_runRecDone = true;                     // one attempt per boot unless we bail below
+
+  // Most recent ON or OFF, newest-first, across both generations.
+  uint32_t onTs = 0; bool open = false; bool found = false;
+  auto scan = [&](const char* path) {
+    if (found || !LittleFS.exists(path)) return;
+    File f = LittleFS.open(path, FILE_READ);
+    if (!f) return;
+    long n = (f.size() >= 8) ? (long)((f.size() - 8) / sizeof(RunEvent)) : 0;
+    for (long i = n - 1; i >= 0 && i >= n - 64 && !found; i--) {
+      RunEvent e;
+      f.seek(8 + i * sizeof(RunEvent));
+      if (f.read((uint8_t*)&e, sizeof(RunEvent)) != (int)sizeof(RunEvent)) break;
+      if (e.kind == RUN_ON)  { onTs = e.ts; open = true;  found = true; }
+      if (e.kind == RUN_OFF) {              open = false; found = true; }
+    }
+    f.close();
+  };
+  scan(RUN_FILE); scan(RUN_OLD);
+  if (!open || !onTs) return;              // nothing open -- normal case, done
+
+  float v = g_lastV;
+  uint32_t nowS = (uint32_t)time(nullptr);
+
+  // Still charging: adopt the open run instead of logging a duplicate ON. Guarded
+  // on plausibility -- an ON from days ago is a leftover of the old bug, not a
+  // drive still in progress, and adopting it would report a multi-day run.
+  if (v >= AS_ALT_V) {
+    if (nowS > onTs && nowS - onTs <= RUN_MAX_PLAUSIBLE_S) {
+      engRunning  = true;
+      engOnMs     = millis() - (nowS - onTs) * 1000UL;   // so dur_s stays right
+      g_lastRunTs = onTs;
+      logLine("boot: engine still running, adopted the open run from %lus ago",
+              (unsigned long)(nowS - onTs));
+      return;
+    }
+    // Implausibly old AND charging now: close the stale one, let the live
+    // detector open a fresh run for what is actually happening.
+  } else if (v >= AS_ENG_OFF_V) {
+    g_runRecDone = false;                  // in the dead band -- ask again next pass
+    return;
+  }
+
+  // Date the shutdown from the ring: the end of the last STRETCH of charging
+  // samples, scanning newest-first.
+  //
+  // Not simply the newest sample above the threshold. recordSample() stores one
+  // instantaneous 250 ms reading per minute, so the ring faithfully captures
+  // brief excursions the engine had nothing to do with -- on 2026-08-19 a pair of
+  // samples read 13.65/13.14 V seven minutes AFTER shutdown, and taking the
+  // newest would have dated this run 7 minutes late. Requiring the same
+  // persistence the live detector requires rejects them: a real drive holds the
+  // threshold for its whole length, a blip does not.
+  uint32_t offTs = 0;
+  if (hist && histCount > 0) {
+    int idx = (histHead - 1 + HIST_N) % HIST_N;
+    uint32_t oldestTs = 0;
+    int      consec   = 0;
+    uint32_t candEnd  = 0;                                   // newest ts of the current stretch
+    for (int k = 0; k < histCount; k++) {
+      const Sample& sm = hist[idx];
+      idx = (idx - 1 + HIST_N) % HIST_N;
+      if (!sm.ts) continue;
+      oldestTs = sm.ts;                                      // ends on the oldest
+      if (sm.ts <= onTs) break;                              // before the run began
+      if (!offTs) {
+        if (sm.vbatt >= AS_ENG_OFF_V) {
+          if (consec == 0) candEnd = sm.ts;
+          if (++consec >= RUN_RECON_MIN_N) offTs = candEnd;
+        } else { consec = 0; candEnd = 0; }
+      }
+    }
+    // Never saw a sustained charge after the ON: it had already stopped by our
+    // oldest sample, so that is the tightest bound the ring can give.
+    if (!offTs && oldestTs > onTs) offTs = oldestTs;
+  }
+  if (!offTs || offTs < onTs) offTs = nowS;                  // no ring, no bound
+
+  uint32_t ran = (offTs > onTs) ? (offTs - onTs) : 0;
+  logLine("boot: closing a run left open by the reset -- stopped %lum ago, ran %lum",
+          (unsigned long)((nowS > offTs ? nowS - offTs : 0) / 60),
+          (unsigned long)(ran / 60));
+  runLogAt(offTs, RUN_OFF, RSRC_EXT, v, ran, RUN_F_RECON);
+  engRunning = false;
+
+  // Same as the live OFF path: without this the long-term drain baseline never
+  // arms, and the whole days-to-weeks view stays blank until the next real run.
+  if (!g_ltDue) {
+    g_ltDue = offTs + LT_SETTLE_S;
+    prefs.putUInt("lt_due", g_ltDue);
+  }
+}
+
 // Append the one pending hourly bucket. Loop core only -- same rule as the
 // event log: the safety task must never touch LittleFS.
 void flushDrainToFlash() {
@@ -2072,8 +2198,6 @@ void evalAutoStart(float v) {
   // edges and remember the last run, so "Last charge" is real even when the board
   // never issued a start. Falls back out at AS_ENG_OFF_V, not AS_ALT_V, so it
   // cannot chatter at the threshold -- see the note there for why 13.10 V.
-  static bool     engRunning = false;
-  static uint32_t engOnMs    = 0;
   static uint32_t candMs     = 0;          // when the pending edge was first seen
   static bool     candTo     = false;      // the state it is heading to
 
@@ -3326,7 +3450,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3443,13 +3567,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=457"></script>
+<script src="/app.js?v=458"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3538,13 +3662,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=457"></script>
+<script src="/app.js?v=458"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3609,13 +3733,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=457"></script>
+<script src="/app.js?v=458"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3647,13 +3771,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=457"></script>
+<script src="/app.js?v=458"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3679,7 +3803,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=457"></script>
+<script src="/app.js?v=458"></script>
 </body></html>
 )HTML";
 
@@ -4444,7 +4568,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=457">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=458">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -4570,6 +4694,7 @@ function loadRuns(){
       else if(r.kind===0)det=(r.flags&1)?"RF sent ok":"RF transmit FAILED";
       h+='<tr><td>'+new Date(r.ts*1000).toLocaleString()
         +(r.flags&128?'<span class="bf" title="reconstructed from other evidence, not recorded live">reconstructed</span>':'')
+        +(r.flags&64?'<span class="bf" title="the board rebooted while this run was open; the end time was recovered from the voltage history, so the duration is an estimate">recovered</span>':'')
         +'</td><td><span class="pill '+k[1]+'">'+k[0]+'</span></td><td>'+(SRC[r.src]||"?")
         +'</td><td>'+(r.v>0?r.v.toFixed(2)+" V":"--")+'</td><td>'+det+'</td></tr>';
     }
@@ -4781,7 +4906,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -5364,6 +5489,7 @@ void loop() {
     flushDrainToFlash();                            // and the hourly drain bucket, if one completed
     flushRunsToFlash();                             // and any engine start/stop events
     flushDailyToFlash();                            // and the daily bucket, at midnight
+    if (!g_runRecDone && timeIsValid() && g_lastV > 5.0f) reconcileOpenRun();
   }
   loopMark("loop");
   uint32_t now = millis();

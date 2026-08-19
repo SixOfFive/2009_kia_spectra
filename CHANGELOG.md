@@ -14,6 +14,82 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-19 — fw 4.58: a reboot no longer loses the end of a run
+
+### Fixed — `engRunning` was a function-static, so it zeroed on every boot
+
+Two ways that lost data:
+
+- **Reboot or OTA while the engine runs** — the ON never gets its OFF, and the
+  next start appends a *second* ON. The log reads ON, ON, OFF and the first run
+  has no duration at all.
+- **Reboot just after a run** — the ON is orphaned permanently, because nothing
+  ever re-examined it. 4.57 created exactly one of these.
+
+`engRunning` / `engOnMs` are now file-scope, and `reconcileOpenRun()` runs once
+per boot as soon as the clock is valid and there is a real reading:
+
+| Found at boot | Action |
+|---|---|
+| No open run | nothing — the normal case |
+| Open run, **v ≥ 13.2 V** | **adopt it** — seed `engRunning`, back-date `engOnMs` so the eventual duration is right. No duplicate ON. |
+| Open run, **v < 13.10 V** | close it, timestamp recovered from history, flagged `RUN_F_RECON` |
+| Open run, **13.10–13.2 V** | dead band — don't guess, retry next pass |
+
+Adoption is refused if the open ON is older than `RUN_MAX_PLAUSIBLE_S` (12 h);
+an ON from days ago is a leftover of this bug, not a drive still in progress, and
+adopting it would report a multi-day run.
+
+### The OFF timestamp is recovered, not guessed
+
+`loadHistory()` restores the sample ring from flash at boot, so the samples from
+*before* the reset are still there. The last stretch of charging in that ring
+dates the shutdown to within one sample interval.
+
+**Naively taking the newest sample above the threshold is wrong**, and this
+firmware had the counter-example already logged. `recordSample()` stores one
+instantaneous 250 ms reading per minute, so the ring faithfully captures brief
+excursions — on 2026-08-19 two samples read **13.65 / 13.14 V seven minutes
+after shutdown**. Requiring the same persistence the live detector requires
+(`RUN_RECON_MIN_N = 3` consecutive samples) rejects them:
+
+| Rule | Recovered OFF | Duration |
+|---|---|---|
+| Newest sample above threshold | 13:05:17 | 46.4 min |
+| **3 consecutive samples (shipped)** | **12:58:16** | **39.4 min** |
+| Ground truth | ~12:57–12:58 | ~39 min |
+
+Fallbacks, in order: no sustained charge after the ON → the oldest sample in the
+ring, which is the tightest bound available; no ring at all → now. The event is
+flagged either way, so a reconstructed duration is never mistaken for a measured
+one.
+
+The reconciled OFF also arms the long-term drain baseline (`g_ltDue`), which the
+live OFF path does. Without it the days-to-weeks view stays blank until the next
+real run.
+
+### Added — `RUN_F_RECON` (0x40) and a "recovered" badge
+
+Distinct from `RUN_F_BACKFILL` (0x80, hand-reconstructed from outside evidence).
+The dashboard marks it, with the reason on hover.
+
+### Verified — end to end, against a known answer
+
+The 12:18:55 run orphaned by the 4.57 flash was the test case, and the true
+answer was already known from the voltage trace. After flashing 4.58:
+
+```
+19/08/2026, 12:18:55            Engine ON   key/FOB  14.13 V
+19/08/2026, 12:58:16 recovered  Engine OFF  key/FOB  12.88 V  ran 39m 21s
+  -> sat 3h 17m between runs
+boot: closing a run left open by the reset -- stopped 55m ago, ran 39m
+```
+
+**Not verified:** the *adoption* path. That needs a reboot during an actual
+drive, which has not happened yet.
+
+---
+
 ## 2026-08-19 — docs: the measurements land in the documentation
 
 No firmware change. Everything the board has actually recorded was still only

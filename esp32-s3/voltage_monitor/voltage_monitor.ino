@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.56";
+const char* FW_VERSION = "4.57";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -260,6 +260,20 @@ const uint32_t AS_VERIFY_S      = 180;      // after firing, expect charging wit
 // was 164 s, and every artefact was under 60 s.
 // The edge is TIMESTAMPED WHEN IT FIRST APPEARED, not when it was confirmed, so
 // run durations and the gaps between runs stay exact.
+// The off edge was AS_ALT_V - 0.3 = 12.90 V until 2026-08-19, when a run that
+// ended ~12:57 had still not closed 36 minutes later. A battery that has just
+// been charged holds SURFACE CHARGE well above its rested voltage, and that
+// afternoon it plateaued at 12.91-12.99 V -- straddling the old threshold, so
+// the detector never saw the engine stop. Left alone it self-clears once the
+// surface charge decays, but the OFF is then timestamped ~45 min late, which
+// inflates the run and starts the 12 h long-term anchor from the wrong moment.
+// Measured separation that day, which is what 13.10 V is chosen from:
+//   engine actually running   13.58 - 14.27 V  (14.2 at start, tapering to 13.6)
+//   after shutdown, settling  12.91 - 13.11 V  (decaying)
+// AS_RUN_OFF_S is what protects this: the 2026-08-17 dips that caused the
+// fourteen-runs bug were all under 60 s, so a 120 s hold still rejects them
+// even with the threshold this close to the running floor.
+const float    AS_ENG_OFF_V     = 13.10f;   // below this, held AS_RUN_OFF_S, a run ends
 const uint32_t AS_RUN_OFF_S     = 120;      // low must hold this long to end a run
 const uint32_t AS_RUN_ON_S      = 5;        // and high this long to start one
 const uint8_t  AS_DEF_MAX_FAILS = 2;        // consecutive unverified starts -> lockout (default)
@@ -2056,13 +2070,14 @@ void evalAutoStart(float v) {
   // Engine on/off from voltage -- ground truth regardless of who started it (key,
   // FOB, or the board). Alternator charging (>= AS_ALT_V) == running. Log both
   // edges and remember the last run, so "Last charge" is real even when the board
-  // never issued a start. 0.3 V hysteresis so it can't chatter at the threshold.
+  // never issued a start. Falls back out at AS_ENG_OFF_V, not AS_ALT_V, so it
+  // cannot chatter at the threshold -- see the note there for why 13.10 V.
   static bool     engRunning = false;
   static uint32_t engOnMs    = 0;
   static uint32_t candMs     = 0;          // when the pending edge was first seen
   static bool     candTo     = false;      // the state it is heading to
 
-  bool inst = engRunning ? (v >= AS_ALT_V - 0.3f) : (valid && v >= AS_ALT_V);
+  bool inst = engRunning ? (v >= AS_ENG_OFF_V) : (valid && v >= AS_ALT_V);
   bool nowRun = engRunning;                // only changes once an edge is CONFIRMED
   uint32_t edgeMs = now;
   if (inst != engRunning) {
@@ -3122,7 +3137,7 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
       +"Compare with <b>Last charge</b>: a command with no charging afterwards means it did not catch.");
     TIP("assince","<b>Since the last start command</b><br>Elapsed time since the board last transmitted Start.");
     TIP("lastrun","<b>Last charge</b><br>When the engine was last actually <i>running</i>, judged from the "
-      +"alternator threshold (&ge;13.2 V with 0.3 V hysteresis). This catches key and FOB starts too, not just "
+      +"alternator threshold: on at &ge;13.2 V, off below 13.1 V held 2 min. This catches key and FOB starts too, not just "
       +"board-fired ones - it is the ground truth for whether the engine ran.");
     TIP("runsince","<b>Since the engine last ran</b><br>Also the baseline for the long-term drain anchor, which is "
       +"taken 12 h after this point so the fast post-charge settling is excluded.");
@@ -3311,7 +3326,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=456"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3428,13 +3443,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=456"></script>
+<script src="/app.js?v=457"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=456"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3523,13 +3538,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=456"></script>
+<script src="/app.js?v=457"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=456"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3594,13 +3609,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=456"></script>
+<script src="/app.js?v=457"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=456"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3632,13 +3647,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=456"></script>
+<script src="/app.js?v=457"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=456"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3664,7 +3679,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=456"></script>
+<script src="/app.js?v=457"></script>
 </body></html>
 )HTML";
 
@@ -4429,7 +4444,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=456">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=457">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -4766,7 +4781,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=456"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=457"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

@@ -14,6 +14,75 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-19 — fw 4.57: engine-off edge 12.90 V -> 13.10 V (surface charge straddled it)
+
+### Fixed — a run that ended at 12:57 had not closed 37 minutes later
+
+The off edge was `AS_ALT_V - 0.3` = **12.90 V**. That is inside the band a
+freshly-charged battery sits in. After two drives today the resting voltage
+plateaued at **12.91–12.99 V** — surface charge, not depletion — so the detector
+never saw the engine stop:
+
+```
+12:57       engine actually stops
+12:58       13.11 V   -> detector: still running
+13:06       12.98 V   -> still running
+13:20       12.94 V   -> still running
+13:34       12.90 V   -> still running, 37 min after shutdown
+```
+
+Left alone it self-clears once surface charge decays, but the OFF is
+timestamped **when the voltage first dropped**, so the run would have been
+recorded as ~76 minutes instead of ~39, and the long-term drain anchor — taken
+12 h after engine-off — would start from the wrong moment.
+
+The off edge is now an explicit constant rather than an offset that no longer
+means anything:
+
+```cpp
+const float AS_ENG_OFF_V = 13.10f;   // below this, held AS_RUN_OFF_S, a run ends
+```
+
+Chosen from the measured separation on 2026-08-19:
+
+| | Range |
+|---|---|
+| Engine actually running | **13.58 – 14.27 V** (14.2 at start, tapering to 13.6) |
+| After shutdown, settling | **12.91 – 13.11 V** (decaying) |
+
+`AS_RUN_OFF_S = 120` is what makes a threshold this close to the running floor
+safe: every dip that caused the 2026-08-17 fourteen-runs bug was under 60 s, so
+the 2-minute hold still rejects them.
+
+### Verified — the 4.51 debounce itself works
+
+Today's 08:26 → 09:01 drive logged as **exactly one ON/OFF pair, 2099 s**. That
+was the outstanding verification from 4.51, where one continuous drive had been
+recorded as fourteen separate runs.
+
+### Known — one dangling ON in the run log
+
+`engRunning` is a plain function-static, so it zeroes on boot. Flashing this
+while the 12:18:55 run was still open means **no OFF will ever be written for
+it**. Deliberate: the alternative was waiting for the old firmware to close it
+at a ~45-minute-late timestamp, recording a confidently wrong 76-minute run.
+A visibly missing OFF is better than a plausible wrong duration.
+
+The general case is unhandled too — a reboot mid-drive produces a second ON with
+no intervening OFF. A boot-time reconciliation (close a dangling run when
+voltage is clearly below `AS_ENG_OFF_V`) would fix both; not done here.
+
+### Notes
+
+- Charging system confirmed healthy while investigating: **14.27 V** peak,
+  tapering to 13.6 V as the battery stopped accepting current.
+- Unexplained: a single sample at **13.65 V at 13:04**, seven minutes after
+  shutdown, with neighbours near 12.98.
+- Asset tags `?v=456` -> `?v=457`; the Last-charge tooltip quoted the old
+  threshold.
+
+---
+
 ## 2026-08-18 — fw 4.56: %/day gets its own line instead of wrapping mid-phrase
 
 ### Fixed — the inline span broke across lines

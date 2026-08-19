@@ -395,6 +395,14 @@ simply landed on it.
 condition.** The control logic deliberately ignores what the graph faithfully
 records, and that difference is by design.
 
+This is not only a reading habit — the firmware has to apply it to itself. When
+a reboot leaves a run open, the end time is rebuilt by searching the restored
+sample ring for the last stretch of charging. Taking the *newest* sample above
+the threshold would have grabbed exactly the excursion above and dated that
+shutdown **7 minutes late**; requiring **three consecutive** samples got it
+right to within a minute. The same persistence rule that separates a dip from a
+shutdown live also separates a blip from a run offline.
+
 ### Two independent debounces, and why both are needed
 
 Voltage hysteresis alone is not enough to tell an engine apart from a dip. On

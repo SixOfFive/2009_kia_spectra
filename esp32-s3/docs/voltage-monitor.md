@@ -258,6 +258,80 @@ confirmed.
 
 ---
 
+## 7b. The run log — every engine start and stop
+
+Separate from the event log, and kept in its own section at the bottom of the
+**Logs** tab. It answers the question the event log cannot: *how long does this
+car actually sit between runs, and which of those runs did the board fire?*
+Events are 16 bytes each in two rotating generations of 2000, so it holds
+roughly 4000 events — years at the handful a day this car produces.
+
+Raw CSV is at **`/runs?n=<count>`**:
+
+```
+ts,kind,src,flags,v,dur_s
+1787163535,1,2,0,14.13,0
+1787165896,2,2,64,12.88,2361
+```
+
+| Field | Values |
+|---|---|
+| `kind` | 0 = start command sent, 1 = **engine ON**, 2 = **engine OFF**, 3 = start drew no charge |
+| `src` | 0 = board (auto), 1 = board (manual), 2 = key or FOB |
+| `flags` | `0x01` RF burst accepted · `0x40` recovered · `0x80` reconstructed |
+| `dur_s` | on an OFF, how long the engine ran |
+
+**`src` is the useful column.** Engine on/off is detected from alternator
+voltage, so it catches runs the board had nothing to do with — the log is a
+complete account of the car, not just of this project.
+
+### Detection, and why it needs two kinds of hysteresis
+
+On at **≥13.2 V held 5 s**, off at **<13.10 V held 120 s**, and each edge is
+timestamped **when it first appeared**, not when it was confirmed, so durations
+and the gaps between runs stay exact.
+
+Voltage alone is not enough. A real alternator dips below any sensible
+threshold at idle and under load — one continuous 96-minute drive was once
+logged as **fourteen separate runs**, some lasting 1–2 seconds. Only the time
+requirement separates a dip from a shutdown.
+
+The off threshold is not just "a bit below on", either. A battery that has just
+been driven holds **surface charge** and can sit at 12.9–13.0 V for over half an
+hour, so a threshold at 12.90 V never fires at all. See
+[power-budget.md](../../docs/power-budget.md) section 7.
+
+### The two badges — never trust a number that carries one
+
+| Badge | Means | Trust the duration? |
+|---|---|---|
+| *(none)* | recorded live, both edges measured | yes |
+| **reconstructed** | hand-derived from other evidence when the log was first created | it is the best available account, not a measurement |
+| **recovered** | the board rebooted while this run was open; the end time was rebuilt from the voltage history | approximately — good to about a minute in the normal case |
+
+### What happens if the board reboots mid-drive
+
+Nothing is lost. On boot the firmware looks for a run left open:
+
+- **Still charging** → it adopts the open run, so you get one correct run rather
+  than two fragments.
+- **Clearly stopped** → it closes it, and *recovers* the end time from the
+  sample ring, which is restored from flash and still holds the samples from
+  before the reset. Marked **recovered**.
+- **In between** → it waits rather than guessing.
+
+The recovery deliberately requires **three consecutive** samples above the
+threshold before it believes the engine was running at that moment. One sample
+is not enough: the graph is a 1-in-240 snapshot (section 7), so it catches brief
+excursions that were never the alternator. On a real case, the naive rule dated
+a shutdown 7 minutes late and the three-sample rule got it right to within a
+minute.
+
+An open run older than **12 hours** is never adopted — that is a leftover of an
+older firmware bug, not a drive still in progress.
+
+---
+
 ## 8. Roadmap / extensions
 
 - **Deep-sleep version:** wake every N minutes, read, push the value (HTTP POST or MQTT),

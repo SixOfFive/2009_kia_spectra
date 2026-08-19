@@ -14,6 +14,44 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-19 — docs: the run log gets documented at all
+
+No firmware change. The run log had **zero** user-facing documentation — not the
+feature, not the `/runs` endpoint, not the badges, not the field encoding. A user
+could see the table on the Logs tab and had no way to know what `src` meant or
+why some rows carry a marker.
+
+### Added — `esp32-s3/docs/voltage-monitor.md` section 7b, "The run log"
+
+- What it records and why it is separate from the event log: *how long does this
+  car sit between runs, and which of those runs did the board fire?*
+- The `/runs?n=` CSV, with the full encoding of `kind`, `src`, `flags`, `dur_s`.
+- **`src` is the useful column** — detection is from alternator voltage, so the
+  log is a complete account of the car, not just of runs this project caused.
+- Detection thresholds, and why **two** kinds of hysteresis are needed: voltage
+  alone once logged one 96-minute drive as fourteen runs, and a naive off
+  threshold never fires at all because surface charge holds 12.9–13.0 V for half
+  an hour after a drive.
+- **The two badges, and what each means for trusting the number** — nothing
+  (measured), *reconstructed* (hand-derived, best available account), *recovered*
+  (rebuilt from voltage history, good to about a minute).
+- What happens on a mid-drive reboot: adopt / close / wait, and the 12-hour
+  plausibility bound on adoption.
+
+### Added — the reconstruction rule in `docs/power-budget.md` section 7
+
+The "don't read a lone spike as a sustained event" subsection now carries its
+payoff: the firmware has to apply that rule to *itself*. Rebuilding a shutdown
+time by taking the newest above-threshold sample would have grabbed the very
+excursion described two paragraphs earlier and dated a run 7 minutes late.
+Three consecutive samples got it right to within a minute.
+
+**The same persistence rule that separates a dip from a shutdown live also
+separates a blip from a run offline** — which is the transferable idea, and the
+reason the two paragraphs now sit together.
+
+---
+
 ## 2026-08-19 — fw 4.58: a reboot no longer loses the end of a run
 
 ### Fixed — `engRunning` was a function-static, so it zeroed on every boot

@@ -14,6 +14,57 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-18 — fw 4.55: %/day on the short-term card too, and a corrected caption
+
+### Added — the same `%/day` on the 24 h "Battery drain rate" card
+
+4.53 put `%/day` beside the long-term rate only. It now appears on the
+short-term card as well, from the same `socPct()` fit:
+
+```
+BATTERY DRAIN RATE           PROJECTED TO 11.8 V
+-6.3 mV/h  ·  14.3 %/day     4.9 days
+fit r^2=0.80 (usable) | 24.0 h window | 1440 samples | temp-comp 7.1 mV/degC
+```
+
+The figure **dims to `#6e7681` when r² < 0.6**, so a number the fit cannot
+support visibly recedes instead of reading as confidently as a good one.
+
+Useful as a cross-check: the two cards are independent fits over different
+spans and currently read **14.3 %/day (24 h least-squares)** against
+**12.5 %/day (long-term anchor)**. Agreement at that level is a much stronger
+statement about the ~280 mA parasitic drain than either card alone.
+
+### Fixed — 4.54's caption described the wrong window
+
+4.54 shipped this with the caption *"%/day extrapolates this short window"*, on
+the belief that the short-term fit spans ~30 minutes. **It does not.**
+`DRAIN_MIN_N = 30` is the minimum sample count before any slope is reported —
+not the window length. The fit actually spans the **whole 24 h ring**:
+`drain_win_s` reads 86438 s over 1440 samples.
+
+So a daily figure is a fair read of that fit, not an extrapolation from a short
+lever, and the caption contradicted the `24.0 h window` printed immediately
+beside it. The real weakness of this card is a different one, and is now what
+the caption says:
+
+> %/day follows this window, which restarts on every reboot and carries the
+> day/night thermal swing — the long-term card is the steadier daily figure
+
+That is also precisely why the long-term card exists at all, so the caption now
+points at the right distinction instead of an invented one.
+
+4.54 was flashed and superseded within the hour; it is not a release worth
+keeping.
+
+### Notes
+
+- Asset cache tags `?v=453` -> `?v=455`.
+- No new `/json` fields — still computed browser-side from `vbatt` and
+  `drain_mvph`, so this remains free on the wire.
+
+---
+
 ## 2026-08-18 — fw 4.53: the drain rate also reads as % of battery per day
 
 ### Added — `%/day` beside the long-term mV/h

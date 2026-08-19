@@ -14,6 +14,66 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-18 — fw 4.56: %/day gets its own line instead of wrapping mid-phrase
+
+### Fixed — the inline span broke across lines
+
+4.53 hung the `%/day` off the end of the value as an inline span, so the
+Long-term rate card rendered:
+
+```
+LONG-TERM RATE
+-5.49 mV/h · 12.7
+%/day
+```
+
+Two causes, both in `.card .v`. It carries **`word-break:break-word`**, and the
+grid track is **`minmax(158px,1fr)`** — a 165 px card cannot hold a 19 px value
+plus a 14 px suffix on one line, so the number and its unit were split across
+the break.
+
+Now a real second line, `.card .sv`, rather than a span squeezed onto the first:
+
+```
+.card .sv{color:var(--mut);font-size:13px;font-weight:600;
+          margin-top:4px;line-height:1.2;white-space:nowrap}
+```
+
+The interpunct separator went with it — it existed only to divide two things
+sharing a line. Both cards read as a clean three-row stack:
+
+```
+LONG-TERM RATE          BATTERY DRAIN RATE      PROJECTED TO 11.8 V
+-5.49 mV/h              -6.3 mV/h               4.9 days
+12.5 %/day              14.2 %/day
+```
+
+### Verified — measured, because the obvious check was wrong
+
+Confirmed against the live board at 1280 px and at 375 px mobile: three rows at
+y=490/515/543, all grid cards uniform at 165 px, no horizontal page scroll.
+
+Worth recording how that check went, because the **first method was unsound**.
+Testing overflow with `scrollWidth > clientWidth` reported `false` for a
+deliberately absurd 40-character string — which should obviously have
+overflowed. It had not: `clientWidth` itself grew 89 px -> 331 px. With
+`white-space:nowrap` **inside an `auto-fit` grid track, long text widens the
+card rather than clipping it**, so the two measurements move together and the
+comparison can never fire.
+
+Re-measured the *card* instead of the span. Width is 165 px with the live value
+and still 165 px at the worst realistic string (`-100.0 %/day`), so the nowrap
+never actually stretches anything. The latent behaviour is real but out of
+reach at any value this card can produce.
+
+### Notes
+
+- Asset cache tags `?v=455` -> `?v=456`. CSS changed this time, not just JS.
+- Hierarchy is deliberate: mV/h stays the primary value since it is what the
+  card measures and what its title names; %/day is the derived gloss beneath.
+
+---
+
 ## 2026-08-18 — fw 4.55: %/day on the short-term card too, and a corrected caption
 
 ### Added — the same `%/day` on the 24 h "Battery drain rate" card

@@ -105,7 +105,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.51";
+const char* FW_VERSION = "4.53";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -2556,6 +2556,31 @@ function fmtDate(ts){if(!ts)return "--";var x=new Date(ts*1000);
          x.toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit"});}
 function fmtEta(s){if(s===undefined||s===null||s<0)return null;if(s<3600)return "~"+Math.max(1,Math.round(s/60))+" min";if(s<86400)return "~"+(s/3600).toFixed(1)+" h";return "~"+(s/86400).toFixed(1)+" days"}
 
+// ---- lead-acid state of charge -------------------------------------------
+// Rested (open-circuit) terminal voltage -> percent charge, 12 V flooded
+// lead-acid at ~25 degC.
+// Least-squares quadratic through the published 10-100 % table:
+//   11.58/10  11.75/20  11.90/30  12.06/40  12.20/50
+//   12.32/60  12.42/70  12.50/80  12.62/90  12.73/100
+// Interpolating that table DIRECTLY is a trap. Its segments are rounded to
+// 10 % and 10 mV, so their slopes jitter 0.063-0.125 %/mV - the 12.42-12.50
+// step reads twice as steep as 11.90-12.06, which is rounding, not chemistry.
+// Slope is exactly what this card needs, so the jitter would swing %/day from
+// 12.5 to 15.4 and back over a 200 mV drift at a perfectly constant drain.
+// The quadratic tracks every table point within 2.3 (mostly under 1.2) and its
+// slope rises smoothly, 0.066 %/mV down at 11.9 V to 0.111 %/mV up at 12.8 V.
+// Monotonic above 10.56 V, so it is well behaved everywhere a car battery sits.
+function socPct(v){return 2732.89+v*(-520.682+v*24.6611);}
+// Percent of a FULL battery drawn per day at a given mV/h. Taken as a finite
+// difference over the whole 24 h step, not the tangent at v, so the answer is
+// the charge actually lost over that day rather than the instantaneous rate.
+// Deliberately unclamped: clamping socPct at 100 % would flatten the slope
+// above 12.73 V and report a real drain as 0 %/day on a nearly full battery.
+// Clamp only the absolute charge you display, never the difference.
+function socPerDay(v,mvph){
+  if(v===undefined||v===null||!isFinite(v)||!isFinite(mvph))return null;
+  return socPct(v)-socPct(v+mvph*24/1000);}
+
 // ---- graph engine (mirrors the original single-page one; min/max lines on all) ----
 var PAD=8, CHARTS={}, TS=[], hoverIdx=-1;
 var IDS=(window.PAGE&&window.PAGE.charts||[]).map(function(c){return c.id});
@@ -2924,6 +2949,19 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
     T("lteta", d.lt_ref_ts?(lte||(d.lt_mvph>=-0.05?"holding":"settling")):"no baseline yet");
     C("lteta", !d.lt_ref_ts?"#8b949e":(d.lt_eta_s<0?"#3fb950":"#d29922"));
     T("ltmv", d.lt_ref_ts?d.lt_mvph.toFixed(2):"--");
+    var pdy=(d.lt_ref_ts&&d.lt_mvph<0)?socPerDay(d.vbatt,d.lt_mvph):null;
+    T("ltpdy", (pdy>0)?("\u00b7 "+pdy.toFixed(1)+" %/day"):"");
+    TIP("ltmv","<b>Long-term rate</b><br>Slope from the anchored baseline to now, and the same drain "
+      +"expressed as a share of a full battery per day."
+      +(pdy>0?("<br><span class='tk'>"+d.lt_mvph.toFixed(2)+" mV/h is "+(d.lt_mvph*24).toFixed(0)
+        +" mV/day; stepped down the rested lead-acid curve from "+d.vbatt.toFixed(2)+" V that is <b>"
+        +pdy.toFixed(1)+" %/day</b>, so a full battery would reach flat in about "+(100/pdy).toFixed(1)
+        +" days of sitting. Charge now reads about "+Math.max(0,Math.min(100,socPct(d.vbatt))).toFixed(0)
+        +" %. Cross-check with the power-budget rule I(mA) = |mV/h| x C(Ah): "
+        +Math.round(Math.abs(d.lt_mvph)*50)+" mA at 50 Ah. The curve assumes a rested, healthy battery "
+        +"near 25 degC, so it reads high while surface charge is still dissipating, and the usable "
+        +"reserve is well short of the full 100 %.</span>")
+       :"<br><span class='tk'>Needs a settled baseline and a negative slope before a daily figure means anything.</span>"));
     T("ltref", d.lt_ref_ts?new Date(d.lt_ref_ts*1000).toLocaleString():"waiting 12 h after last run");
     T("ltrefv", d.lt_ref_ts?d.lt_ref_v.toFixed(2):"--");
     // hourly-bucket regression: the span-of-the-whole-park number
@@ -3261,7 +3299,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=453"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3378,13 +3416,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=449"></script>
+<script src="/app.js?v=453"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=453"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3473,13 +3511,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=449"></script>
+<script src="/app.js?v=453"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=453"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3510,7 +3548,7 @@ const char VOLT_HTML[] PROGMEM = R"HTML(
 <div class="card" style="margin-bottom:10px">
 <div class="grid" style="margin-top:0">
 <div class="card"><div class="k">Est. time to auto-start</div><div class="v"><span id="lteta">--</span></div></div>
-<div class="card"><div class="k">Long-term rate</div><div class="v"><span id="ltmv">--</span> mV/h</div></div>
+<div class="card"><div class="k">Long-term rate</div><div class="v"><span id="ltmv">--</span> mV/h <span id="ltpdy" style="font-size:14px;color:#8b949e"></span></div></div>
 <div class="card"><div class="k">Baseline anchored</div><div class="v" style="font-size:13px" id="ltref">--</div></div>
 <div class="card"><div class="k">Baseline voltage</div><div class="v"><span id="ltrefv">--</span> V</div></div>
 <div class="card"><div class="k">Fit quality</div><div class="v"><span id="hrq">--</span></div></div>
@@ -3544,13 +3582,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=449"></script>
+<script src="/app.js?v=453"></script>
 </body></html>
 )HTML";
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=453"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3582,13 +3620,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=449"></script>
+<script src="/app.js?v=453"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=453"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3614,7 +3652,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=449"></script>
+<script src="/app.js?v=453"></script>
 </body></html>
 )HTML";
 
@@ -4379,7 +4417,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=449">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=453">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -4716,7 +4754,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=449"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=453"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

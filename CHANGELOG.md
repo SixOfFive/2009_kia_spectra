@@ -14,6 +14,96 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-18 — fw 4.53: the drain rate also reads as % of battery per day
+
+### Added — `%/day` beside the long-term mV/h
+
+The Long-term rate card showed `-5.57 mV/h` and nothing else. That number is
+only meaningful to someone who already knows the conversion; nobody looks at
+millivolts per hour and feels how fast the battery is emptying. It now reads:
+
+```
+LONG-TERM RATE
+-5.57 mV/h  ·  12.8 %/day
+```
+
+The conversion runs entirely in the browser from `vbatt` and `lt_mvph`, both of
+which `/json` already carried. **No new JSON fields, no extra bytes on the
+wire** — the link is poor enough that this mattered more than the convenience of
+computing it on the board.
+
+The card gained a tooltip that shows its own working, because 12.8 %/day is an
+alarming number and it should be auditable rather than taken on faith:
+
+> -5.57 mV/h is -134 mV/day; stepped down the rested lead-acid curve from
+> 12.59 V that is **13.0 %/day**, so a full battery would reach flat in about
+> 7.7 days of sitting. Charge now reads about 86 %. Cross-check with the
+> power-budget rule I(mA) = |mV/h| x C(Ah): 279 mA at 50 Ah.
+
+That cross-check is the point of quoting it: `docs/power-budget.md` §6 predicts
+**-1.2 to -1.9 mV/h for car + board as designed**, and the board is measuring
+-5.57. The two independent routes to a current — the SoC curve and the
+power-budget rule — agree at ~280 mA, which is squarely the parasitic fault the
+docs describe, not instrumentation error.
+
+### Fixed — do not interpolate the published SoC table directly
+
+First cut interpolated the standard rested-voltage table (12.73 V = 100 %,
+12.20 V = 50 %, 11.31 V = 0 %). It shipped as 4.52 and read **14.2 %/day**,
+which is wrong in a way worth recording.
+
+The table is rounded to 10 % and 10 mV, so its **segment slopes jitter between
+0.063 and 0.125 %/mV** — the 12.42-12.50 step reads *twice as steep* as
+11.90-12.06. That is rounding, not chemistry. Slope is precisely what this card
+consumes, so the artifact came straight through: at a perfectly constant drain,
+the display swung
+
+```
+12.60 V -> 12.5 %/day     12.50 V -> 15.4 %/day     12.40 V -> 12.5 %/day
+```
+
+A ±20 % wobble driven by nothing but where the voltage happened to sit between
+two rounded table rows. On a card whose entire job is to be the *stable*,
+days-to-weeks number, that would read as the drain changing when it had not.
+
+4.53 replaces the interpolation with a least-squares quadratic through the
+10-100 % rows: `socPct(v) = 2732.89 - 520.682 v + 24.6611 v²`. It tracks every
+table point within 2.3 points (mostly under 1.2), and its slope now rises
+smoothly and monotonically — 0.066 %/mV at 11.9 V to 0.111 %/mV at 12.8 V —
+which is the real shape of the curve rather than quantisation noise. Cubic was
+tried and rejected: max residual 2.26 vs 2.34, no meaningful gain for the extra
+term. The parabola's vertex is at 10.56 V, so it is monotonic across every
+voltage a car battery can present.
+
+Same sweep, smoothed:
+
+```
+12.80 V -> 14.3 %/day   12.60 V -> 13.0   12.50 V -> 12.4   12.20 V -> 10.4
+```
+
+Still voltage-dependent, but now for a physical reason: the curve genuinely
+flattens as the battery drains, so a *constant current* shows up as a
+*steepening* mV/h. Reading %/day instead of mV/h removes that distortion, which
+is the second reason the conversion earns its place.
+
+`socPct()` is deliberately **unclamped**. Clamping it at 100 % would zero the
+slope above 12.73 V and report a real drain as `0 %/day` on a nearly-full
+battery — the exact case this system exists to catch. Only the absolute charge
+figure in the tooltip is clamped to 0-100; the difference never is.
+
+### Notes
+
+- `hr_ok` is now **true** with 103 hourly buckets, so the long-term fit is
+  finally reporting on a settled regression rather than the two-point anchor.
+- Caveat carried in the tooltip: the SoC curve assumes a rested, healthy
+  battery near 25 °C, so it reads high while surface charge is still
+  dissipating, and usable reserve is well short of the full 100 %.
+- Asset cache tags `?v=449` -> `?v=453` (7 CSS + 5 JS references) because the
+  shared `app.js` changed. 4.52 was flashed but superseded within minutes; it is
+  not a release worth keeping.
+
+---
+
 ## 2026-08-11 — field diagnosis (no firmware change)
 
 Live telemetry pulled off the installed board (fw 4.23). No release; recorded

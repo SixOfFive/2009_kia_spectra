@@ -14,6 +14,86 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-23 — fw 4.68: a Debug tab with a BLE scanner
+
+### Added — `/debug`, and `GET /btscan`
+
+The radio is off in normal operation and this is the only thing that turns it
+on: bring the stack up, scan, tear it down, display. **Nothing is stored,
+connected to, or paired.**
+
+Shown per device: name, address, public/random, RSSI, and advertised service
+UUIDs — enough to recognise a specific dongle, which is the point.
+
+**The caveat is on the page, in bold, because it decides how a result should be
+read: the ESP32-S3 has no Bluetooth Classic radio at all.** A Classic (SPP)
+device is invisible here, so an empty result does *not* mean nothing is there.
+This can prove "it IS BLE"; it can never prove "it is not".
+
+### Architecture — the scan runs on its own task
+
+The first cut scanned inline in the request handler, which meant the
+single-connection WebServer served nothing for the ~8 s a 5 s scan takes.
+Back-to-back `curl` scans survived that, but the dashboard's own 2 s `/json`
+poller piled up behind the block and the board panicked. Rather than chase an
+intermittent fault, the blocking was removed: `GET /btscan?s=N` starts a task
+pinned to **core 1** and returns immediately, `GET /btscan` polls for the result.
+Core 0 is left alone — the safety task owns it and must never contend with a
+radio bring-up.
+
+### Four bugs found during bring-up, all by testing against the real radio
+
+**1. Use-after-free.** `res->getCount()` was read in the trailing `logLine`,
+*after* `deinit()` had destroyed the scan object. It logged
+`9439492 device(s) seen` and panicked the board twice. The count is now
+snapshotted immediately after the scan.
+
+**2. Remote-supplied names broke the JSON.** A BLE advertised name is arbitrary
+bytes from an unauthenticated stranger in radio range, and real neighbours were
+already sending non-UTF-8 — the response stopped being parseable within minutes
+of first use. Names are now stripped to printable ASCII, JSON metacharacters
+escaped, and capped; the page escapes for HTML on top.
+
+**3. Fixed-buffer truncation.** Device rows were built with `snprintf` into a
+320 B buffer. A device advertising several 36-character UUIDs overran it and the
+truncation landed *mid-object*, corrupting the whole response. Rows are built
+with `String` now, and the UUID list is capped at 4 with an ellipsis.
+
+**4. Heap fragmentation — the real cause of the panics.** Free heap was never the
+binding constraint; **contiguity** was. Each BLE up/down cycle permanently
+fragments the heap, and the largest free block fell **131 KB → 65 KB → 55 KB**
+over three cycles while total free barely moved. Below what NimBLE needs for a
+~70 KB stack, `init()` **faulted instead of failing**. The gate is now
+`ESP.getMaxAllocHeap()`, not `getFreeHeap()`, plus a 130 KB total floor and a 5 s
+cooldown. Six rounds under concurrent load: **0 panics**, refused cleanly with a
+message naming the actual number.
+
+### Known limit — about two scans per boot
+
+That fragmentation does not undo itself, so the third scan is normally refused.
+This is stated on the page rather than buried, the result line prints the
+largest free block so you can watch it coming, and a **Reboot board** button
+appears when it gets low. The confirm dialog says what a reboot costs: sampling
+pauses ~20 s and park-confirm re-arms, delaying auto-start protection by 15 min.
+
+### Also fixed — two client-side faults the browser exposed
+
+- **Poller contention.** The debug poll on top of the dashboard's 2 s `/json`
+  poll filled the single-connection server, and the browser logged a wall of
+  `ERR_CONNECTION_RESET` while the board itself was healthy. The dashboard poller
+  is now paused for the duration and handed back afterwards; its interval handle
+  lives on `window.POLLIV` for that purpose.
+- **Straggler polls.** Reading a finished result resets the board to idle, so a
+  poll still in flight came back `idle` and overwrote a correct 14-device table
+  with "scan failed".
+
+### Cost
+
++237 KB flash (7% → 9% of 16 MB) and +2 KB static DRAM; NimBLE's ~70 KB is
+heap-allocated only while a scan is running.
+
+---
+
 ## 2026-08-19 — docs: the run log gets documented at all
 
 No firmware change. The run log had **zero** user-facing documentation — not the

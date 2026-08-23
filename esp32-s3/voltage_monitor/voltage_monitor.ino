@@ -28,6 +28,9 @@
 #include "esp_system.h"     // esp_reset_reason() -- why the last boot happened
 #include "esp_sntp.h"       // NTP sync notification callback
 #include "esp_wifi.h"       // esp_wifi_set_protocol() -- force 802.11b for range/stability
+#include <BLEDevice.h>      // debug page only: brought up for a scan, torn down after
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 #include "esp_attr.h"       // RTC_NOINIT_ATTR -- WDT breadcrumbs that survive a reset
 #include <stdarg.h>         // logLine() variadic formatting
 #include <Adafruit_GFX.h>
@@ -105,7 +108,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.58";
+const char* FW_VERSION = "4.68";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -299,6 +302,31 @@ const int      START_N          = 64;       // start-event ring buffer length
 // so both can live on one network. Port 161 is fine here: no OS privilege
 // rules on bare metal. Community is read-only; there is no SET path at all.
 const bool     SNMP_ENABLED   = true;
+// ----- Bluetooth (debug page only) -----
+// The radio is OFF in normal operation and /btscan is the ONLY thing that turns
+// it on: bring the stack up, scan, tear it down, return the result. Nothing is
+// stored, nothing is connected to, nothing is paired.
+//
+// Two hard constraints, both of which change how a result should be read:
+//   * The ESP32-S3 has NO Bluetooth Classic. This is BLE only, so a Classic
+//     (SPP) device is invisible to it -- an empty result does NOT mean nothing
+//     is there.
+//   * BLE and WiFi share one radio and one antenna. A scan steals airtime from
+//     the link this page arrived over, so keep scans short.
+// Measured: the NimBLE stack takes ~70 KB of heap while it is up. The first
+// value here was 80 KB, which is nonsense -- it let a scan start with 10 KB left
+// for WiFi and HTTP, and the board panicked. The floor has to cover the stack
+// AND leave the rest of the system its working room.
+const uint32_t BT_MIN_HEAP    = 130000;     // refuse to bring the stack up below this
+// NimBLE's teardown is not instantaneous. Starting a fresh init() seconds after
+// a deinit() panicked repeatedly; this gap lets the controller settle first.
+const uint32_t BT_COOLDOWN_MS = 5000;
+// Free heap is not the binding constraint -- CONTIGUITY is. The stack wants
+// sizeable blocks, and HTTP traffic fragments the heap with String churn, so a
+// board reporting 170 KB free can still fail to place a 70 KB stack. Gate on the
+// largest single allocation available, not just the total.
+const uint32_t BT_MIN_BLOCK   = 60000;
+const int      BT_SCAN_MAX_S  = 15;
 const uint16_t SNMP_PORT      = 161;
 const char*    SNMP_COMMUNITY = "public";
 // -----------------------------------------------------------
@@ -756,6 +784,7 @@ uint32_t  g_lastRunTs   = 0;               // epoch the engine was last seen RUN
 
 // Engine on/off state. FILE SCOPE, not function-static, because reconcileOpenRun()
 // has to seed it at boot -- see the note there for why a plain static loses runs.
+bool      g_btUp        = false;           // BLE stack currently initialised
 bool      engRunning    = false;
 uint32_t  engOnMs       = 0;               // millis() of the confirmed ON edge
 bool      g_runRecDone  = false;           // boot reconciliation has run (or had nothing to do)
@@ -3442,7 +3471,10 @@ function attachHandlers(){
   var p=location.pathname;document.querySelectorAll("nav.tabs a").forEach(function(a){
     if(a.getAttribute("data-p")===p)a.classList.add("on");});
   attachHandlers();setupHover();
-  poll();setInterval(poll,2000);
+  // Handle kept on window so a page can pause it. The WebServer takes one
+  // connection at a time, so a second poller on top of this one is enough to
+  // start resetting connections on a weak link.
+  poll();window.POLLIV=setInterval(poll,2000);
   if(window.PAGE&&window.PAGE.charts&&window.PAGE.charts.length){buildRangeBar();setSpan(SPAN);}
   if($("startbox")){loadStarts();setInterval(loadStarts,15000);}
 })();
@@ -3450,7 +3482,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3461,6 +3493,7 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
 <div class="wrap">
@@ -3567,13 +3600,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=458"></script>
+<script src="/app.js?v=467"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3584,6 +3617,7 @@ const char WIFI_HTML[] PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
 <div class="wrap">
@@ -3662,13 +3696,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=458"></script>
+<script src="/app.js?v=467"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3679,6 +3713,7 @@ const char VOLT_HTML[] PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
 <div class="wrap">
@@ -3733,13 +3768,134 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=458"></script>
+<script src="/app.js?v=467"></script>
 </body></html>
 )HTML";
+const char DEBUG_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vroom &middot; Debug</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
+<div id="tip"></div>
+<header><h1>&#9889; ESP32-S3 &middot; Debug</h1>
+<span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
+<nav class="tabs">
+<a href="/" data-p="/">Main</a>
+<a href="/wifi" data-p="/wifi">WiFi / Net</a>
+<a href="/voltage" data-p="/voltage">Voltage</a>
+<a href="/cpu" data-p="/cpu">CPU</a>
+<a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
+<a href="/logs" data-p="/logs">Log</a>
+<a href="/debug" data-p="/debug">Debug</a>
+<a href="/update" data-p="/update">Update</a>
+</nav>
+<div class="wrap">
+<div class="clbl">Bluetooth LE scanner</div>
+<div class="card">
+<div class="pwrrow">
+<div><div class="k">Scan for nearby BLE devices</div>
+<div class="v" style="font-size:15px" id="btstat">radio is off</div></div>
+<div style="text-align:right">
+<button class="seg" id="btgo" data-s="6">Scan 6 s</button>
+<button class="seg" id="btgo2" data-s="12">Scan 12 s</button>
+<button class="seg" id="btboot" style="display:none;margin-left:6px">Reboot board</button></div>
+</div>
+<div class="k" style="margin-top:10px;line-height:1.7;text-transform:none;letter-spacing:0">
+The radio is <b>off in normal operation</b>. A scan brings the stack up, listens, and puts it
+back down; nothing is stored, connected to, or paired.
+<br><br><b>This is BLE only &mdash; the ESP32-S3 has no Bluetooth Classic radio at all.</b>
+A Classic (SPP) device is invisible here, so <b>an empty result does not mean nothing is
+there</b>. Most cheap ELM327 dongles are Classic; the BLE ones exist because iOS will not do
+arbitrary SPP, which is why &ldquo;works with iPhone&rdquo; is a reliable tell.
+<br><br>BLE and WiFi share one radio and one antenna, so a scan steals airtime from the link
+this page arrived over. The scan runs on its own task, so the dashboard stays live throughout and the results appear
+when it finishes &mdash; a 5&nbsp;s scan takes about 8&nbsp;s door to door. Expect WiFi to feel
+slightly slower while it runs, since both radios share one antenna.
+<br><br><b>Expect about two scans per boot.</b> Bringing the BLE stack up and down fragments the
+heap and does not fully undo it &mdash; the largest free block fell 131&nbsp;KB &rarr; 65&nbsp;KB
+&rarr; 55&nbsp;KB over three cycles here. Below 60&nbsp;KB the stack can no longer be placed, and
+the scan is <b>refused rather than attempted</b>: earlier firmware tried anyway and panicked the
+board. A reboot defragments and gives you two more.
+</div>
+</div>
+<div class="clbl">Result</div>
+<div class="card"><div class="k" id="btmeta">no scan run yet</div>
+<div style="overflow-x:auto;margin-top:10px"><table class="st" id="bttab"><tbody><tr><td class="k">&mdash;</td></tr></tbody></table></div>
+</div>
+</div>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; <span id="clk">--</span></footer>
+<script src="/app.js?v=467"></script>
+<script>
+function esc(t){return String(t).replace(/[&<>]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
+var btTimer=null;
+function btEnd(){ if(btTimer){clearInterval(btTimer);btTimer=null;}
+  if(!window.POLLIV){ poll(); window.POLLIV=setInterval(poll,2000); }   // hand the link back
+  $("btgo").disabled=false; $("btgo2").disabled=false; }
+function btRender(d){
+  var st=$("btstat"), meta=$("btmeta");
+  st.textContent=d.bt_up_now?"radio LEFT UP":"radio off again";
+  st.style.color=d.bt_up_now?"#d29922":"#3fb950";
+  meta.textContent=d.n+" device(s) in "+d.secs+" s \u00b7 heap "+Math.round(d.heap_before/1024)+" KB before, "
+    +Math.round(d.heap_up/1024)+" KB with the stack up, "+Math.round(d.heap_after/1024)+" KB after"
+    +" \u00b7 largest free block "+Math.round((d.block_before||0)/1024)+" KB before the scan"
+    +" \u00b7 most of the dip returns within seconds, but fragmentation does not";
+  if((d.block_before||0)<90000) $("btboot").style.display="";
+  var dv=(d.dev||[]).slice().sort(function(a,b){return b.rssi-a.rssi});
+  if(!dv.length){ $("bttab").innerHTML='<tbody><tr><td class="k">nothing advertising &mdash; remember a '
+    +'Bluetooth Classic device cannot appear here</td></tr></tbody>'; return; }
+  var h='<thead><tr><th>Name</th><th>Address</th><th>Type</th><th>RSSI</th><th>Service UUIDs</th></tr></thead><tbody>';
+  for(var i=0;i<dv.length;i++){var x=dv[i];
+    h+="<tr><td>"+(x.name?esc(x.name):"<span class='k'>(no name)</span>")+"</td><td><code>"+esc(x.mac)
+      +"</code></td><td>"+esc(x.type)+"</td><td>"+x.rssi+" dBm</td><td><code>"
+      +(x.uuids?esc(x.uuids):"&mdash;")+"</code></td></tr>";}
+  $("bttab").innerHTML=h+"</tbody>";
+}
+function btPoll(){
+  fetch("/btscan",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+    // Reading a finished result resets the board to idle, so a poll still in
+    // flight when an earlier one succeeded comes back "idle" and used to
+    // overwrite a perfectly good result with "scan failed". btTimer is null once
+    // we are done, which makes it the flag for "ignore stragglers".
+    if(!btTimer)return;
+    if(d.state==="running")return;                 // still going; the next tick will ask again
+    btEnd();
+    if(d.state==="done"){ btRender(d); return; }
+    if(d.state==="idle")return;                    // consumed elsewhere; leave the display alone
+    $("btstat").textContent="scan failed"; $("btstat").style.color="#f85149";
+    $("btmeta").textContent=d.detail||"the board reported no result";
+  }).catch(function(e){});                          // a dropped poll is harmless -- just try again
+}
+function btScan(sec){
+  $("btgo").disabled=true; $("btgo2").disabled=true;
+  $("btstat").textContent="radio up, listening for "+sec+" s\u2026"; $("btstat").style.color="#d29922";
+  $("btmeta").textContent="scanning \u2014 the page stays live, results appear when it finishes";
+  // One poller at a time. Leaving the 2 s /json poll running alongside this one
+  // filled the single-connection server and the browser logged a wall of
+  // ERR_CONNECTION_RESET while the board itself was perfectly healthy.
+  if(window.POLLIV){ clearInterval(window.POLLIV); window.POLLIV=null; }
+  fetch("/btscan?s="+sec,{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+    if(!d.ok){ btEnd(); $("btstat").textContent="could not start"; $("btstat").style.color="#f85149";
+               $("btmeta").textContent=d.detail||d.state||"";
+               if(/fragment/.test(d.detail||"")) $("btboot").style.display=""; return; }
+    if(btTimer)clearInterval(btTimer);
+    btTimer=setInterval(btPoll,2000);
+  }).catch(function(e){ btEnd(); $("btstat").textContent="could not start";
+                        $("btstat").style.color="#f85149"; $("btmeta").textContent="request failed"; });
+}
+$("btgo").onclick=function(){btScan(6)};
+$("btboot").onclick=function(){ if(!confirm("Reboot the board? Sampling pauses for ~20 s and "
+  +"park-confirm re-arms, delaying auto-start protection by 15 min."))return;
+  $("btmeta").textContent="rebooting\u2026 this page will come back on its own";
+  fetch("/reboot",{method:"POST"}).catch(function(e){});
+  setTimeout(function(){location.reload()},14000); };
+$("btgo2").onclick=function(){btScan(12)};
+</script>
+</body></html>
+)HTML";
+
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3750,6 +3906,7 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
 <div class="wrap">
@@ -3771,13 +3928,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=458"></script>
+<script src="/app.js?v=467"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3788,6 +3945,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
 <div class="wrap">
@@ -3803,7 +3961,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=458"></script>
+<script src="/app.js?v=467"></script>
 </body></html>
 )HTML";
 
@@ -3823,6 +3981,7 @@ void handleAppJs()       { trackReq(); sendCached("application/javascript; chars
 void handleDash()        { trackReq(); sendPage(MAIN_HTML); }   // "/" = Main tab
 void handleWifiPage()    { trackReq(); sendPage(WIFI_HTML); }
 void handleVoltagePage() { trackReq(); sendPage(VOLT_HTML); }
+void handleDebugPage()   { trackReq(); sendPage(DEBUG_HTML); }
 void handleCpuPage()     { trackReq(); sendPage(CPU_HTML); }
 void handleMemPage()     { trackReq(); sendPage(MEM_HTML); }
 
@@ -4121,6 +4280,172 @@ void handleAgg() {
 // Guarded at every layer: unknown button -> 400, RF disabled -> 503,
 // chip absent -> 503, patterns not captured -> 409. So a bench board with
 // no real secrets and/or no wired CC1101 can never transmit a live packet.
+// A BLE advertised name is arbitrary bytes from an unauthenticated stranger in
+// radio range -- treat it as hostile input, because it arrived by exactly the
+// route a hostile one would. Live scanning immediately found real devices whose
+// names carried non-UTF-8 bytes and broke the JSON outright.
+//
+// Everything outside printable ASCII is dropped and the two JSON metacharacters
+// are escaped, so a broken or malicious advertiser can neither corrupt the
+// response nor inject markup into the page. The name is for human recognition,
+// not fidelity, so losing exotic bytes costs nothing.
+static String btSafeName(const String& in) {
+  const size_t CAP = 40;
+  String o; o.reserve(CAP + 8);
+  for (size_t i = 0; i < in.length() && o.length() < CAP; i++) {
+    char c = in[i];
+    if (c < 0x20 || c > 0x7E) continue;
+    if (c == '"' || c == '\\') o += '\\';
+    o += c;
+  }
+  return o;
+}
+
+// The scan runs on its OWN TASK, and the HTTP handler only starts it and polls.
+//
+// The first cut scanned inline in the handler, which meant the single-connection
+// WebServer served nothing for the ~8 s a 5 s scan takes. Back-to-back curl
+// scans survived that fine, but the dashboard's own 2 s /json poller piled up
+// behind the block and the board panicked. Rather than chase an intermittent
+// fault, take the blocking out: HTTP stays responsive, nothing queues, and the
+// BLE lifecycle is no longer interleaved with sending a response.
+//
+// Pinned to core 1 alongside loop/WiFi, deliberately NOT core 0 -- the safety
+// task owns that core and must never contend with a radio bring-up.
+enum { BTS_IDLE = 0, BTS_RUNNING, BTS_DONE, BTS_ERR };
+volatile int   g_btState   = BTS_IDLE;
+static int     g_btSecs    = 6;
+static String  g_btJson;                   // built by the task; read only once state != RUNNING
+static uint32_t g_btStart  = 0;            // millis, for the stuck-task backstop
+static char    g_btErr[72] = "";
+static uint32_t g_btLastEnd = 0;           // millis the last scan finished tearing down
+
+void btScanTask(void* arg) {
+  uint32_t heap0 = ESP.getFreeHeap(), heapUp = heap0, blk0 = ESP.getMaxAllocHeap();
+  int nSeen = 0;
+  bool wasUp = g_btUp;
+
+  if (!wasUp) {
+    if (!BLEDevice::init("")) {
+      snprintf(g_btErr, sizeof(g_btErr), "BLEDevice::init() failed");
+      g_btLastEnd = millis(); g_btState = BTS_ERR; vTaskDelete(nullptr); return;
+    }
+    g_btUp = true;
+  }
+  heapUp = ESP.getFreeHeap();
+
+  BLEScan* sc = BLEDevice::getScan();
+  sc->setActiveScan(true);         // send scan requests -- without this most devices have no name
+  sc->setInterval(100);
+  sc->setWindow(99);
+  BLEScanResults* res = sc->start((uint32_t)g_btSecs, false);
+  // Snapshot the count NOW. res points inside the BLEScan object, which deinit()
+  // destroys -- reading it afterwards is a use-after-free that reported 9439492
+  // devices and panicked the board twice before it was spotted.
+  nSeen = res ? res->getCount() : 0;
+
+  String out; out.reserve(2048);
+  char b[192];
+  snprintf(b, sizeof(b), "\"secs\":%d,\"n\":%d,\"bt_was_up\":%s,\"heap_before\":%lu,\"heap_up\":%lu,"
+                         "\"block_before\":%lu,\"dev\":[",
+           g_btSecs, nSeen, wasUp ? "true" : "false",
+           (unsigned long)heap0, (unsigned long)heapUp, (unsigned long)blk0);
+  out += b;
+
+  // Built with String, not snprintf into a fixed buffer. A device advertising
+  // several 36-character UUIDs overran a 320 B buffer and the truncation landed
+  // mid-object, so the entire response stopped being parseable JSON.
+  for (int i = 0; i < nSeen; i++) {
+    BLEAdvertisedDevice d = res->getDevice(i);
+    String uu;
+    int nu = d.getServiceUUIDCount();
+    if (nu > 4) nu = 4;                        // enough to identify; not unbounded
+    for (int u = 0; u < nu; u++) { if (u) uu += " "; uu += d.getServiceUUID(u).toString(); }
+    if (d.getServiceUUIDCount() > nu) uu += " ...";
+    if (i) out += ",";
+    out += "{\"mac\":\"";    out += d.getAddress().toString();
+    out += "\",\"type\":\""; out += (d.getAddressType() == BLE_ADDR_PUBLIC) ? "public" : "random";
+    out += "\",\"name\":\""; out += btSafeName(d.getName());
+    out += "\",\"rssi\":";   out += String(d.getRSSI());
+    out += ",\"uuids\":\"";  out += uu;
+    out += "\"}";
+  }
+  if (res) sc->clearResults();
+
+  // deinit(false), never deinit(true): the release_memory path calls
+  // esp_bt_controller_mem_release(), which is ONE-WAY. It hands the controller's
+  // static pool to the general allocator and no later init() can get it back, so
+  // a second scan would fail for the rest of the boot.
+  if (!wasUp) { BLEDevice::deinit(false); g_btUp = false; }
+  res = nullptr;
+
+  snprintf(b, sizeof(b), "],\"heap_after\":%lu,\"bt_up_now\":%s",
+           (unsigned long)ESP.getFreeHeap(), g_btUp ? "true" : "false");
+  out += b;
+
+  g_btJson  = out;
+  g_btLastEnd = millis();
+  g_btState = BTS_DONE;            // set LAST: the handler reads g_btJson only after this
+  logLine("BT: scanned %ds, %d device(s) seen, radio %s",
+          g_btSecs, nSeen, g_btUp ? "left up" : "back off");
+  vTaskDelete(nullptr);
+}
+
+// GET /btscan?s=N  starts a scan and returns immediately.
+// GET /btscan      reports state, and the result once it is ready.
+void handleBtScan() {
+  trackReq();
+  auto say = [&](int code, const String& body) {
+    g_out_total += body.length();
+    server.send(code, "application/json", body);
+  };
+
+  // Backstop: if the task never finished, do not wedge the page forever.
+  if (g_btState == BTS_RUNNING && millis() - g_btStart > 90000UL) {
+    snprintf(g_btErr, sizeof(g_btErr), "scan task did not finish within 90 s");
+    g_btState = BTS_ERR;
+  }
+
+  if (server.hasArg("s")) {                         // ---- start ----
+    if (g_btState == BTS_RUNNING) { say(409, "{\"ok\":false,\"state\":\"running\"}"); return; }
+    int secs = server.arg("s").toInt();
+    if (secs < 2) secs = 2;
+    if (secs > BT_SCAN_MAX_S) secs = BT_SCAN_MAX_S;
+    uint32_t freeNow = ESP.getFreeHeap(), blockNow = ESP.getMaxAllocHeap();
+    if (blockNow < BT_MIN_BLOCK) {
+      say(503, String("{\"ok\":false,\"detail\":\"heap is too fragmented: ") + (freeNow / 1024) +
+               " KB free but the largest single block is only " + (blockNow / 1024) +
+               " KB. Reboot to defragment.\"}"); return;
+    }
+    if (freeNow < BT_MIN_HEAP) {
+      say(503, String("{\"ok\":false,\"detail\":\"only ") + (freeNow / 1024) +
+               " KB free; the BLE stack needs ~70 KB and the rest of the board needs the remainder. "
+               "Reboot to reclaim heap.\"}"); return;
+    }
+    if (g_btLastEnd && millis() - g_btLastEnd < BT_COOLDOWN_MS) {
+      say(429, String("{\"ok\":false,\"detail\":\"the radio is still settling from the last scan; "
+                      "wait ") + ((BT_COOLDOWN_MS - (millis() - g_btLastEnd)) / 1000 + 1) + " s\"}"); return;
+    }
+    g_btSecs = secs; g_btJson = ""; g_btErr[0] = 0;
+    g_btStart = millis(); g_btState = BTS_RUNNING;
+    if (xTaskCreatePinnedToCore(btScanTask, "btscan", 8192, nullptr, 1, nullptr, 1) != pdPASS) {
+      g_btState = BTS_ERR;
+      say(500, "{\"ok\":false,\"detail\":\"could not start the scan task\"}"); return;
+    }
+    say(202, "{\"ok\":true,\"state\":\"running\",\"secs\":" + String(secs) + "}");
+    return;
+  }
+
+  switch (g_btState) {                              // ---- poll ----
+    case BTS_RUNNING: say(200, "{\"ok\":true,\"state\":\"running\"}"); break;
+    case BTS_DONE:    say(200, "{\"ok\":true,\"state\":\"done\"," + g_btJson + "}");
+                      g_btState = BTS_IDLE; break;
+    case BTS_ERR:     say(200, String("{\"ok\":false,\"state\":\"error\",\"detail\":\"") + g_btErr + "\"}");
+                      g_btState = BTS_IDLE; break;
+    default:          say(200, "{\"ok\":true,\"state\":\"idle\"}"); break;
+  }
+}
+
 void handleTransmit() {
   trackReq();
   String btn = server.arg("button"); btn.toUpperCase();
@@ -4568,7 +4893,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=458">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=467">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -4595,6 +4920,7 @@ table.rh tr.gap td{background:#0d1117;color:var(--mut);font-style:italic}
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
 <div class="wrap">
@@ -4906,7 +5232,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=458"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -4915,6 +5241,7 @@ const char UPDATE_HTML[] PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
 <div class="wrap">
@@ -5269,6 +5596,8 @@ void setup() {
   server.on("/voltage", HTTP_GET, handleVoltagePage);  // Voltage tab
   server.on("/cpu", HTTP_GET, handleCpuPage);          // CPU tab (POST /cpu below sets the clock)
   server.on("/memdisk", HTTP_GET, handleMemPage);      // Memory / Disk tab
+  server.on("/debug", HTTP_GET, handleDebugPage);      // Debug tab (BLE scanner)
+  server.on("/btscan", HTTP_GET, handleBtScan);        // brings BLE up, scans, puts it back down
   server.on("/app.css", HTTP_GET, handleAppCss);       // shared cached stylesheet
   server.on("/app.js", HTTP_GET, handleAppJs);         // shared cached engine
   server.on("/json", handleJson);

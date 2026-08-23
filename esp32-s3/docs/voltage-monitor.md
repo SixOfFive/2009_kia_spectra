@@ -332,6 +332,62 @@ older firmware bug, not a drive still in progress.
 
 ---
 
+## 7c. Debug tab &mdash; the BLE scanner
+
+`/debug` scans for nearby Bluetooth LE devices. **The radio is off in normal
+operation and this is the only thing that turns it on**: it brings the stack up,
+listens, and puts it back down. Nothing is stored, connected to, or paired.
+
+Per device you get name, address, public/random, RSSI and advertised service
+UUIDs &mdash; enough to recognise a specific dongle.
+
+### It is BLE only, and that changes how to read a result
+
+**The ESP32-S3 has no Bluetooth Classic radio at all.** A Classic (SPP) device
+cannot appear here no matter what, so **an empty result does not mean nothing is
+there.**
+
+This matters if you are using it to identify an OBD-II dongle. Most cheap ELM327
+clones are Classic; the BLE ones exist because iOS will not do arbitrary SPP,
+which makes &ldquo;works with iPhone&rdquo; a reliable tell. The scanner can
+prove a device *is* BLE. It can never prove one is not.
+
+### Expect about two scans per boot
+
+Bringing the BLE stack up and down **fragments the heap and does not undo it.**
+Measured over three cycles on this board, the largest free block fell
+**131&nbsp;KB &rarr; 65&nbsp;KB &rarr; 55&nbsp;KB** while total free heap barely
+moved &mdash; free heap is not the binding constraint, contiguity is.
+
+NimBLE needs roughly 70&nbsp;KB for its stack, so below a 60&nbsp;KB largest
+block it cannot be placed. The scan is then **refused rather than attempted**,
+naming the actual figure. That guard matters: earlier firmware checked only total
+free heap, tried anyway, and `init()` panicked the board instead of failing.
+
+The result line prints the largest free block so you can see it coming, and a
+**Reboot board** button appears when it gets low. A reboot defragments and gives
+you two more &mdash; at the cost of ~20&nbsp;s of sampling and a 15-minute
+park-confirm re-arm before auto-start protection is live again.
+
+### Behaviour worth knowing
+
+- The scan runs on its own task, so the dashboard stays responsive; a 5&nbsp;s
+  scan takes about 8&nbsp;s door to door.
+- The page pauses its own 2&nbsp;s `/json` poll for the duration. The WebServer
+  takes one connection at a time and two pollers on a weak link is enough to
+  start resetting connections.
+- WiFi and BLE share one radio and one antenna, so expect the link to feel
+  slightly slower while a scan runs.
+- Advertised names are treated as hostile input &mdash; stripped to printable
+  ASCII and escaped &mdash; because they are arbitrary bytes from an
+  unauthenticated stranger in radio range. Real neighbours were already
+  advertising non-UTF-8 bytes on day one.
+
+API, if you want it directly: `GET /btscan?s=<2..15>` starts a scan and returns
+at once; `GET /btscan` polls and returns the result once, then resets to idle.
+
+---
+
 ## 8. Roadmap / extensions
 
 - **Deep-sleep version:** wake every N minutes, read, push the value (HTTP POST or MQTT),

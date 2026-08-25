@@ -108,7 +108,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.68";
+const char* FW_VERSION = "4.71";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -3482,7 +3482,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3600,13 +3600,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=467"></script>
+<script src="/app.js?v=470"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3696,13 +3696,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=467"></script>
+<script src="/app.js?v=470"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3768,13 +3768,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=467"></script>
+<script src="/app.js?v=470"></script>
 </body></html>
 )HTML";
 const char DEBUG_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Debug</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
+<title>vroom &middot; Debug</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Debug</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3797,7 +3797,10 @@ const char DEBUG_HTML[] PROGMEM = R"HTML(
 <div style="text-align:right">
 <button class="seg" id="btgo" data-s="6">Scan 6 s</button>
 <button class="seg" id="btgo2" data-s="12">Scan 12 s</button>
-<button class="seg" id="btboot" style="display:none;margin-left:6px">Reboot board</button></div>
+<button class="seg" id="btoff" style="display:none;margin-left:6px">Radio off</button>
+<button class="seg" id="btboot" style="display:none;margin-left:6px">Reboot board</button>
+<div class="k" style="margin-top:8px;text-transform:none;letter-spacing:0">
+<label><input type="checkbox" id="btkeep"> keep the radio up between scans</label></div></div>
 </div>
 <div class="k" style="margin-top:10px;line-height:1.7;text-transform:none;letter-spacing:0">
 The radio is <b>off in normal operation</b>. A scan brings the stack up, listens, and puts it
@@ -3810,11 +3813,19 @@ arbitrary SPP, which is why &ldquo;works with iPhone&rdquo; is a reliable tell.
 this page arrived over. The scan runs on its own task, so the dashboard stays live throughout and the results appear
 when it finishes &mdash; a 5&nbsp;s scan takes about 8&nbsp;s door to door. Expect WiFi to feel
 slightly slower while it runs, since both radios share one antenna.
-<br><br><b>Expect about two scans per boot.</b> Bringing the BLE stack up and down fragments the
-heap and does not fully undo it &mdash; the largest free block fell 131&nbsp;KB &rarr; 65&nbsp;KB
-&rarr; 55&nbsp;KB over three cycles here. Below 60&nbsp;KB the stack can no longer be placed, and
-the scan is <b>refused rather than attempted</b>: earlier firmware tried anyway and panicked the
-board. A reboot defragments and gives you two more.
+<br><br><b>Bringing the stack up and down is what costs you, not scanning.</b> Each cycle
+fragments the heap and does not undo it &mdash; the largest free block fell 131&nbsp;KB &rarr;
+65&nbsp;KB &rarr; 55&nbsp;KB over three cycles. Below 60&nbsp;KB the ~70&nbsp;KB stack can no
+longer be placed and a scan is <b>refused rather than attempted</b>, because earlier firmware
+tried anyway and panicked the board.
+<br><br>So if you are going to scan more than once or twice, tick <b>keep the radio up</b>: the
+stack is placed once and reused instead of being rebuilt every time. Measured back to back,
+six scans in a row all completed that way (largest block 61&nbsp;&rarr;&nbsp;37&nbsp;KB) where
+tearing down each time refuses after about two. It is an improvement, <b>not a cure</b> &mdash;
+scanning still costs a few&nbsp;KB a time, so the session is longer, not unlimited.
+<br><br><b>Radio off</b> puts it back down and hands the memory back. Leaving it up holds
+~70&nbsp;KB of heap and keeps a second radio powered, so do not leave it on after a
+diagnostic session.
 </div>
 </div>
 <div class="clbl">Result</div>
@@ -3823,7 +3834,7 @@ board. A reboot defragments and gives you two more.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=467"></script>
+<script src="/app.js?v=470"></script>
 <script>
 function esc(t){return String(t).replace(/[&<>]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
 var btTimer=null;
@@ -3838,7 +3849,9 @@ function btRender(d){
     +Math.round(d.heap_up/1024)+" KB with the stack up, "+Math.round(d.heap_after/1024)+" KB after"
     +" \u00b7 largest free block "+Math.round((d.block_before||0)/1024)+" KB before the scan"
     +" \u00b7 most of the dip returns within seconds, but fragmentation does not";
-  if((d.block_before||0)<90000) $("btboot").style.display="";
+  $("btoff").style.display = d.bt_up_now ? "" : "none";
+  // Only nag about rebooting when keeping the radio up is not already the answer.
+  if((d.block_before||0)<90000 && !d.bt_up_now) $("btboot").style.display="";
   var dv=(d.dev||[]).slice().sort(function(a,b){return b.rssi-a.rssi});
   if(!dv.length){ $("bttab").innerHTML='<tbody><tr><td class="k">nothing advertising &mdash; remember a '
     +'Bluetooth Classic device cannot appear here</td></tr></tbody>'; return; }
@@ -3872,7 +3885,8 @@ function btScan(sec){
   // filled the single-connection server and the browser logged a wall of
   // ERR_CONNECTION_RESET while the board itself was perfectly healthy.
   if(window.POLLIV){ clearInterval(window.POLLIV); window.POLLIV=null; }
-  fetch("/btscan?s="+sec,{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+  fetch("/btscan?s="+sec+($("btkeep").checked?"&keep=1":""),{cache:"no-store"})
+    .then(function(r){return r.json()}).then(function(d){
     if(!d.ok){ btEnd(); $("btstat").textContent="could not start"; $("btstat").style.color="#f85149";
                $("btmeta").textContent=d.detail||d.state||"";
                if(/fragment/.test(d.detail||"")) $("btboot").style.display=""; return; }
@@ -3882,12 +3896,24 @@ function btScan(sec){
                         $("btstat").style.color="#f85149"; $("btmeta").textContent="request failed"; });
 }
 $("btgo").onclick=function(){btScan(6)};
+$("btoff").onclick=function(){ fetch("/btscan?off=1",{cache:"no-store"})
+  .then(function(r){return r.json()}).then(function(d){
+    $("btoff").style.display="none";
+    $("btstat").textContent="radio off again"; $("btstat").style.color="#3fb950";
+    $("btmeta").textContent="radio down \u00b7 largest free block "+Math.round((d.heap_block||0)/1024)+" KB";
+  }).catch(function(e){}); };
 $("btboot").onclick=function(){ if(!confirm("Reboot the board? Sampling pauses for ~20 s and "
   +"park-confirm re-arms, delaying auto-start protection by 15 min."))return;
   $("btmeta").textContent="rebooting\u2026 this page will come back on its own";
   fetch("/reboot",{method:"POST"}).catch(function(e){});
   setTimeout(function(){location.reload()},14000); };
 $("btgo2").onclick=function(){btScan(12)};
+fetch("/json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+  if(d.bt_up){ $("btoff").style.display=""; $("btkeep").checked=true;
+    $("btstat").textContent="radio is UP"; $("btstat").style.color="#d29922"; }
+  $("btmeta").textContent="no scan run yet \u00b7 largest free block "
+    +Math.round((d.heap_block||0)/1024)+" KB (the stack needs ~70 KB placed contiguously)";
+}).catch(function(e){});
 </script>
 </body></html>
 )HTML";
@@ -3895,7 +3921,7 @@ $("btgo2").onclick=function(){btScan(12)};
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3928,13 +3954,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=467"></script>
+<script src="/app.js?v=470"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3961,7 +3987,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=467"></script>
+<script src="/app.js?v=470"></script>
 </body></html>
 )HTML";
 
@@ -4007,7 +4033,7 @@ void handleJson() {
   char json[1650];
   snprintf(json, sizeof(json),
     "{\"vbatt\":%.2f,\"temp_c\":%.1f,\"adc_mv\":%d,\"divider\":%.3f,\"cal\":%.3f,"
-    "\"rssi\":%d,\"uptime_s\":%lu,\"heap_free\":%u,\"heap_total\":%u,"
+    "\"rssi\":%d,\"uptime_s\":%lu,\"heap_free\":%u,\"heap_total\":%u,\"heap_block\":%u,\"bt_up\":%s,"
     "\"psram_free\":%u,\"psram_total\":%u,\"disk_used\":%u,\"disk_total\":%u,"
     "\"mode\":\"%s\",\"ip\":\"%s\",\"interval_s\":%d,\"samples\":%d,\"led\":\"%s\",\"fw\":\"%s\",\"rf\":\"%s\","
     "\"ssid\":\"%s\",\"bssid\":\"%s\",\"ch\":%d,\"phy\":\"%s\",\"txpwr_dbm\":%.2f,\"proto\":\"%s\","
@@ -4026,6 +4052,7 @@ void handleJson() {
     "\"fs_wr_b\":%lu,\"fs_wr_n\":%lu,\"sb_n\":%d}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
+    (unsigned)ESP.getMaxAllocHeap(), g_btUp ? "true" : "false",
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
     (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes(),
     apMode ? "ap" : "sta", ip.c_str(), (int)(SAMPLE_MS / 1000), histCount, voltStatus(v), FW_VERSION,
@@ -4319,8 +4346,10 @@ static String  g_btJson;                   // built by the task; read only once 
 static uint32_t g_btStart  = 0;            // millis, for the stuck-task backstop
 static char    g_btErr[72] = "";
 static uint32_t g_btLastEnd = 0;           // millis the last scan finished tearing down
+static bool     g_btKeep    = false;       // leave the radio up after this scan
 
 void btScanTask(void* arg) {
+  vTaskDelay(pdMS_TO_TICKS(150));          // let the HTTP 202 reach the client first
   uint32_t heap0 = ESP.getFreeHeap(), heapUp = heap0, blk0 = ESP.getMaxAllocHeap();
   int nSeen = 0;
   bool wasUp = g_btUp;
@@ -4376,7 +4405,10 @@ void btScanTask(void* arg) {
   // esp_bt_controller_mem_release(), which is ONE-WAY. It hands the controller's
   // static pool to the general allocator and no later init() can get it back, so
   // a second scan would fail for the rest of the boot.
-  if (!wasUp) { BLEDevice::deinit(false); g_btUp = false; }
+  // Tearing the stack down is what fragments the heap, NOT scanning -- so when the
+  // caller says it is going to scan again, don't. One bring-up costs its ~70 KB
+  // once; ten bring-ups cost the heap its contiguity permanently.
+  if (!wasUp && !g_btKeep) { BLEDevice::deinit(false); g_btUp = false; }
   res = nullptr;
 
   snprintf(b, sizeof(b), "],\"heap_after\":%lu,\"bt_up_now\":%s",
@@ -4411,28 +4443,51 @@ void handleBtScan() {
     int secs = server.arg("s").toInt();
     if (secs < 2) secs = 2;
     if (secs > BT_SCAN_MAX_S) secs = BT_SCAN_MAX_S;
-    uint32_t freeNow = ESP.getFreeHeap(), blockNow = ESP.getMaxAllocHeap();
-    if (blockNow < BT_MIN_BLOCK) {
-      say(503, String("{\"ok\":false,\"detail\":\"heap is too fragmented: ") + (freeNow / 1024) +
-               " KB free but the largest single block is only " + (blockNow / 1024) +
-               " KB. Reboot to defragment.\"}"); return;
-    }
-    if (freeNow < BT_MIN_HEAP) {
-      say(503, String("{\"ok\":false,\"detail\":\"only ") + (freeNow / 1024) +
-               " KB free; the BLE stack needs ~70 KB and the rest of the board needs the remainder. "
-               "Reboot to reclaim heap.\"}"); return;
-    }
-    if (g_btLastEnd && millis() - g_btLastEnd < BT_COOLDOWN_MS) {
-      say(429, String("{\"ok\":false,\"detail\":\"the radio is still settling from the last scan; "
-                      "wait ") + ((BT_COOLDOWN_MS - (millis() - g_btLastEnd)) / 1000 + 1) + " s\"}"); return;
+    // EVERY guard below exists for BLEDevice::init(). None of them applies once the
+    // stack is already placed -- and applying them anyway is actively wrong: after
+    // bring-up the largest block is necessarily small BECAUSE the stack is holding
+    // it, so an up radio would refuse every scan and "keep the radio up" would be
+    // useless. (It was, until this was spotted: a keep-mode run that looked like
+    // "6 scans, zero further fragmentation" was really 1 scan and 5 refusals.)
+    if (!g_btUp) {
+      uint32_t freeNow = ESP.getFreeHeap(), blockNow = ESP.getMaxAllocHeap();
+      if (blockNow < BT_MIN_BLOCK) {
+        say(503, String("{\"ok\":false,\"detail\":\"heap is too fragmented to place the BLE stack: ")
+                 + (freeNow / 1024) + " KB free but the largest single block is only " + (blockNow / 1024)
+                 + " KB. Tick 'keep the radio up' before the first scan to avoid this, or reboot to "
+                   "defragment.\"}"); return;
+      }
+      if (freeNow < BT_MIN_HEAP) {
+        say(503, String("{\"ok\":false,\"detail\":\"only ") + (freeNow / 1024) +
+                 " KB free; the BLE stack needs ~70 KB and the rest of the board needs the remainder. "
+                 "Reboot to reclaim heap.\"}"); return;
+      }
+      if (g_btLastEnd && millis() - g_btLastEnd < BT_COOLDOWN_MS) {
+        say(429, String("{\"ok\":false,\"detail\":\"the radio is still settling from the last "
+                        "teardown; wait ") + ((BT_COOLDOWN_MS - (millis() - g_btLastEnd)) / 1000 + 1)
+                 + " s\"}"); return;
+      }
     }
     g_btSecs = secs; g_btJson = ""; g_btErr[0] = 0;
+    g_btKeep = server.hasArg("keep");
     g_btStart = millis(); g_btState = BTS_RUNNING;
-    if (xTaskCreatePinnedToCore(btScanTask, "btscan", 8192, nullptr, 1, nullptr, 1) != pdPASS) {
-      g_btState = BTS_ERR;
-      say(500, "{\"ok\":false,\"detail\":\"could not start the scan task\"}"); return;
-    }
+    // ANSWER FIRST, THEN BRING THE RADIO UP. Spawning the task before sending
+    // meant BLEDevice::init() starved the send on the same core: a 202 that
+    // should be instant took 2.8 s, and when it outlasted the browser the page
+    // reported "could not start" for a scan that was in fact running fine.
     say(202, "{\"ok\":true,\"state\":\"running\",\"secs\":" + String(secs) + "}");
+    if (xTaskCreatePinnedToCore(btScanTask, "btscan", 8192, nullptr, 1, nullptr, 1) != pdPASS) {
+      snprintf(g_btErr, sizeof(g_btErr), "could not start the scan task");
+      g_btLastEnd = millis(); g_btState = BTS_ERR;      // the page learns this on its next poll
+    }
+    return;
+  }
+
+  if (server.hasArg("off")) {                        // ---- put the radio down ----
+    if (g_btState == BTS_RUNNING) { say(409, "{\"ok\":false,\"detail\":\"a scan is running\"}"); return; }
+    if (g_btUp) { BLEDevice::deinit(false); g_btUp = false; g_btLastEnd = millis();
+                  logLine("BT: radio switched off from the debug page"); }
+    say(200, String("{\"ok\":true,\"bt_up_now\":false,\"heap_block\":") + ESP.getMaxAllocHeap() + "}");
     return;
   }
 
@@ -4893,7 +4948,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=467">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=470">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -5232,7 +5287,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=467"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>

@@ -14,6 +14,69 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-25 — fw 4.71: fix "could not start", and an answer better than rebooting
+
+### Fixed — the scan task was started before the reply was sent
+
+Reported from the page as **"could not start"** with no detail. It was not the
+fragmentation guard: heap was 187 KB free on a two-minute-old boot.
+
+`handleBtScan()` spawned the scan task and *then* called `server.send()`, so
+`BLEDevice::init()` was already bringing the radio up, on the same core, while
+the 202 was still trying to go out. A response that should be instant measured
+**2.76 s**; when it outlasted the browser's patience the page saw a dead socket
+and reported a failure for a scan that was in fact running perfectly.
+
+The handler now **answers first, then spawns**, and the task waits 150 ms before
+touching the radio so the reply has drained. Task-creation failure is reported
+through the poll state instead of the start response.
+
+### Fixed — the guards applied even when the radio was already up
+
+Every guard on that path exists for `BLEDevice::init()`. Applying them to a
+board whose stack is *already placed* is not merely useless, it is backwards:
+after bring-up the largest free block is necessarily small **because the stack is
+holding it**, so an up radio refused every subsequent scan. That made the new
+keep-up mode useless in exactly the case it exists for. All three guards are now
+scoped to `if (!g_btUp)`.
+
+### Added — "keep the radio up", and an explicit Radio off
+
+Answering *"any other fix besides rebooting?"*: yes. **Tearing the stack down is
+what fragments the heap; scanning is much cheaper.** A checkbox keeps the stack
+placed between scans, `GET /btscan?off=1` (and a **Radio off** button) puts it
+back down, and `/json` now carries `heap_block` and `bt_up` so fragmentation is
+visible without running a scan at all.
+
+Measured back to back, six scans in a row all completed with the radio kept up:
+
+```
+scan 1  n=12   block 61428      scan 4  n=11   block 40948
+scan 2  n=12   block 57332      scan 5  n=11   block 36852
+scan 3  n=13   block 40948      scan 6  n=13   block 36852
+radio off  ->  block 65524 recovered
+```
+
+Against roughly two scans before refusal when the stack is rebuilt each time. It
+is **an improvement, not a cure** — the block still steps down, so a session gets
+longer, not unlimited. The page says exactly that rather than overselling it.
+
+### A measurement of mine that was wrong, and how
+
+An earlier run of that same test appeared to show **six scans with the block
+frozen at 59380 — zero further fragmentation.** It was an artifact. 59380 is
+*below* the 60 KB gate, so scans 2–6 were being **silently refused**: the block
+was constant because nothing was running. The test printed no per-scan device
+count, so a refusal and a success looked identical.
+
+Re-run with `n=` printed per scan, the real behaviour is the table above — still
+a clear win, but not the free lunch the first run implied. **A stability metric
+that holds still because the work stopped looks exactly like a stability metric
+that holds still because the work got cheaper.** Always print evidence that the
+work actually happened.
+
+---
+
 ## 2026-08-23 — fw 4.68: a Debug tab with a BLE scanner
 
 ### Added — `/debug`, and `GET /btscan`

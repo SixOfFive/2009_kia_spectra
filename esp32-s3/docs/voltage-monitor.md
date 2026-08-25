@@ -352,22 +352,54 @@ clones are Classic; the BLE ones exist because iOS will not do arbitrary SPP,
 which makes &ldquo;works with iPhone&rdquo; a reliable tell. The scanner can
 prove a device *is* BLE. It can never prove one is not.
 
-### Expect about two scans per boot
+### Scanning repeatedly &mdash; tick "keep the radio up"
 
-Bringing the BLE stack up and down **fragments the heap and does not undo it.**
-Measured over three cycles on this board, the largest free block fell
-**131&nbsp;KB &rarr; 65&nbsp;KB &rarr; 55&nbsp;KB** while total free heap barely
-moved &mdash; free heap is not the binding constraint, contiguity is.
+**Bringing the BLE stack up and down is what fragments the heap. Scanning is much
+cheaper.** That distinction is the whole trick to using this page.
 
-NimBLE needs roughly 70&nbsp;KB for its stack, so below a 60&nbsp;KB largest
-block it cannot be placed. The scan is then **refused rather than attempted**,
-naming the actual figure. That guard matters: earlier firmware checked only total
-free heap, tried anyway, and `init()` panicked the board instead of failing.
+Each up/down cycle costs contiguity and does not give it back. Over three cycles
+the largest free block fell **131&nbsp;KB &rarr; 65&nbsp;KB &rarr; 55&nbsp;KB**
+while *total* free heap barely moved &mdash; free heap is not the binding
+constraint, contiguity is. NimBLE needs roughly 70&nbsp;KB placed contiguously,
+so below a 60&nbsp;KB largest block it cannot be placed at all, and you get
+**about two scans per boot**.
 
-The result line prints the largest free block so you can see it coming, and a
-**Reboot board** button appears when it gets low. A reboot defragments and gives
-you two more &mdash; at the cost of ~20&nbsp;s of sampling and a 15-minute
-park-confirm re-arm before auto-start protection is live again.
+Ticking **keep the radio up** places the stack once and reuses it. Six scans back
+to back, all completing:
+
+| Scan | Devices | Largest block |
+|---|---|---|
+| 1 | 12 | 61428 |
+| 2 | 12 | 57332 |
+| 3 | 13 | 40948 |
+| 4 | 11 | 40948 |
+| 5 | 11 | 36852 |
+| 6 | 13 | 36852 |
+| *Radio off* | &mdash; | *65524 recovered* |
+
+**An improvement, not a cure.** The block still steps down as you scan, so a
+session gets longer rather than unlimited &mdash; but six scans beats two, and
+**Radio off** hands the memory back when you are done.
+
+Watch it directly: `/json` carries `heap_block` (largest contiguous block) and
+`bt_up`, and the page prints the block on every result. If you do run it down, a
+**Reboot board** button appears; a reboot defragments fully, at the cost of
+~20&nbsp;s of sampling and a 15-minute park-confirm re-arm before auto-start
+protection is live again.
+
+> Leaving the radio up holds ~70&nbsp;KB of heap and keeps a second radio
+> powered. Don't leave it on after a diagnostic session.
+
+### Why a scan is refused rather than attempted
+
+Earlier firmware checked only *total* free heap, tried anyway, and `init()`
+**panicked the board instead of returning false.** The guard now tests
+`ESP.getMaxAllocHeap()` and names the actual figure in the refusal.
+
+Those guards apply **only when the stack has to be brought up**. Once it is
+placed they are meaningless &mdash; the largest block is small precisely
+*because* the stack is holding it &mdash; and an early version that checked them
+unconditionally refused every scan while the radio was up.
 
 ### Behaviour worth knowing
 
@@ -383,8 +415,22 @@ park-confirm re-arm before auto-start protection is live again.
   unauthenticated stranger in radio range. Real neighbours were already
   advertising non-UTF-8 bytes on day one.
 
-API, if you want it directly: `GET /btscan?s=<2..15>` starts a scan and returns
-at once; `GET /btscan` polls and returns the result once, then resets to idle.
+### API
+
+| Call | Does |
+|---|---|
+| `GET /btscan?s=<2..15>` | start a scan, returns `202` at once |
+| `GET /btscan?s=<n>&keep=1` | ...and leave the radio up afterwards |
+| `GET /btscan` | poll; returns the result **once**, then resets to idle |
+| `GET /btscan?off=1` | put the radio down now |
+
+The start call answers *before* the radio comes up. It did the reverse once, and
+`BLEDevice::init()` starved the reply on the same core &mdash; a `202` that
+should be instant took **2.76&nbsp;s**, and when it outlasted the browser the
+page reported "could not start" for a scan that was running perfectly.
+
+Because a poll consumes the result, a second poll still in flight comes back
+`idle`; don't let a straggler overwrite a good display.
 
 ---
 

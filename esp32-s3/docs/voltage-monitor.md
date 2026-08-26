@@ -378,17 +378,28 @@ to back, all completing:
 | *Radio off* | &mdash; | *65524 recovered* |
 
 **An improvement, not a cure.** The block still steps down as you scan, so a
-session gets longer rather than unlimited &mdash; but six scans beats two, and
-**Radio off** hands the memory back when you are done.
+session gets longer rather than unlimited &mdash; but six scans beats two.
 
-Watch it directly: `/json` carries `heap_block` (largest contiguous block) and
-`bt_up`, and the page prints the block on every result. If you do run it down, a
+The box is **ticked by default**, and the radio **drops itself after 5 minutes
+with no scan**, so it cannot be left on by forgetting. **Radio off** ends it
+immediately. That matters because a radio left up holds ~70&nbsp;KB of heap and
+burns real current on a board whose whole purpose is not draining the battery.
+
+### The fragmentation does not recover on its own
+
+Worth being blunt about, because it is the failure you are most likely to hit.
+A board left alone **overnight** was still refusing scans **16 hours later** &mdash;
+184&nbsp;KB free, largest block 55&nbsp;KB. Two scans the previous afternoon had
+taken it from 147&nbsp;KB to 57&nbsp;KB and it simply stayed there. Normal
+operation neither worsens nor heals it.
+
+So once you are below the limit, **only a reboot helps** &mdash; waiting will not.
+
+Watch it coming: `/json` carries `heap_block` (largest contiguous block) and
+`bt_up`, and the page prints the block on every result. When it does run out a
 **Reboot board** button appears; a reboot defragments fully, at the cost of
 ~20&nbsp;s of sampling and a 15-minute park-confirm re-arm before auto-start
 protection is live again.
-
-> Leaving the radio up holds ~70&nbsp;KB of heap and keeps a second radio
-> powered. Don't leave it on after a diagnostic session.
 
 ### Why a scan is refused rather than attempted
 

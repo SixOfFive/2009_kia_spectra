@@ -108,7 +108,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.71";
+const char* FW_VERSION = "4.72";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -321,6 +321,11 @@ const uint32_t BT_MIN_HEAP    = 130000;     // refuse to bring the stack up belo
 // NimBLE's teardown is not instantaneous. Starting a fresh init() seconds after
 // a deinit() panicked repeatedly; this gap lets the controller settle first.
 const uint32_t BT_COOLDOWN_MS = 5000;
+// Keeping the stack up is the difference between ~2 scans and a whole session,
+// but a radio left on by accident costs ~70 KB of heap and real current on a
+// board whose entire job is not draining the battery. So it turns itself off
+// once you stop using it, which is what makes keep-up safe to default ON.
+const uint32_t BT_IDLE_OFF_MS = 300000;     // 5 min with no scan -> radio down
 // Free heap is not the binding constraint -- CONTIGUITY is. The stack wants
 // sizeable blocks, and HTTP traffic fragments the heap with String churn, so a
 // board reporting 170 KB free can still fail to place a 70 KB stack. Gate on the
@@ -3482,7 +3487,7 @@ function attachHandlers(){
 const char MAIN_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
+<title>vroom &middot; Main</title><link rel="stylesheet" href="/app.css?v=471"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 Voltage Monitor</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3600,13 +3605,13 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=470"></script>
+<script src="/app.js?v=471"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
+<title>vroom &middot; WiFi / Net</title><link rel="stylesheet" href="/app.css?v=471"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; WiFi / Network</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3696,13 +3701,13 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=470"></script>
+<script src="/app.js?v=471"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
+<title>vroom &middot; Voltage</title><link rel="stylesheet" href="/app.css?v=471"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Voltage</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3768,13 +3773,13 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=470"></script>
+<script src="/app.js?v=471"></script>
 </body></html>
 )HTML";
 const char DEBUG_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Debug</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
+<title>vroom &middot; Debug</title><link rel="stylesheet" href="/app.css?v=471"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Debug</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3800,7 +3805,8 @@ const char DEBUG_HTML[] PROGMEM = R"HTML(
 <button class="seg" id="btoff" style="display:none;margin-left:6px">Radio off</button>
 <button class="seg" id="btboot" style="display:none;margin-left:6px">Reboot board</button>
 <div class="k" style="margin-top:8px;text-transform:none;letter-spacing:0">
-<label><input type="checkbox" id="btkeep"> keep the radio up between scans</label></div></div>
+<label><input type="checkbox" id="btkeep" checked> keep the radio up between scans</label>
+<span style="opacity:.7"> &mdash; drops automatically after 5 min idle</span></div></div>
 </div>
 <div class="k" style="margin-top:10px;line-height:1.7;text-transform:none;letter-spacing:0">
 The radio is <b>off in normal operation</b>. A scan brings the stack up, listens, and puts it
@@ -3823,9 +3829,11 @@ stack is placed once and reused instead of being rebuilt every time. Measured ba
 six scans in a row all completed that way (largest block 61&nbsp;&rarr;&nbsp;37&nbsp;KB) where
 tearing down each time refuses after about two. It is an improvement, <b>not a cure</b> &mdash;
 scanning still costs a few&nbsp;KB a time, so the session is longer, not unlimited.
-<br><br><b>Radio off</b> puts it back down and hands the memory back. Leaving it up holds
-~70&nbsp;KB of heap and keeps a second radio powered, so do not leave it on after a
-diagnostic session.
+<br><br>It is ticked by default, and the radio <b>drops itself after 5&nbsp;minutes with no
+scan</b>, so it cannot be left on by accident &mdash; it holds ~70&nbsp;KB of heap and keeps a
+second radio powered while up. <b>Radio off</b> ends it immediately.
+<br><br>Note the fragmentation <b>does not recover on its own</b>: a board left alone overnight
+was still refusing scans 16&nbsp;hours later. Once you are below the limit only a reboot helps.
 </div>
 </div>
 <div class="clbl">Result</div>
@@ -3834,7 +3842,7 @@ diagnostic session.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=470"></script>
+<script src="/app.js?v=471"></script>
 <script>
 function esc(t){return String(t).replace(/[&<>]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
 var btTimer=null;
@@ -3909,7 +3917,7 @@ $("btboot").onclick=function(){ if(!confirm("Reboot the board? Sampling pauses f
   setTimeout(function(){location.reload()},14000); };
 $("btgo2").onclick=function(){btScan(12)};
 fetch("/json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
-  if(d.bt_up){ $("btoff").style.display=""; $("btkeep").checked=true;
+  if(d.bt_up){ $("btoff").style.display="";
     $("btstat").textContent="radio is UP"; $("btstat").style.color="#d29922"; }
   $("btmeta").textContent="no scan run yet \u00b7 largest free block "
     +Math.round((d.heap_block||0)/1024)+" KB (the stack needs ~70 KB placed contiguously)";
@@ -3921,7 +3929,7 @@ fetch("/json",{cache:"no-store"}).then(function(r){return r.json()}).then(functi
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
+<title>vroom &middot; CPU</title><link rel="stylesheet" href="/app.css?v=471"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; CPU</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3954,13 +3962,13 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=470"></script>
+<script src="/app.js?v=471"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
+<title>vroom &middot; Mem / Disk</title><link rel="stylesheet" href="/app.css?v=471"></head><body>
 <div id="tip"></div>
 <header><h1>&#9889; ESP32-S3 &middot; Memory / Disk</h1>
 <span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
@@ -3987,7 +3995,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=470"></script>
+<script src="/app.js?v=471"></script>
 </body></html>
 )HTML";
 
@@ -4454,8 +4462,9 @@ void handleBtScan() {
       if (blockNow < BT_MIN_BLOCK) {
         say(503, String("{\"ok\":false,\"detail\":\"heap is too fragmented to place the BLE stack: ")
                  + (freeNow / 1024) + " KB free but the largest single block is only " + (blockNow / 1024)
-                 + " KB. Tick 'keep the radio up' before the first scan to avoid this, or reboot to "
-                   "defragment.\"}"); return;
+                 + " KB, and it needs ~60 KB contiguous. Reboot to defragment -- this does not recover "
+                   "on its own. Leave 'keep the radio up' ticked afterwards and one bring-up covers the "
+                   "whole session.\"}"); return;
       }
       if (freeNow < BT_MIN_HEAP) {
         say(503, String("{\"ok\":false,\"detail\":\"only ") + (freeNow / 1024) +
@@ -4948,7 +4957,7 @@ void handleLogsPage() {
   trackReq();
   static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=470">
+<title>vroom &middot; Log</title><link rel="stylesheet" href="/app.css?v=471">
 <style>
 #log{background:var(--card);border:1px solid #21262d;border-radius:10px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-height:200px}
 #log div{padding:1px 0;border-bottom:1px solid #12161c}
@@ -5287,7 +5296,7 @@ void handleStartsClear() {
 
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=470"></head><body>
+<title>vroom &middot; Update</title><link rel="stylesheet" href="/app.css?v=471"></head><body>
 <header><h1>&#9889; ESP32-S3 &middot; Firmware Update</h1></header>
 <nav class="tabs">
 <a href="/" data-p="/">Main</a>
@@ -5873,6 +5882,12 @@ void loop() {
     flushDrainToFlash();                            // and the hourly drain bucket, if one completed
     flushRunsToFlash();                             // and any engine start/stop events
     flushDailyToFlash();                            // and the daily bucket, at midnight
+    // Never while a scan task is live -- it owns the stack until it finishes.
+    if (g_btUp && g_btState != BTS_RUNNING && g_btLastEnd &&
+        millis() - g_btLastEnd > BT_IDLE_OFF_MS) {
+      BLEDevice::deinit(false); g_btUp = false; g_btLastEnd = millis();
+      logLine("BT: radio auto-off after %lu min idle", (unsigned long)(BT_IDLE_OFF_MS / 60000));
+    }
     if (!g_runRecDone && timeIsValid() && g_lastV > 5.0f) reconcileOpenRun();
   }
   loopMark("loop");

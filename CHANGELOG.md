@@ -14,6 +14,47 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-08-26 — fw 4.72: the radio drops itself, and honest advice when it is too late
+
+### Found — the fragmentation never recovers
+
+The board sat overnight with **no BLE activity for 16 hours** and still refused a
+scan: 184 KB free, largest block **55 KB**. Two scans the previous afternoon had
+taken it from 147 KB to 57 KB and it stayed there.
+
+So this is not "uptime fragments the heap" — it is that **the BLE fragmentation is
+permanent for the life of the boot**. Normal operation neither worsens nor heals
+it. That is exactly the failure reported from the page, and it means the practical
+rule is stricter than previously written: once you are below the limit, only a
+reboot helps, and no amount of waiting will do.
+
+### Fixed — the refusal message suggested something that cannot work
+
+It said *"tick 'keep the radio up' before the first scan to avoid this, or reboot"*.
+The first half is useless **in the state where the message appears**: the stack
+cannot be placed at all, so the checkbox changes nothing right now. The message
+leads with the reboot, states plainly that it does not recover on its own, and
+keeps the checkbox advice as prevention for next time.
+
+### Added — the radio turns itself off after 5 minutes idle
+
+Keeping the stack up is the difference between ~2 scans and a whole session, but a
+radio left on by accident holds ~70 KB of heap and burns real current on a board
+whose entire purpose is not draining the battery. It now drops itself after
+`BT_IDLE_OFF_MS` (5 min) with no scan, from the loop core, never while a scan task
+is live.
+
+That is what makes the safer default possible: **"keep the radio up" now defaults
+to ticked.** You get the long session by default and cannot leave the radio on by
+forgetting — **Radio off** still ends it immediately.
+
+### Verified
+
+Fresh boot restored the largest block to 147444. First keep-mode scan: 13 devices,
+`bt_up_now: true`, `block_before: 139252`.
+
+---
+
 ## 2026-08-25 — fw 4.71: fix "could not start", and an answer better than rebooting
 
 ### Fixed — the scan task was started before the reply was sent

@@ -28,9 +28,12 @@
 #include "esp_system.h"     // esp_reset_reason() -- why the last boot happened
 #include "esp_sntp.h"       // NTP sync notification callback
 #include "esp_wifi.h"       // esp_wifi_set_protocol() -- force 802.11b for range/stability
-#include <BLEDevice.h>      // debug page only: brought up for a scan, torn down after
+#include <BLEDevice.h>      // debug page only: a scan or a one-shot connect test, radio off otherwise
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <BLEClient.h>      // /btconnect -- can the board talk to a dongle, not just see it
+#include <BLERemoteService.h>
+#include <BLERemoteCharacteristic.h>
 #include "esp_attr.h"       // RTC_NOINIT_ATTR -- WDT breadcrumbs that survive a reset
 #include <stdarg.h>         // logLine() variadic formatting
 #include <Adafruit_GFX.h>
@@ -108,7 +111,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.72";
+const char* FW_VERSION = "4.73";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -303,9 +306,10 @@ const int      START_N          = 64;       // start-event ring buffer length
 // rules on bare metal. Community is read-only; there is no SET path at all.
 const bool     SNMP_ENABLED   = true;
 // ----- Bluetooth (debug page only) -----
-// The radio is OFF in normal operation and /btscan is the ONLY thing that turns
-// it on: bring the stack up, scan, tear it down, return the result. Nothing is
-// stored, nothing is connected to, nothing is paired.
+// The radio is OFF in normal operation and only the Debug page turns it on:
+// /btscan brings the stack up, scans and reports; /btconnect makes ONE short
+// connection to an address you name, asks it a few read-only questions and
+// disconnects. Nothing is stored, nothing is paired, nothing stays connected.
 //
 // Two hard constraints, both of which change how a result should be read:
 //   * The ESP32-S3 has NO Bluetooth Classic. This is BLE only, so a Classic
@@ -3810,7 +3814,8 @@ const char DEBUG_HTML[] PROGMEM = R"HTML(
 </div>
 <div class="k" style="margin-top:10px;line-height:1.7;text-transform:none;letter-spacing:0">
 The radio is <b>off in normal operation</b>. A scan brings the stack up, listens, and puts it
-back down; nothing is stored, connected to, or paired.
+back down; nothing is stored or paired, and nothing is connected to unless you press
+<b>Test</b> on a result.
 <br><br><b>This is BLE only &mdash; the ESP32-S3 has no Bluetooth Classic radio at all.</b>
 A Classic (SPP) device is invisible here, so <b>an empty result does not mean nothing is
 there</b>. Most cheap ELM327 dongles are Classic; the BLE ones exist because iOS will not do
@@ -3840,6 +3845,32 @@ was still refusing scans 16&nbsp;hours later. Once you are below the limit only 
 <div class="card"><div class="k" id="btmeta">no scan run yet</div>
 <div style="overflow-x:auto;margin-top:10px"><table class="st" id="bttab"><tbody><tr><td class="k">&mdash;</td></tr></tbody></table></div>
 </div>
+<div class="clbl">Connection test</div>
+<div class="card">
+<div class="pwrrow">
+<div><div class="k">Can the board talk to it?</div>
+<div class="v" style="font-size:15px" id="bcstat">scan, then press Test on a device</div></div>
+<div style="text-align:right">
+<button class="seg" id="bcagain" style="display:none">Run again</button>
+<div class="k" style="margin-top:8px;text-transform:none;letter-spacing:0">
+<label><input type="checkbox" id="bcobd"> also query the car &mdash; ignition ON</label></div></div>
+</div>
+<div class="k" style="margin-top:10px;line-height:1.7;text-transform:none;letter-spacing:0">
+<b>Test</b> makes one short connection, finds the device's serial service (a notify
+characteristic for replies, a write one for commands), sends <code>ATZ</code>
+<code>ATE0</code> <code>ATI</code> <code>ATRV</code>, and disconnects. <b>PASS</b> means the board
+exchanged data with an ELM327 &mdash; not merely that something was advertising.
+<code>ATRV</code> is the dongle measuring its own supply on OBD pin&nbsp;16, so it answers with
+the car off.
+<br><br><b>Close the OBD app on your phone first</b> (or turn the phone's Bluetooth off). A BLE
+dongle normally takes one connection at a time and stops advertising while something holds it.
+<br><br>Only read-only commands are accepted. <b>Query the car</b> adds <code>ATSP0</code>
+<code>0100</code> <code>010C</code> (protocol search, supported PIDs, RPM), which need the
+ignition ON; with it off, <code>UNABLE TO CONNECT</code> or <code>NO DATA</code> is the normal
+answer from a working dongle. A device that is not there takes about 30&nbsp;s to give up on.
+</div>
+<div style="overflow-x:auto;margin-top:10px"><table class="st" id="bctab"><tbody><tr><td class="k">&mdash;</td></tr></tbody></table></div>
+</div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; <span id="clk">--</span></footer>
 <script src="/app.js?v=471"></script>
@@ -3863,11 +3894,12 @@ function btRender(d){
   var dv=(d.dev||[]).slice().sort(function(a,b){return b.rssi-a.rssi});
   if(!dv.length){ $("bttab").innerHTML='<tbody><tr><td class="k">nothing advertising &mdash; remember a '
     +'Bluetooth Classic device cannot appear here</td></tr></tbody>'; return; }
-  var h='<thead><tr><th>Name</th><th>Address</th><th>Type</th><th>RSSI</th><th>Service UUIDs</th></tr></thead><tbody>';
+  var h='<thead><tr><th>Name</th><th>Address</th><th>Type</th><th>RSSI</th><th>Service UUIDs</th><th></th></tr></thead><tbody>';
   for(var i=0;i<dv.length;i++){var x=dv[i];
     h+="<tr><td>"+(x.name?esc(x.name):"<span class='k'>(no name)</span>")+"</td><td><code>"+esc(x.mac)
       +"</code></td><td>"+esc(x.type)+"</td><td>"+x.rssi+" dBm</td><td><code>"
-      +(x.uuids?esc(x.uuids):"&mdash;")+"</code></td></tr>";}
+      +(x.uuids?esc(x.uuids):"&mdash;")+"</code></td><td><button class='seg' data-mac='"+esc(x.mac)
+      +"' data-t='"+esc(x.type)+"'>Test</button></td></tr>";}
   $("bttab").innerHTML=h+"</tbody>";
 }
 function btPoll(){
@@ -3915,6 +3947,71 @@ $("btboot").onclick=function(){ if(!confirm("Reboot the board? Sampling pauses f
   $("btmeta").textContent="rebooting\u2026 this page will come back on its own";
   fetch("/reboot",{method:"POST"}).catch(function(e){});
   setTimeout(function(){location.reload()},14000); };
+// ---- connection test ----
+var bcTimer=null, bcLast=null;
+function bcBusy(b){ var bs=document.querySelectorAll("#bttab button[data-mac]");
+  for(var i=0;i<bs.length;i++) bs[i].disabled=b;
+  $("bcagain").disabled=b; $("btgo").disabled=b; $("btgo2").disabled=b; }
+function bcEnd(){ if(bcTimer){clearInterval(bcTimer);bcTimer=null;}
+  if(!window.POLLIV){ poll(); window.POLLIV=setInterval(poll,2000); }   // hand the link back
+  bcBusy(false); }
+function bcMsg(t){ $("bctab").innerHTML='<tbody><tr><td class="k">'+esc(t)+'</td></tr></tbody>'; }
+function bcRender(d){
+  var pass=/^PASS/.test(d.verdict||""), h="<tbody>";
+  function row(k,v){ h+="<tr><td class='k'>"+k+"</td><td>"+v+"</td></tr>"; }
+  $("bcstat").textContent=d.verdict||"done";
+  $("bcstat").style.color=pass?"#3fb950":(d.connected?"#d29922":"#f85149");
+  row("Device","<code>"+esc(d.addr)+"</code> "+esc(d.type));
+  row("Connected",d.connected?"yes, in "+d.conn_ms+" ms \u00b7 RSSI "+d.rssi+" dBm \u00b7 MTU "+d.mtu
+                             :"no &mdash; gave up after "+Math.round(d.conn_ms/1000)+" s");
+  if(d.connected){
+    var s=d.serial;
+    row("Serial service",s?"<code>"+esc(s.svc)+"</code><br>replies on <code>"+esc(s.rx)
+        +"</code>, commands to <code>"+esc(s.tx)+"</code> ("+esc(s.write)+")"
+        +(s.subscribed?"":" \u00b7 <b>subscribing failed</b>"):"none found");
+    (d.elm||[]).forEach(function(e){
+      row("<code>"+esc(e.cmd)+"</code>",(e.reply?"<code>"+esc(e.reply)+"</code>":"<span class='k'>no reply</span>")
+          +" <span class='k'>\u00b7 "+e.ms+" ms"+(e.prompt?"":" \u00b7 no prompt")+"</span>"); });
+    var sv=(d.svcs||[]).map(function(x){ return "<code>"+esc(x.uuid)+"</code><br><span class='k'>"
+      +x.chars.map(function(c){return esc(c.uuid)+" "+esc(c.props)}).join("<br>")+"</span>"; });
+    row("All services",sv.length?sv.join("<br>"):"none");
+  }
+  row("Heap","largest block "+Math.round((d.block_before||0)/1024)+" KB before, "
+      +Math.round((d.block_after||0)/1024)+" KB after \u00b7 radio "+(d.bt_up_now?"left up":"off again"));
+  $("bctab").innerHTML=h+"</tbody>";
+  $("btoff").style.display=d.bt_up_now?"":"none";
+}
+function bcPoll(){
+  fetch("/btconnect",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+    if(!bcTimer)return;                            // same straggler rule as the scan poll
+    if(d.state==="running")return;
+    bcEnd();
+    if(d.state==="done"){ bcRender(d); return; }
+    if(d.state==="idle")return;
+    $("bcstat").textContent="test failed"; $("bcstat").style.color="#f85149";
+    bcMsg(d.detail||"the board reported no result");
+  }).catch(function(e){});
+}
+function bcRun(mac,t){
+  bcLast={mac:mac,t:t}; $("bcagain").style.display=""; bcBusy(true);
+  $("bcstat").textContent="connecting to "+mac+"\u2026"; $("bcstat").style.color="#d29922";
+  bcMsg("working \u2014 a device that is not there takes about 30 s to give up on");
+  if(window.POLLIV){ clearInterval(window.POLLIV); window.POLLIV=null; }
+  var q="/btconnect?addr="+encodeURIComponent(mac)+"&t="+encodeURIComponent(t)
+    +($("btkeep").checked?"&keep=1":"")
+    +($("bcobd").checked?"&cmds="+encodeURIComponent("ATZ,ATE0,ATI,ATRV,ATSP0,0100,010C"):"");
+  fetch(q,{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+    if(!d.ok){ bcEnd(); $("bcstat").textContent="could not start"; $("bcstat").style.color="#f85149";
+               bcMsg(d.detail||d.state||"");
+               if(/fragment/.test(d.detail||"")) $("btboot").style.display=""; return; }
+    if(bcTimer)clearInterval(bcTimer);
+    bcTimer=setInterval(bcPoll,2000);
+  }).catch(function(e){ bcEnd(); $("bcstat").textContent="could not start";
+                        $("bcstat").style.color="#f85149"; bcMsg("request failed"); });
+}
+$("bttab").onclick=function(e){ var b=e.target.closest("button[data-mac]");
+  if(b && !b.disabled) bcRun(b.getAttribute("data-mac"),b.getAttribute("data-t")); };
+$("bcagain").onclick=function(){ if(bcLast) bcRun(bcLast.mac,bcLast.t); };
 $("btgo2").onclick=function(){btScan(12)};
 fetch("/json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
   if(d.bt_up){ $("btoff").style.display="";
@@ -4356,6 +4453,53 @@ static char    g_btErr[72] = "";
 static uint32_t g_btLastEnd = 0;           // millis the last scan finished tearing down
 static bool     g_btKeep    = false;       // leave the radio up after this scan
 
+// Connect-test state (see btConnTask). Declared up here because the scan handler
+// and the idle-off in loop() must not touch the stack while a test holds it.
+enum { BCS_IDLE = 0, BCS_RUNNING, BCS_DONE, BCS_ERR };
+volatile int    g_bcState   = BCS_IDLE;
+static uint32_t g_bcStart   = 0;           // millis, for the stuck-task backstop
+static String   g_bcJson;                  // built by the task; read only once state != RUNNING
+static char     g_bcErr[72] = "";
+
+// The one connect-test client, reused for as long as the stack stays up.
+// BLEDevice keeps its own pointer to the last client it created and DELETES it
+// inside deinit() -- so deleting ours as well would be a double free, and making
+// a fresh one per test would leak every one but the last. Reuse one, and forget
+// it at every teardown, which is why every teardown now goes through here.
+static BLEClient* g_bcClient = nullptr;
+static void btStackDown() {
+  BLEDevice::deinit(false);
+  g_btUp = false;
+  g_bcClient = nullptr;
+}
+
+// EVERY guard here exists for BLEDevice::init(), so callers apply it only while
+// the stack is down (see the note in handleBtScan). Returns 0 when a bring-up may
+// go ahead, otherwise the HTTP status to refuse with, and the body to send.
+static int btBringUpRefusal(String& body) {
+  uint32_t freeNow = ESP.getFreeHeap(), blockNow = ESP.getMaxAllocHeap();
+  if (blockNow < BT_MIN_BLOCK) {
+    body = String("{\"ok\":false,\"detail\":\"heap is too fragmented to place the BLE stack: ")
+         + (freeNow / 1024) + " KB free but the largest single block is only " + (blockNow / 1024)
+         + " KB, and it needs ~60 KB contiguous. Reboot to defragment -- this does not recover "
+           "on its own. Leave 'keep the radio up' ticked afterwards and one bring-up covers the "
+           "whole session.\"}";
+    return 503;
+  }
+  if (freeNow < BT_MIN_HEAP) {
+    body = String("{\"ok\":false,\"detail\":\"only ") + (freeNow / 1024) +
+           " KB free; the BLE stack needs ~70 KB and the rest of the board needs the remainder. "
+           "Reboot to reclaim heap.\"}";
+    return 503;
+  }
+  if (g_btLastEnd && millis() - g_btLastEnd < BT_COOLDOWN_MS) {
+    body = String("{\"ok\":false,\"detail\":\"the radio is still settling from the last "
+                  "teardown; wait ") + ((BT_COOLDOWN_MS - (millis() - g_btLastEnd)) / 1000 + 1) + " s\"}";
+    return 429;
+  }
+  return 0;
+}
+
 void btScanTask(void* arg) {
   vTaskDelay(pdMS_TO_TICKS(150));          // let the HTTP 202 reach the client first
   uint32_t heap0 = ESP.getFreeHeap(), heapUp = heap0, blk0 = ESP.getMaxAllocHeap();
@@ -4416,7 +4560,7 @@ void btScanTask(void* arg) {
   // Tearing the stack down is what fragments the heap, NOT scanning -- so when the
   // caller says it is going to scan again, don't. One bring-up costs its ~70 KB
   // once; ten bring-ups cost the heap its contiguity permanently.
-  if (!wasUp && !g_btKeep) { BLEDevice::deinit(false); g_btUp = false; }
+  if (!wasUp && !g_btKeep) btStackDown();
   res = nullptr;
 
   snprintf(b, sizeof(b), "],\"heap_after\":%lu,\"bt_up_now\":%s",
@@ -4448,6 +4592,9 @@ void handleBtScan() {
 
   if (server.hasArg("s")) {                         // ---- start ----
     if (g_btState == BTS_RUNNING) { say(409, "{\"ok\":false,\"state\":\"running\"}"); return; }
+    if (g_bcState == BCS_RUNNING) {
+      say(409, "{\"ok\":false,\"detail\":\"a connect test is using the radio\"}"); return;
+    }
     int secs = server.arg("s").toInt();
     if (secs < 2) secs = 2;
     if (secs > BT_SCAN_MAX_S) secs = BT_SCAN_MAX_S;
@@ -4458,24 +4605,9 @@ void handleBtScan() {
     // useless. (It was, until this was spotted: a keep-mode run that looked like
     // "6 scans, zero further fragmentation" was really 1 scan and 5 refusals.)
     if (!g_btUp) {
-      uint32_t freeNow = ESP.getFreeHeap(), blockNow = ESP.getMaxAllocHeap();
-      if (blockNow < BT_MIN_BLOCK) {
-        say(503, String("{\"ok\":false,\"detail\":\"heap is too fragmented to place the BLE stack: ")
-                 + (freeNow / 1024) + " KB free but the largest single block is only " + (blockNow / 1024)
-                 + " KB, and it needs ~60 KB contiguous. Reboot to defragment -- this does not recover "
-                   "on its own. Leave 'keep the radio up' ticked afterwards and one bring-up covers the "
-                   "whole session.\"}"); return;
-      }
-      if (freeNow < BT_MIN_HEAP) {
-        say(503, String("{\"ok\":false,\"detail\":\"only ") + (freeNow / 1024) +
-                 " KB free; the BLE stack needs ~70 KB and the rest of the board needs the remainder. "
-                 "Reboot to reclaim heap.\"}"); return;
-      }
-      if (g_btLastEnd && millis() - g_btLastEnd < BT_COOLDOWN_MS) {
-        say(429, String("{\"ok\":false,\"detail\":\"the radio is still settling from the last "
-                        "teardown; wait ") + ((BT_COOLDOWN_MS - (millis() - g_btLastEnd)) / 1000 + 1)
-                 + " s\"}"); return;
-      }
+      String why;
+      int code = btBringUpRefusal(why);
+      if (code) { say(code, why); return; }
     }
     g_btSecs = secs; g_btJson = ""; g_btErr[0] = 0;
     g_btKeep = server.hasArg("keep");
@@ -4494,7 +4626,8 @@ void handleBtScan() {
 
   if (server.hasArg("off")) {                        // ---- put the radio down ----
     if (g_btState == BTS_RUNNING) { say(409, "{\"ok\":false,\"detail\":\"a scan is running\"}"); return; }
-    if (g_btUp) { BLEDevice::deinit(false); g_btUp = false; g_btLastEnd = millis();
+    if (g_bcState == BCS_RUNNING) { say(409, "{\"ok\":false,\"detail\":\"a connect test is running\"}"); return; }
+    if (g_btUp) { btStackDown(); g_btLastEnd = millis();
                   logLine("BT: radio switched off from the debug page"); }
     say(200, String("{\"ok\":true,\"bt_up_now\":false,\"heap_block\":") + ESP.getMaxAllocHeap() + "}");
     return;
@@ -4506,6 +4639,352 @@ void handleBtScan() {
                       g_btState = BTS_IDLE; break;
     case BTS_ERR:     say(200, String("{\"ok\":false,\"state\":\"error\",\"detail\":\"") + g_btErr + "\"}");
                       g_btState = BTS_IDLE; break;
+    default:          say(200, "{\"ok\":true,\"state\":\"idle\"}"); break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BLE connect test -- can the board TALK to a dongle, not just see it? (fw 4.73)
+//
+// A scan proves a device is advertising. It does not prove the board can hold a
+// connection to it, find its serial service, or get an answer back -- and those
+// are what decide whether an ELM327-over-BLE OBD-II dongle is usable from here.
+// So this connects to the address given, discovers services, picks the serial
+// pair (a notify characteristic for replies, a write one for commands), sends a
+// few read-only commands, reports what came back, and disconnects.
+//
+// Same shape as the scan, for the same reasons: its own task on core 1, the
+// handler answers before the radio is touched, and the result is read once.
+// Nothing is paired and nothing is left connected.
+// ---------------------------------------------------------------------------
+const int   BT_CONN_MAX_CMDS     = 8;
+const char* BT_CONN_DEFAULT_CMDS = "ATZ,ATE0,ATI,ATRV";   // all answer with the ignition off
+
+static char         g_bcAddr[18] = "";
+static uint8_t      g_bcAddrType = BLE_ADDR_PUBLIC;
+static String       g_bcCmds;                      // validated by the handler, comma-separated
+static bool         g_bcKeep     = false;
+static portMUX_TYPE g_bcMux      = portMUX_INITIALIZER_UNLOCKED;
+static char         g_bcRx[512];                   // reply bytes, appended by the notify callback
+static size_t       g_bcRxLen    = 0;
+
+// Runs on the NimBLE host task, not ours: no allocation and no logging, just an
+// append under the spinlock. Bytes past the buffer are dropped -- a reply that long
+// is not one of the short identification answers this test asks for.
+static void btRxNotify(BLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+  portENTER_CRITICAL(&g_bcMux);
+  for (size_t i = 0; i < len && g_bcRxLen < sizeof(g_bcRx); i++) g_bcRx[g_bcRxLen++] = (char)data[i];
+  portEXIT_CRITICAL(&g_bcMux);
+}
+
+// Read-only commands only. The endpoint is unauthenticated on the LAN and the far
+// side of the dongle is the car's diagnostic bus, so this is an ALLOW list: ELM327
+// identification and status AT commands, plus OBD-II requests in the modes that
+// only read -- 01 live data, 02 freeze frame, 03 stored codes, 07 pending codes,
+// 09 vehicle info, 0A permanent codes. Mode 04 (clear codes, which also wipes the
+// readiness monitors) cannot be reached, nor can AT commands that rewrite the
+// dongle's saved settings. AT SP 0 is the one save allowed: it restores the factory
+// default, automatic protocol search, which the OBD requests depend on.
+static bool btCmdAllowed(const String& c) {
+  static const char* AT_OK[] = { "ATZ", "ATWS", "ATI", "AT@1", "ATRV", "ATDP", "ATDPN",
+                                 "ATE0", "ATL0", "ATS0", "ATH0", "ATH1", "ATSP0" };
+  if (c.startsWith("AT")) {
+    for (const char* ok : AT_OK) if (c == ok) return true;
+    return false;
+  }
+  if (c.length() < 2 || c.length() > 8) return false;
+  for (size_t i = 0; i < c.length(); i++) if (!isxdigit((unsigned char)c[i])) return false;
+  String mode = c.substring(0, 2);
+  return mode == "01" || mode == "02" || mode == "03" || mode == "07" || mode == "09" || mode == "0A";
+}
+
+// Full 128-bit lowercase form, whatever toString() chose to print, so a 16-bit
+// UUID compares equal to its expanded spelling.
+static String btUuidStr(BLEUUID u) {
+  String s = u.toString(); s.toLowerCase();
+  if (s.startsWith("0x")) s = s.substring(2);
+  if (s.length() == 4) s = "0000" + s;
+  if (s.length() == 8) s += "-0000-1000-8000-00805f9b34fb";
+  return s;
+}
+
+// Serial services used by ELM327-over-BLE dongles, most common first. A device
+// offering none of them is still tried if some vendor service has a notify + write
+// pair; this list only breaks ties.
+static const char* BT_SERIAL_SVCS[] = {
+  "0000fff0-0000-1000-8000-00805f9b34fb",
+  "0000ffe0-0000-1000-8000-00805f9b34fb",
+  "000018f0-0000-1000-8000-00805f9b34fb",
+  "e7810a71-73ae-499d-8c15-faa9aef0c3f2",
+};
+static bool btStdService(const String& u) {      // GAP, GATT, device information, battery
+  return u.startsWith("00001800-") || u.startsWith("00001801-") ||
+         u.startsWith("0000180a-") || u.startsWith("0000180f-");
+}
+
+// Send one command and collect its reply up to the ELM327 '>' prompt. A reply
+// arrives split across notifications (20 bytes each at the default MTU), so this
+// waits for the prompt, not the first packet. The reply is bytes from a device we
+// do not control: printable ASCII only, CR/LF runs shown as " | ", prompt dropped,
+// JSON-escaped, capped.
+static String btElmExchange(BLEClient* cl, BLERemoteCharacteristic* tx, bool withResp,
+                            const String& cmd, uint32_t timeoutMs, uint32_t& tookMs, bool& prompt) {
+  portENTER_CRITICAL(&g_bcMux); g_bcRxLen = 0; portEXIT_CRITICAL(&g_bcMux);
+  String line = cmd + "\r";
+  uint32_t t0 = millis();
+  prompt = false;
+  if (!tx->writeValue((uint8_t*)line.c_str(), line.length(), withResp)) {
+    tookMs = millis() - t0;
+    return "(write failed)";
+  }
+  char buf[sizeof(g_bcRx)];
+  size_t n = 0;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(25));
+    portENTER_CRITICAL(&g_bcMux); n = g_bcRxLen; memcpy(buf, g_bcRx, n); portEXIT_CRITICAL(&g_bcMux);
+    if (n && memchr(buf, '>', n)) { prompt = true; break; }
+    if (millis() - t0 >= timeoutMs || !cl->isConnected()) break;
+  }
+  tookMs = millis() - t0;
+  String o; o.reserve(n + 16);
+  bool sep = false;
+  for (size_t i = 0; i < n && o.length() < 200; i++) {
+    char c = buf[i];
+    if (c == '\r' || c == '\n') { sep = o.length() > 0; continue; }
+    if (c == '>' || c < 0x20 || c > 0x7E) continue;
+    if (sep) { o += " | "; sep = false; }
+    if (c == '"' || c == '\\') o += '\\';
+    o += c;
+  }
+  return o;
+}
+
+void btConnTask(void* arg) {
+  vTaskDelay(pdMS_TO_TICKS(150));          // let the HTTP 202 reach the client first
+  uint32_t heap0 = ESP.getFreeHeap(), blk0 = ESP.getMaxAllocHeap();
+  bool wasUp = g_btUp;
+  auto fail = [&](const char* why) {
+    snprintf(g_bcErr, sizeof(g_bcErr), "%s", why);
+    if (g_btUp && !wasUp && !g_bcKeep) btStackDown();
+    g_btLastEnd = millis(); g_bcState = BCS_ERR; vTaskDelete(nullptr);
+  };
+
+  if (!wasUp) {
+    if (!BLEDevice::init("")) { fail("BLEDevice::init() failed"); return; }
+    g_btUp = true;
+  }
+  if (!g_bcClient) g_bcClient = BLEDevice::createClient();
+  BLEClient* cl = g_bcClient;
+  if (!cl) { fail("could not create a BLE client"); return; }
+
+  String out; out.reserve(3072);
+  char b[200];
+  snprintf(b, sizeof(b), "\"addr\":\"%s\",\"type\":\"%s\",\"bt_was_up\":%s,\"heap_before\":%lu,"
+                         "\"block_before\":%lu",
+           g_bcAddr, g_bcAddrType == BLE_ADDR_PUBLIC ? "public" : "random", wasUp ? "true" : "false",
+           (unsigned long)heap0, (unsigned long)blk0);
+  out += b;
+
+  // connect() ignores its timeout argument in this core's NimBLE path and always
+  // waits its own 30 s, so a device that is not there takes that long to report.
+  uint32_t t0 = millis();
+  bool connected = cl->connect(BLEAddress(String(g_bcAddr), g_bcAddrType), g_bcAddrType);
+  uint32_t connMs = millis() - t0;
+  snprintf(b, sizeof(b), ",\"connected\":%s,\"conn_ms\":%lu", connected ? "true" : "false",
+           (unsigned long)connMs);
+  out += b;
+
+  BLERemoteCharacteristic* rx = nullptr;
+  BLERemoteCharacteristic* tx = nullptr;
+  bool subscribed = false, withResp = false, elmSeen = false;
+  int nPrompt = 0;
+  if (connected) {
+    snprintf(b, sizeof(b), ",\"mtu\":%u,\"rssi\":%d", (unsigned)cl->getMTU(), cl->getRssi());
+    out += b;
+
+    String rxSvc;
+    int rank = 99, nSvc = 0;
+    out += ",\"svcs\":[";
+    for (auto& sp : *cl->getServices()) {
+      BLERemoteService* s = sp.second;
+      String su = btUuidStr(s->getUUID());
+      bool show = nSvc < 12;                       // enough to recognise a device; not unbounded
+      if (show) { if (nSvc) out += ","; out += "{\"uuid\":\""; out += su; out += "\",\"chars\":["; }
+      nSvc++;
+      BLERemoteCharacteristic* sRx = nullptr;
+      BLERemoteCharacteristic* sTxOnly = nullptr;
+      BLERemoteCharacteristic* sTxAny = nullptr;
+      int nChr = 0;
+      for (auto& cp : *s->getCharacteristics()) {
+        BLERemoteCharacteristic* c = cp.second;
+        bool ntf = c->canNotify() || c->canIndicate();
+        bool wr  = c->canWrite() || c->canWriteNoResponse();
+        if (ntf && !sRx) sRx = c;
+        if (wr && !ntf && !sTxOnly) sTxOnly = c;
+        if (wr && !sTxAny) sTxAny = c;
+        if (!show || nChr >= 10) continue;
+        if (nChr++) out += ",";
+        out += "{\"uuid\":\""; out += btUuidStr(c->getUUID()); out += "\",\"props\":\"";
+        if (c->canRead()) out += 'R';
+        if (c->canWrite()) out += 'W';
+        if (c->canWriteNoResponse()) out += 'w';
+        if (c->canNotify()) out += 'N';
+        if (c->canIndicate()) out += 'I';
+        out += "\"}";
+      }
+      if (show) out += "]}";
+      // Prefer a write characteristic that is not also the notify one: clones that
+      // split the pair (replies on one, commands on the other) ignore commands sent
+      // to the wrong one. A single notify+write characteristic is the fallback.
+      BLERemoteCharacteristic* sTx = sTxOnly ? sTxOnly : sTxAny;
+      if (!sRx || !sTx || btStdService(su)) continue;
+      int r = 50;
+      for (size_t k = 0; k < sizeof(BT_SERIAL_SVCS) / sizeof(BT_SERIAL_SVCS[0]); k++)
+        if (su == BT_SERIAL_SVCS[k]) r = (int)k;
+      if (r < rank) { rank = r; rx = sRx; tx = sTx; rxSvc = su; }
+    }
+    out += "]";
+
+    if (rx && tx) {
+      withResp = !tx->canWriteNoResponse();
+      subscribed = rx->subscribe(rx->canNotify(), btRxNotify);
+      out += ",\"serial\":{\"svc\":\""; out += rxSvc;
+      out += "\",\"rx\":\"";  out += btUuidStr(rx->getUUID());
+      out += "\",\"tx\":\"";  out += btUuidStr(tx->getUUID());
+      out += "\",\"write\":\""; out += withResp ? "with-response" : "no-response";
+      out += "\",\"subscribed\":"; out += subscribed ? "true" : "false";
+      out += "}";
+    } else {
+      out += ",\"serial\":null";
+    }
+
+    out += ",\"elm\":[";
+    if (subscribed) {
+      String list = g_bcCmds + ",";
+      int nCmd = 0;
+      for (int from = 0, comma; (comma = list.indexOf(',', from)) >= 0 && cl->isConnected(); from = comma + 1) {
+        String cmd = list.substring(from, comma);
+        if (!cmd.length()) continue;
+        uint32_t tmo = (cmd == "ATZ" || cmd == "ATWS") ? 4000 : cmd.startsWith("AT") ? 2500 : 6000;
+        uint32_t took = 0;
+        bool prompt = false;
+        String reply = btElmExchange(cl, tx, withResp, cmd, tmo, took, prompt);
+        if (prompt) nPrompt++;
+        if (reply.indexOf("ELM") >= 0) elmSeen = true;
+        if (nCmd++) out += ",";
+        out += "{\"cmd\":\""; out += cmd;            // allow-listed, so already JSON-safe
+        out += "\",\"ms\":";  out += String(took);
+        out += ",\"prompt\":"; out += prompt ? "true" : "false";
+        out += ",\"reply\":\""; out += reply;
+        out += "\"}";
+      }
+    }
+    out += "]";
+
+    // Wait for the disconnect to land before the task ends: the client is reused,
+    // and connect() refuses while the previous link still holds a handle.
+    cl->disconnect();
+    for (uint32_t w = millis(); cl->getConnId() != BLE_HS_CONN_HANDLE_NONE && millis() - w < 5000; )
+      vTaskDelay(pdMS_TO_TICKS(20));
+  }
+
+  const char* verdict =
+      !connected  ? "no connection" :
+      !(rx && tx) ? "connected, but no serial (notify + write) service found" :
+      !subscribed ? "connected, but subscribing to its replies failed" :
+      !nPrompt    ? "connected and subscribed, but the dongle never answered" :
+      elmSeen     ? "PASS: connected and the dongle answered as an ELM327" :
+                    "connected and answering, but nothing identified an ELM327";
+  out += ",\"verdict\":\""; out += verdict; out += "\"";
+
+  if (!wasUp && !g_bcKeep) btStackDown();
+  snprintf(b, sizeof(b), ",\"heap_after\":%lu,\"block_after\":%lu,\"bt_up_now\":%s",
+           (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), g_btUp ? "true" : "false");
+  out += b;
+
+  g_bcJson = out;
+  g_btLastEnd = millis();
+  g_bcState = BCS_DONE;            // set LAST: the handler reads g_bcJson only after this
+  // The log line is capped at LOG_LEN with the timestamp inside it, so it gets the
+  // short form; the full verdict is in the JSON.
+  const char* vshort = !connected ? "no connection" : !(rx && tx) ? "no serial service" :
+                       !subscribed ? "subscribe failed" : !nPrompt ? "no answer" :
+                       elmSeen ? "PASS" : "answers, not ELM327";
+  logLine("BT: test %s -> %s, %lu ms to connect", g_bcAddr, vshort, (unsigned long)connMs);
+  vTaskDelete(nullptr);
+}
+
+// GET /btconnect?addr=aa:bb:cc:dd:ee:ff&t=public|random[&cmds=ATZ,ATI][&keep=1]
+//                  starts a connect test and returns immediately.
+// GET /btconnect   reports state, and the result once it is ready.
+void handleBtConnect() {
+  trackReq();
+  auto say = [&](int code, const String& body) {
+    g_out_total += body.length();
+    server.send(code, "application/json", body);
+  };
+
+  // Backstop, sized for the worst honest case: a 30 s connect, discovery, then
+  // eight commands at up to 6 s each.
+  if (g_bcState == BCS_RUNNING && millis() - g_bcStart > 150000UL) {
+    snprintf(g_bcErr, sizeof(g_bcErr), "connect task did not finish within 150 s");
+    g_bcState = BCS_ERR;
+  }
+
+  if (server.hasArg("addr")) {                      // ---- start ----
+    if (g_bcState == BCS_RUNNING || g_btState == BTS_RUNNING) {
+      say(409, "{\"ok\":false,\"detail\":\"the radio is busy with a scan or another test\"}"); return;
+    }
+    String a = server.arg("addr"); a.trim(); a.toLowerCase();
+    bool addrOk = a.length() == 17;
+    for (int i = 0; addrOk && i < 17; i++)
+      addrOk = (i % 3 == 2) ? a[i] == ':' : isxdigit((unsigned char)a[i]);
+    if (!addrOk) { say(400, "{\"ok\":false,\"detail\":\"addr must look like aa:bb:cc:dd:ee:ff\"}"); return; }
+
+    String raw = server.hasArg("cmds") ? server.arg("cmds") : String(BT_CONN_DEFAULT_CMDS);
+    raw.toUpperCase(); raw.replace(" ", ""); raw += ",";
+    String cmds;
+    int nCmd = 0;
+    for (int from = 0, comma; (comma = raw.indexOf(',', from)) >= 0; from = comma + 1) {
+      String c = raw.substring(from, comma);
+      if (!c.length()) continue;
+      if (!btCmdAllowed(c)) {
+        say(400, String("{\"ok\":false,\"detail\":\"'") + btSafeName(c) +
+                 "' is not on the read-only command list\"}"); return;
+      }
+      if (++nCmd > BT_CONN_MAX_CMDS) {
+        say(400, String("{\"ok\":false,\"detail\":\"at most ") + BT_CONN_MAX_CMDS + " commands\"}"); return;
+      }
+      if (cmds.length()) cmds += ",";
+      cmds += c;
+    }
+
+    if (!g_btUp) {
+      String why;
+      int code = btBringUpRefusal(why);
+      if (code) { say(code, why); return; }
+    }
+    strlcpy(g_bcAddr, a.c_str(), sizeof(g_bcAddr));
+    g_bcAddrType = (server.arg("t") == "random") ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+    g_bcCmds = cmds;
+    g_bcKeep = server.hasArg("keep");
+    g_bcJson = ""; g_bcErr[0] = 0;
+    g_bcStart = millis(); g_bcState = BCS_RUNNING;
+    // Answer first, then touch the radio -- the scan learned this in 4.71.
+    say(202, "{\"ok\":true,\"state\":\"running\"}");
+    if (xTaskCreatePinnedToCore(btConnTask, "btconn", 8192, nullptr, 1, nullptr, 1) != pdPASS) {
+      snprintf(g_bcErr, sizeof(g_bcErr), "could not start the connect task");
+      g_btLastEnd = millis(); g_bcState = BCS_ERR;
+    }
+    return;
+  }
+
+  switch (g_bcState) {                              // ---- poll ----
+    case BCS_RUNNING: say(200, "{\"ok\":true,\"state\":\"running\"}"); break;
+    case BCS_DONE:    say(200, "{\"ok\":true,\"state\":\"done\"," + g_bcJson + "}");
+                      g_bcState = BCS_IDLE; break;
+    case BCS_ERR:     say(200, String("{\"ok\":false,\"state\":\"error\",\"detail\":\"") + g_bcErr + "\"}");
+                      g_bcState = BCS_IDLE; break;
     default:          say(200, "{\"ok\":true,\"state\":\"idle\"}"); break;
   }
 }
@@ -5662,6 +6141,7 @@ void setup() {
   server.on("/memdisk", HTTP_GET, handleMemPage);      // Memory / Disk tab
   server.on("/debug", HTTP_GET, handleDebugPage);      // Debug tab (BLE scanner)
   server.on("/btscan", HTTP_GET, handleBtScan);        // brings BLE up, scans, puts it back down
+  server.on("/btconnect", HTTP_GET, handleBtConnect);  // one short connection, read-only ELM327 questions
   server.on("/app.css", HTTP_GET, handleAppCss);       // shared cached stylesheet
   server.on("/app.js", HTTP_GET, handleAppJs);         // shared cached engine
   server.on("/json", handleJson);
@@ -5882,10 +6362,10 @@ void loop() {
     flushDrainToFlash();                            // and the hourly drain bucket, if one completed
     flushRunsToFlash();                             // and any engine start/stop events
     flushDailyToFlash();                            // and the daily bucket, at midnight
-    // Never while a scan task is live -- it owns the stack until it finishes.
-    if (g_btUp && g_btState != BTS_RUNNING && g_btLastEnd &&
+    // Never while a scan or connect test is live -- it owns the stack until it finishes.
+    if (g_btUp && g_btState != BTS_RUNNING && g_bcState != BCS_RUNNING && g_btLastEnd &&
         millis() - g_btLastEnd > BT_IDLE_OFF_MS) {
-      BLEDevice::deinit(false); g_btUp = false; g_btLastEnd = millis();
+      btStackDown(); g_btLastEnd = millis();
       logLine("BT: radio auto-off after %lu min idle", (unsigned long)(BT_IDLE_OFF_MS / 60000));
     }
     if (!g_runRecDone && timeIsValid() && g_lastV > 5.0f) reconcileOpenRun();

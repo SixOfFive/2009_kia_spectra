@@ -14,6 +14,90 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-14 — fw 4.73: a BLE connect test, and the Veepeak passes it
+
+### Added — can the board *talk* to a dongle, not just see it?
+
+The scanner proves a device is advertising. It cannot say whether the board can
+hold a connection, find the serial service and get an answer back — and that is
+what decides whether a BLE OBD-II dongle is usable from here. Every scan row now
+has a **Test** button, backed by `GET /btconnect?addr=<mac>&t=<public|random>`:
+
+- connect, discover services, and pick the serial pair: a notify characteristic
+  for replies and a write one for commands. `FFF0`, `FFE0`, `18F0` and the
+  vLinker-style 128-bit service break ties; any vendor notify + write pair is tried;
+- subscribe, send `ATZ ATE0 ATI ATRV`, and collect each reply up to the ELM327 `>`
+  prompt — a reply arrives split across notifications, so the first packet is not
+  the answer;
+- disconnect, wait for the link to actually drop, and report a verdict.
+
+Own task on core 1, the reply sent before the radio is touched, the result read
+once: the shape the scanner reached in 4.71, for the same reasons.
+
+**Commands go through a read-only allow list.** The endpoint is unauthenticated
+on the LAN and the far side of the dongle is the car's diagnostic bus, so only
+ELM327 identification/status AT commands and OBD-II modes `01 02 03 07 09 0A` are
+accepted. Mode `04` — clear codes, which also wipes the readiness monitors — cannot
+be reached, nor can AT commands that rewrite the dongle's saved settings.
+
+### Verified — the Veepeak in the car, ignition off
+
+| | |
+|---|---|
+| Scan | `VEEPEAK`, public address, −56 dBm, advertises `FFF0` |
+| Connect | 8317 ms, −58 dBm, MTU 130 |
+| Serial pair | `FFF1` notify (replies), `FFF2` write / write-no-response (commands) |
+| `ATZ`, `ATI` | `ELM327 v1.5` (904 ms, 101 ms) |
+| `ATRV` | `11.9V` |
+| Verdict | **PASS: connected and the dongle answered as an ELM327** |
+
+It also exposes Device Information (`180A`) and Microchip's transparent-UART
+service (`49535343-fe7d-…`); the tie-break correctly chose `FFF0`.
+
+A second test on the **reused client**, with the stack still up and the largest
+free block down to 36,852 B, passed again: 5,570 ms to connect at −54 dBm, same
+replies, `ATRV` `11.8V`. Between the two, a test against a peripheral out of reach
+(a laptop indoors at −85 dBm) timed out at 31,001 ms and left the client reusable,
+which the second pass proved. The 60 KB largest-block gate is a requirement for
+bringing the stack up, not for connecting once it is up.
+
+**`ATRV` is not a battery reference.** It read 11.9 V while the board's own
+calibrated divider read 12.89 V, so the divider stays the measurement.
+
+### Found — what a live connection costs
+
+Free heap went **178,732 → 90,924 B** across the test with the radio left up, and
+the largest block **131,060 → 47,092 B**. Anything that holds a connection open
+for continuous OBD polling carries that for as long as the link lasts. That is the
+design constraint for whatever is built on this.
+
+### Designed around — the client the library deletes for you
+
+`BLEDevice` keeps its own pointer to the last client it created and deletes it
+inside `deinit()`. Deleting ours as well would be a double free; creating one per
+test would leak all but the last. So one client is reused per radio session and
+forgotten at every teardown, and all three teardown paths — scan, **Radio off**,
+idle auto-off — now go through a single `btStackDown()` for exactly that reason.
+
+### Found, not fixed — OTA gives up on a short pause in the data
+
+Six uploads of this image failed with `curl: (52) Empty reply from server` at
+random offsets; the board logged each as `OTA ABORTED by client` (14,360 to
+482,496 bytes in). The client was not aborting. `WebServer::_uploadReadByte()`
+stops when no byte arrives within the connection's read timeout and reports that
+as an abort. Turning WiFi power-save off was not enough on its own: two of three
+attempts still failed before the third went through (1,562,167 B in 92 s). The
+fix is to lengthen the upload connection's timeout while an OTA runs. It was
+found after this image was built, so it goes in the next one.
+
+### Changed — WiFi power-save is off
+
+Switched off (`POST /wifips?on=0`, persisted in NVS) to get the upload through,
+and left off at the owner's request. It costs parked current. Undo with
+`POST /wifips?on=1`.
+
+---
+
 ## 2026-08-26 — fw 4.72: the radio drops itself, and honest advice when it is too late
 
 ### Found — the fragmentation never recovers

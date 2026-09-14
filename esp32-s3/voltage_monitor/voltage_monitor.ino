@@ -35,6 +35,11 @@
 #include <BLERemoteService.h>
 #include <BLERemoteCharacteristic.h>
 #include "obd_elm.h"      // OBD pages: ELM327 reply parsing and J1979 decoding, host-tested
+// Defined with the OBD log further down but called earlier -- by the safety task's
+// edge detector and by /obdjson -- and the Arduino builder's generated prototypes
+// missed both.
+bool obdEngineFresh(uint32_t nowMs, ObdEngine* out);
+void obdLogRecount();
 #include "esp_attr.h"       // RTC_NOINIT_ATTR -- WDT breadcrumbs that survive a reset
 #include <stdarg.h>         // logLine() variadic formatting
 #include <Adafruit_GFX.h>
@@ -112,7 +117,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.74";
+const char* FW_VERSION = "4.75";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -428,6 +433,7 @@ struct RunEvent {
 const uint8_t  RUN_F_TX_OK    = 0x01;         // the CC1101 accepted the burst
 const uint8_t  RUN_F_BACKFILL = 0x80;         // reconstructed, NOT recorded live
 const uint8_t  RUN_F_RECON    = 0x40;         // edge inferred at boot, timestamp is an estimate
+const uint8_t  RUN_F_OBD      = 0x20;         // edge timed by the engine computer over OBD, not by voltage
 const char*    RUN_FILE = "/runs.bin";
 const char*    RUN_OLD  = "/runs.old";
 const uint32_t RUN_MAGIC = 0x52554E31;        // "RUN1"
@@ -2249,7 +2255,23 @@ void evalAutoStart(float v) {
   bool inst = engRunning ? (v >= AS_ENG_OFF_V) : (valid && v >= AS_ALT_V);
   bool nowRun = engRunning;                // only changes once an edge is CONFIRMED
   uint32_t edgeMs = now;
-  if (inst != engRunning) {
+  uint8_t runFlags = 0;
+  // While the OBD link has a fresh reading, the engine computer decides the run
+  // edges: RPM falls to zero the moment the engine stops, where voltage needs
+  // AS_RUN_OFF_S to see through surface charge, and a voltage dip cannot end a run
+  // the ECU says is still going. This decides the RUN LOG ONLY. The fire decision
+  // above (g_parkS) stays on voltage alone -- a Start sent to a running Compustar
+  // engine switches it off -- and nothing on that path reads engRunning.
+  ObdEngine oe;
+  bool obdUse = obdEngineFresh(now, &oe);
+  // A link that has lost the ECU mid-drive must not end a run the alternator says is
+  // still going: an OBD "stopped" is only taken once voltage agrees charging stopped.
+  if (obdUse && oe.state == OE_STOPPED && valid && v >= AS_ALT_V) obdUse = false;
+  if (obdUse) {
+    candMs = 0;
+    bool obdRun = (oe.state == OE_RUNNING);
+    if (obdRun != engRunning) { nowRun = obdRun; edgeMs = oe.changeMs; runFlags = RUN_F_OBD; }
+  } else if (inst != engRunning) {
     if (candMs == 0 || candTo != inst) { candMs = now; candTo = inst; }
     uint32_t need = inst ? AS_RUN_ON_S : AS_RUN_OFF_S;
     if ((now - candMs) / 1000 >= need) { nowRun = inst; edgeMs = candMs; candMs = 0; }
@@ -2260,20 +2282,21 @@ void evalAutoStart(float v) {
   // recorded time or inflate the gap to the previous run.
   uint32_t edgeTs = 0;
   if (timeIsValid()) {
-    uint32_t backS = (now - edgeMs) / 1000;
-    edgeTs = (uint32_t)time(nullptr) - backS;
-  }
+    uint32_t backS = (edgeMs <= now) ? (now - edgeMs) / 1000 : 0;
+    edgeTs = (uint32_t)time(nullptr) - backS; }
+  // An ON edge the ECU saw first is dated by its own run-time counter (PID 1F).
+  if (runFlags && nowRun && oe.onEpoch) edgeTs = oe.onEpoch;
 
   if (nowRun && !engRunning) {
     engOnMs     = edgeMs;
     g_lastRunTs = edgeTs;
     if (g_lastRunTs) prefs.putUInt("last_run", g_lastRunTs);
     cdMaybeFlush(now, true);
-    logLine("ENGINE ON: alternator charging at %.2f V", v);
+    logLine(runFlags ? "ENGINE ON: the ECU reports it running (%.2f V)" : "ENGINE ON: alternator charging at %.2f V", v);
     // Attribute the run: a start we are verifying is ours, anything else is the
     // key or the FOB. This is what makes "time between manual and auto starts"
     // answerable months later.
-    runLogAt(edgeTs, RUN_ON, g_verifying ? (g_verifyAuto ? RSRC_AUTO : RSRC_MANUAL) : RSRC_EXT, v, 0, 0);
+    runLogAt(edgeTs, RUN_ON, g_verifying ? (g_verifyAuto ? RSRC_AUTO : RSRC_MANUAL) : RSRC_EXT, v, 0, runFlags);
     g_sbFlush = true;                             // don't strand the transition in RAM
     // The engine is running but WE did not ask for it -- key, FOB or someone
     // else. Record it in the start history so the log is a complete account of
@@ -2294,9 +2317,10 @@ void evalAutoStart(float v) {
     resetDrainBuckets("engine started");
   } else if (!nowRun && engRunning) {
     uint32_t ran = (edgeMs - engOnMs) / 1000;
-    logLine("ENGINE OFF: charging ended at %.2f V after %lum %lus",
+    logLine(runFlags ? "ENGINE OFF: the ECU reports it stopped (%.2f V) after %lum %lus"
+                     : "ENGINE OFF: charging ended at %.2f V after %lum %lus",
             v, (unsigned long)(ran / 60), (unsigned long)(ran % 60));
-    runLogAt(edgeTs, RUN_OFF, RSRC_EXT, v, ran, 0);
+    runLogAt(edgeTs, RUN_OFF, RSRC_EXT, v, ran, runFlags);
     g_sbFlush = true;                             // ditto -- this edge starts the drain clock
     if (edgeTs) {                                 // arm the settled reference
       g_ltDue = edgeTs + LT_SETTLE_S;
@@ -4132,7 +4156,21 @@ function overview(d){
   d.cats.forEach(function(c){
     h+="<a class=\"card\" href=\"/obd/"+esc(c.k)+"\"><div class=\"k\">"+esc(c.n)+"</div><div class=\"v\" style=\"font-size:14px;font-weight:400\">"
       +esc(c.b)+"</div>"+(c.tot?"<div class=\"sv\">"+(c.sup===null?c.tot+(c.tot===1?" value":" values"):c.sup+" of "+c.tot+" supported")+"</div>":"")+"</a>";});
-  return h+"</div>";
+  return h+"</div>"+logCard(d);
+}
+function logCard(d){
+  var L=d.log||{}, live=d.link==="live";
+  var state=!L.en?"off":(live?"recording a row every 30 s":"on \u2014 records whenever the car answers");
+  return "<div class=\"clbl\">OBD log</div><div class=\"card\"><div class=\"pwrrow\"><div style=\"flex:1;min-width:220px\">"
+    +"<div class=\"k\">Logging</div><div class=\"v\" style=\"font-size:15px;color:"+(!L.en?"#8b949e":(live?"#3fb950":"#e6edf3"))+"\">"+state+"</div>"
+    +"<div class=\"sv\" style=\"white-space:normal\">"+(L.bytes?Math.max(1,Math.round(L.bytes/1024))+" KB stored":"nothing stored yet")
+    +(L.last?" \u00b7 newest row "+new Date(L.last*1000).toLocaleString():"")+"</div></div>"
+    +"<div style=\"text-align:right\"><button class=\"seg\" id=\"logtog\">"+(L.en?"Turn off":"Turn on")+"</button> "
+    +"<a href=\"/obdlog.csv\" style=\"margin:0 6px\">Download CSV</a>"
+    +"<button class=\"seg\" id=\"logclr\""+(L.bytes?"":" disabled")+">Clear</button></div></div>"
+    +"<div class=\"note\">A row every 30 s while the car answers, date and time first; nothing is written while it is off. "
+    +"With logging on, the board connects to the reader by itself when the engine starts and holds the link for the drive. "
+    +"Two generations of about 512 KB are kept.</div></div>";
 }
 function electrical(d){
   return needCar(d,"ECU values")+cards(d.vals.concat([
@@ -4205,6 +4243,11 @@ function render(d){
   }
   $("body").innerHTML=h;
   var rb=$("refresh"); if(rb)rb.onclick=function(){REFRESH=true;rb.disabled=true;rb.textContent="reading\u2026"};
+  var lt=$("logtog"); if(lt)lt.onclick=function(){lt.disabled=true;
+    fetch("/obdlog?en="+((d.log&&d.log.en)?"0":"1"),{method:"POST"}).catch(function(){});};
+  var lc=$("logclr"); if(lc)lc.onclick=function(){
+    if(!confirm("Delete the whole OBD log, both generations? This cannot be undone."))return;
+    lc.disabled=true; fetch("/obdlog?clear=1",{method:"POST"}).catch(function(){});};
 }
 // A hidden tab stops polling, so the board drops the link a minute later instead of
 // holding ~88 KB for a page nobody is looking at. Browsers still run a background
@@ -5350,6 +5393,26 @@ static volatile uint32_t g_obdPolls = 0;             // /obdjson requests served
 static IPAddress         g_obdPoller;                // who polled last
 static volatile uint32_t g_obdBeat  = 0;             // session loop passes (for /obdstate)
 static char              g_obdStage[16] = "idle";    // the command or step the session is on
+// ---- OBD log and the ECU's view of the engine (fw 4.75) ----
+const uint32_t OBD_LOG_EVERY_MS = 30000;              // one row per 30 s while the car answers
+const uint32_t OBD_ENG_FRESH_MS = 15000;              // an ECU view older than this is not used
+const int      OBD_LOGQ_N       = 4;
+struct ObdLogRow {
+  uint32_t ts;                                        // unix epoch of the row
+  float    v[OBD_MAX_PIDS];                           // indexed like OBD_PIDS
+  uint64_t have;                                      // bit i set: v[i] is a fresh reading
+  float    atrv, batt;
+  int8_t   mil, dtc;                                  // -1 = not known
+};
+static bool         g_obdLogEn   = true;              // NVS "obd_log"; on unless turned off
+static ObdLogRow    g_obdLogQ[OBD_LOGQ_N];            // filled by the OBD task, drained by the loop core
+static int          g_obdLogHead = 0, g_obdLogTail = 0;
+static portMUX_TYPE g_obdLogMux  = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t g_obdLogRows   = 0;          // rows written since boot
+static volatile uint32_t g_obdLogLastTs = 0;          // epoch of the newest row written
+static uint32_t     g_obdLogBytes = 0;                // both generations on flash
+static ObdEngine    g_obdEng;                         // written by the OBD task ...
+static portMUX_TYPE g_obdEngMux  = portMUX_INITIALIZER_UNLOCKED;   // ... read by the safety task
 static volatile int      g_obdWant         = -1;     // category on screen; -1 = the main OBD page
 static volatile bool     g_obdCodesRefresh = false;
 static volatile bool     g_obdFatal        = false;  // the last session hit something a retry cannot fix
@@ -5395,7 +5458,10 @@ static void obdJsonText(String& o, const char* s) {
 
 static bool obdShouldStop(const char* addr) {
   uint32_t last = g_obdLastPoll;                 // read before millis(), so never "in the future"
-  return millis() - last > OBD_IDLE_MS || strcmp(addr, g_obdAddr) != 0;
+  bool pageIdle = millis() - last > OBD_IDLE_MS;
+  // With logging on, the log wants the link for as long as the engine runs.
+  bool logging = g_obdLogEn && engRunning;
+  return (pageIdle && !logging) || strcmp(addr, g_obdAddr) != 0;
 }
 
 // Sleep in short slices, waking early when the pages close or the reader changes.
@@ -5518,6 +5584,70 @@ static void obdReadInfo(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, cha
   portEXIT_CRITICAL(&g_obdMux);
 }
 
+// ---- the OBD log and the ECU's view of the engine: session-side helpers (fw 4.75) ----
+const int OBD_WANT_LOG = -2;                     // obdPollValues: every logged PID, not one page's
+
+// Feed the engine tracker one RPM reading. The first time the engine is seen
+// running, ask for PID 1F too, so the start is dated by the ECU's own counter
+// rather than by whenever the link happened to come up.
+static void obdEngNote(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, float rpm, long runtime,
+                       const uint32_t sup[4], char* r, size_t cap) {
+  bool wasRunning;
+  portENTER_CRITICAL(&g_obdEngMux);
+  wasRunning = g_obdEng.state == OE_RUNNING;
+  portEXIT_CRITICAL(&g_obdEngMux);
+  if (rpm >= OBD_ENG_RPM_MIN && !wasRunning && runtime < 0 && obdIsSupported(sup, 0x1F)) {
+    obdCmd(cl, tx, wr, "011F", 4000, r, cap);
+    uint8_t d[4];
+    float v = 0;
+    int n = obdFindPid(r, 0x01, 0x1F, d, sizeof(d));
+    if (n >= 0 && obdDecode(0x1F, d, n, &v)) runtime = (long)v;
+  }
+  uint32_t epoch = timeIsValid() ? (uint32_t)time(nullptr) : 0;
+  portENTER_CRITICAL(&g_obdEngMux);
+  obdEngObserve(&g_obdEng, true, rpm, false, runtime, millis(), epoch);
+  portEXIT_CRITICAL(&g_obdEngMux);
+}
+
+// A whole pass got no answer from the car. It counts toward "stopped" only if the
+// ECU had been reporting the engine running -- see obdEngObserve().
+static void obdEngSilent() {
+  uint32_t epoch = timeIsValid() ? (uint32_t)time(nullptr) : 0;
+  portENTER_CRITICAL(&g_obdEngMux);
+  obdEngObserve(&g_obdEng, false, 0, true, -1, millis(), epoch);
+  portEXIT_CRITICAL(&g_obdEngMux);
+}
+
+// Queue one log row from what the car reported in the last OBD_LOG_EVERY_MS. RAM
+// only: the loop core writes it (flushObdLogToFlash). A pass with nothing fresh from
+// the car queues nothing, which is what keeps a car that is off out of the log.
+static void obdLogQueueRow() {
+  if (!timeIsValid()) return;                    // a row with no date is not worth keeping
+  ObdLogRow row;
+  memset(&row, 0, sizeof(row));
+  row.ts = (uint32_t)time(nullptr);
+  uint32_t now = millis();
+  portENTER_CRITICAL(&g_obdMux);
+  for (int i = 0; i < OBD_PID_COUNT && i < OBD_MAX_PIDS; i++)
+    if (g_obd.val[i].state == 1 && now - g_obd.val[i].atMs <= OBD_LOG_EVERY_MS) {
+      row.v[i] = g_obd.val[i].v;
+      row.have |= 1ULL << i;
+    }
+  row.atrv = g_obd.atrv;
+  row.mil = g_obd.monKnown ? ((g_obd.mon[0] & 0x80) ? 1 : 0) : -1;
+  row.dtc = g_obd.monKnown ? (int8_t)(g_obd.mon[0] & 0x7F) : -1;
+  portEXIT_CRITICAL(&g_obdMux);
+  if (!row.have) return;
+  row.batt = g_lastV;
+  portENTER_CRITICAL(&g_obdLogMux);
+  int nxt = (g_obdLogHead + 1) % OBD_LOGQ_N;
+  if (nxt != g_obdLogTail) {                     // full -> drop the row, never stall the link
+    g_obdLogQ[g_obdLogHead] = row;
+    g_obdLogHead = nxt;
+  }
+  portEXIT_CRITICAL(&g_obdLogMux);
+}
+
 // One pass over the values the open page shows. Returns how many the car
 // answered, or -1 when there was nothing to ask.
 static int obdPollValues(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, int want, char* r, size_t cap) {
@@ -5527,9 +5657,14 @@ static int obdPollValues(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, in
   portEXIT_CRITICAL(&g_obdMux);
   const int vehicleCat = obdCatIndex("vehicle");
   int asked = 0, answered = 0;
+  bool rpmOk = false;
+  float rpm = 0;
+  long runtime = -1;
   for (int i = 0; i < OBD_PID_COUNT && i < OBD_MAX_PIDS && cl->isConnected(); i++) {
     const ObdPid& p = OBD_PIDS[i];
-    if (want < 0 ? !p.hub : p.cat != want) continue;
+    bool pick = (want == OBD_WANT_LOG) ? (p.cat != vehicleCat) : (want < 0 ? p.hub : p.cat == want);
+    if (p.pid == 0x0C) pick = true;              // whether the engine is running is always worth knowing
+    if (!pick) continue;
     if (!obdIsSupported(sup, p.pid)) continue;
     uint8_t st;
     portENTER_CRITICAL(&g_obdMux);
@@ -5545,6 +5680,8 @@ static int obdPollValues(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, in
     bool ok = n >= 0 && obdDecode(p.pid, d, n, &v);
     asked++;
     if (ok) answered++;
+    if (ok && p.pid == 0x0C) { rpmOk = true; rpm = v; }
+    if (ok && p.pid == 0x1F) runtime = (long)v;
     portENTER_CRITICAL(&g_obdMux);
     if (ok) {
       g_obd.val[i].v = v;
@@ -5555,6 +5692,7 @@ static int obdPollValues(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, in
     }
     portEXIT_CRITICAL(&g_obdMux);
   }
+  if (rpmOk) obdEngNote(cl, tx, wr, rpm, runtime, sup, r, cap);
   return asked ? answered : -1;
 }
 
@@ -5616,7 +5754,7 @@ static void obdSession(const char* addr, uint8_t type) {
 
     bool live = obdProbe(cl, tx, wr, r, sizeof(r));
     logLine("OBD: reader up, car %s", live ? "answering" : "not answering");
-    uint32_t lastProbe = millis(), lastSlow = millis(), lastMon = 0;
+    uint32_t lastProbe = millis(), lastSlow = millis(), lastMon = 0, lastLog = 0;
     int silent = 0;
     while (cl->isConnected() && !obdShouldStop(addr)) {
       const int want = g_obdWant;
@@ -5658,7 +5796,13 @@ static void obdSession(const char* addr, uint8_t type) {
         portEXIT_CRITICAL(&g_obdMux);
         if (!known) obdReadInfo(cl, tx, wr, r, sizeof(r));
       }
+      if (answered && g_obdLogEn && timeIsValid() && (lastLog == 0 || millis() - lastLog >= OBD_LOG_EVERY_MS)) {
+        lastLog = millis();                        // one sweep of every logged value, then a row
+        obdReadMonitor(cl, tx, wr, r, sizeof(r));
+        if (obdPollValues(cl, tx, wr, OBD_WANT_LOG, r, sizeof(r)) > 0) obdLogQueueRow();
+      }
       int got = answered ? obdPollValues(cl, tx, wr, want, r, sizeof(r)) : 0;
+      if (got == 0) obdEngSilent();
       if (got == 0 && ++silent >= 3) {             // the ignition went off mid-session
         live = false;
         lastProbe = millis();
@@ -5695,7 +5839,7 @@ void obdTask(void* arg) {
 
 // Start a session for the page that just polled, unless something else holds the
 // radio or the heap cannot place the stack. `why` explains a refusal.
-static bool obdStartSession(String& why) {
+static bool obdStartSession(String& why, const char* who) {
   if (g_btState == BTS_RUNNING || g_bcState == BCS_RUNNING) {
     why = "the Debug page is using the radio";
     return false;
@@ -5713,9 +5857,12 @@ static bool obdStartSession(String& why) {
   g_obd.linkSince = millis();
   g_obd.nStored = g_obd.nPending = g_obd.nPerm = -1;
   portEXIT_CRITICAL(&g_obdMux);
+  portENTER_CRITICAL(&g_obdEngMux);
+  obdEngReset(&g_obdEng);                        // a new link knows nothing about the engine yet
+  portEXIT_CRITICAL(&g_obdEngMux);
   g_obdFatal = false;
   g_obdAlive = true;                              // before the task exists: a second poll must not start a second
-  logLine("OBD: link opened for %s", g_obdPoller.toString().c_str());
+  logLine("OBD: link opened for %s", who);
   if (xTaskCreatePinnedToCore(obdTask, "obd", 8192, nullptr, 1, nullptr, 1) != pdPASS) {
     g_obdAlive = false;
     why = "could not start the OBD task";
@@ -5736,9 +5883,12 @@ void handleObdJson() {
   g_obdPolls++;
   g_obdPoller = server.client().remoteIP();
   if (server.hasArg("refresh")) g_obdCodesRefresh = true;
+  static bool logCounted = false;               // the log's size, read off flash once per boot
+  if (!logCounted) { obdLogRecount(); logCounted = true; }
 
   String note;
-  if (g_obdAddr[0] && !g_obdAlive && millis() - g_obdHoldFrom >= g_obdHoldMs) obdStartSession(note);
+  if (g_obdAddr[0] && !g_obdAlive && millis() - g_obdHoldFrom >= g_obdHoldMs)
+    obdStartSession(note, g_obdPoller.toString().c_str());
 
   static ObdShared s;                             // loop task only; keeps ~1.3 KB off its stack
   portENTER_CRITICAL(&g_obdMux);
@@ -5761,6 +5911,11 @@ void handleObdJson() {
   o += ",\"atrv\":";
   if (s.atrv > 0) o += String(s.atrv, 1); else o += "null";
   o += ",\"board_v\":";        o += String(g_lastV, 2);
+  o += ",\"log\":{\"en\":";   o += g_obdLogEn ? "true" : "false";
+  o += ",\"bytes\":";         o += g_obdLogBytes;
+  o += ",\"rows\":";          o += (uint32_t)g_obdLogRows;
+  o += ",\"last\":";          o += (uint32_t)g_obdLogLastTs;
+  o += "}";
   if (s.monKnown) {
     o += ",\"mil\":";          o += (s.mon[0] & 0x80) ? "true" : "false";
     o += ",\"dtc\":";          o += (int)(s.mon[0] & 0x7F);
@@ -5916,6 +6071,222 @@ void handleObdCfg() {
   g_obdHoldMs = 0;                                // a new reader gets a session straight away
   logLine("OBD: reader set to %s", g_obdAddr);
   say(200, String("{\"ok\":true,\"reader\":\"") + g_obdAddr + "\"}");
+}
+
+// ---------------------------------------------------------------------------
+// OBD log (fw 4.75) -- a CSV row every 30 s while the car answers.
+//
+// Rows are built by the OBD task in RAM and written here, on the loop core, with
+// every other filesystem write: never from the BLE task, never while an OTA
+// streams. Two generations of OBD_LOG_CAP are kept, as with the event log. The
+// first column is local date and time. A value the car did not report is an empty
+// cell, so the columns never shift.
+//
+// Logging defaults ON. While it is on and the engine runs, the loop core starts
+// the link itself (obdLogMaybeStart) and the link is held for the whole drive --
+// the ~88 KB a held link costs is accepted while driving, when the auto-start has
+// nothing to do.
+// ---------------------------------------------------------------------------
+const size_t OBD_LOG_CAP  = 512UL * 1024UL;       // per generation
+const char*  OBD_LOG_FILE = "/obdlog.csv";
+const char*  OBD_LOG_OLD  = "/obdlog.old";
+
+static void obdLogHeader(String& out) {
+  int cols[OBD_MAX_PIDS];
+  int n = obdLogColumns(cols, OBD_MAX_PIDS);
+  char cell[40];
+  out += "datetime";
+  for (int c = 0; c < n; c++) {
+    obdCsvHeaderCell(OBD_PIDS[cols[c]], cell, sizeof(cell));
+    out += ',';
+    out += cell;
+  }
+  out += ",atrv_V,battery_V,mil,dtc_count\n";
+}
+
+static void obdLogFormatRow(const ObdLogRow& row, String& out) {
+  char b[40];
+  time_t tt = (time_t)row.ts;
+  struct tm lt;
+  localtime_r(&tt, &lt);                         // reentrant: logLine uses localtime() on other tasks
+  strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &lt);
+  out += b;
+  int cols[OBD_MAX_PIDS];
+  int n = obdLogColumns(cols, OBD_MAX_PIDS);
+  for (int c = 0; c < n; c++) {
+    int i = cols[c];
+    const ObdPid& p = OBD_PIDS[i];
+    out += ',';
+    if (!(row.have & (1ULL << i))) continue;
+    if (p.fmt != OF_NUM) {
+      out += obdEnumText(p.fmt, (int)row.v[i]);  // host-tested to contain no commas
+    } else {
+      snprintf(b, sizeof(b), "%.*f", (int)p.dec, (double)row.v[i]);
+      out += b;
+    }
+  }
+  out += ',';
+  if (row.atrv > 0) { snprintf(b, sizeof(b), "%.1f", (double)row.atrv); out += b; }
+  out += ',';
+  snprintf(b, sizeof(b), "%.2f", (double)row.batt);
+  out += b;
+  out += ',';
+  if (row.mil >= 0) out += row.mil ? '1' : '0';
+  out += ',';
+  if (row.dtc >= 0) out += String((int)row.dtc);
+  out += '\n';
+}
+
+void obdLogRecount() {
+  uint32_t total = 0;
+  for (const char* p : { OBD_LOG_FILE, OBD_LOG_OLD }) {
+    if (!LittleFS.exists(p)) continue;
+    File f = LittleFS.open(p, FILE_READ);
+    if (f) { total += f.size(); f.close(); }
+  }
+  g_obdLogBytes = total;
+}
+
+// Drain queued rows to flash. LOOP CORE ONLY; the caller holds off while an OTA streams.
+void flushObdLogToFlash() {
+  for (;;) {
+    ObdLogRow row;
+    portENTER_CRITICAL(&g_obdLogMux);
+    bool has = g_obdLogTail != g_obdLogHead;
+    if (has) {
+      row = g_obdLogQ[g_obdLogTail];
+      g_obdLogTail = (g_obdLogTail + 1) % OBD_LOGQ_N;
+    }
+    portEXIT_CRITICAL(&g_obdLogMux);
+    if (!has) return;
+
+    String line;
+    line.reserve(360);
+    obdLogFormatRow(row, line);
+    bool fresh = !LittleFS.exists(OBD_LOG_FILE);
+    File f = LittleFS.open(OBD_LOG_FILE, FILE_APPEND);
+    if (!f) return;
+    size_t w = 0;
+    if (fresh) {
+      String h;
+      obdLogHeader(h);
+      w += f.print(h);
+    }
+    w += f.print(line);
+    size_t sz = f.size();
+    f.close();
+    g_fsBytes += w;
+    g_fsCommits++;
+    g_obdLogBytes += w;
+    g_obdLogRows++;
+    g_obdLogLastTs = row.ts;
+    if (sz >= OBD_LOG_CAP) {                     // keep exactly one prior generation
+      LittleFS.remove(OBD_LOG_OLD);
+      LittleFS.rename(OBD_LOG_FILE, OBD_LOG_OLD);
+      obdLogRecount();
+    }
+  }
+}
+
+// With logging on, an engine that starts wants the link. LOOP CORE (a bring-up may
+// happen here). A refusal -- radio busy, heap too fragmented -- is retried every
+// 30 s rather than every pass, and logged once per drive.
+void obdLogMaybeStart() {
+  static uint32_t lastTry = 0;
+  static bool     warned  = false;
+  if (!engRunning) { warned = false; return; }
+  if (!g_obdLogEn || !g_obdAddr[0] || g_obdAlive) return;
+  if (millis() - g_obdHoldFrom < g_obdHoldMs) return;
+  if (lastTry && millis() - lastTry < 30000UL) return;
+  lastTry = millis();
+  String why;
+  if (obdStartSession(why, "the log")) return;
+  if (!warned) {
+    logLine("OBD: log link refused: %s", why.c_str());
+    warned = true;
+  }
+}
+
+// The ECU's view of the engine, when the OBD link has one recent enough to trust.
+// Called by the SAFETY TASK (evalAutoStart): RAM and a spinlock, nothing else.
+bool obdEngineFresh(uint32_t nowMs, ObdEngine* out) {
+  portENTER_CRITICAL(&g_obdEngMux);
+  *out = g_obdEng;
+  portEXIT_CRITICAL(&g_obdEngMux);
+  uint32_t age = (out->updMs > nowMs) ? 0 : nowMs - out->updMs;
+  return out->state != OE_UNKNOWN && out->updMs != 0 && age <= OBD_ENG_FRESH_MS;
+}
+
+// GET /obdlog.csv -- the whole OBD log as one CSV, older generation first.
+void handleObdLogCsv() {
+  trackReq();
+  boundSendStall();
+  server.sendHeader("Content-Disposition", "attachment; filename=\"vroom-obd-log.csv\"");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  String firstHeader;
+  auto emit = [&](const char* path) {
+    if (!LittleFS.exists(path)) return;
+    File f = LittleFS.open(path, FILE_READ);
+    if (!f) return;
+    String header = f.readStringUntil('\n');
+    // One header for the whole download -- unless a generation was written by a
+    // firmware with different columns, in which case its own header is kept so no
+    // row is read against the wrong names.
+    if (header != firstHeader) {
+      String h = header + "\n";
+      if (!waitWritable(4000)) { f.close(); return; }
+      g_out_total += h.length();
+      server.sendContent(h);
+      if (!firstHeader.length()) firstHeader = header;
+    }
+    char buf[1024];
+    while (f.available()) {
+      int n = f.read((uint8_t*)buf, sizeof(buf));
+      if (n <= 0) break;
+      if (!waitWritable(4000)) break;            // stalled client -> abort rather than block
+      g_out_total += n;
+      server.sendContent(buf, (size_t)n);
+      esp_task_wdt_reset();
+    }
+    f.close();
+  };
+  emit(OBD_LOG_OLD);
+  emit(OBD_LOG_FILE);
+  if (!firstHeader.length()) {                   // nothing logged yet: still a valid CSV
+    String h;
+    obdLogHeader(h);
+    g_out_total += h.length();
+    server.sendContent(h);
+  }
+  server.sendContent("");
+}
+
+// POST /obdlog?en=0|1    logging off / on (NVS "obd_log", default on)
+// POST /obdlog?clear=1   delete the log, both generations
+void handleObdLogCfg() {
+  trackReq();
+  if (server.hasArg("en")) {
+    g_obdLogEn = server.arg("en") == "1";
+    prefs.putBool("obd_log", g_obdLogEn);
+    logLine("OBD: logging %s", g_obdLogEn ? "on" : "off");
+  }
+  if (server.arg("clear") == "1") {
+    LittleFS.remove(OBD_LOG_FILE);
+    LittleFS.remove(OBD_LOG_OLD);
+    portENTER_CRITICAL(&g_obdLogMux);
+    g_obdLogTail = g_obdLogHead;                 // and anything still queued
+    portEXIT_CRITICAL(&g_obdLogMux);
+    g_obdLogBytes = 0;
+    g_obdLogRows = 0;
+    g_obdLogLastTs = 0;
+    logLine("OBD: log cleared");
+  }
+  char j[96];
+  snprintf(j, sizeof(j), "{\"ok\":true,\"en\":%s,\"bytes\":%lu}",
+           g_obdLogEn ? "true" : "false", (unsigned long)g_obdLogBytes);
+  g_out_total += strlen(j);
+  server.send(200, "application/json", j);
 }
 
 void handleTransmit() {
@@ -6494,6 +6865,7 @@ function loadRuns(){
       h+='<tr><td>'+new Date(r.ts*1000).toLocaleString()
         +(r.flags&128?'<span class="bf" title="reconstructed from other evidence, not recorded live">reconstructed</span>':'')
         +(r.flags&64?'<span class="bf" title="the board rebooted while this run was open; the end time was recovered from the voltage history, so the duration is an estimate">recovered</span>':'')
+        +(r.flags&32?'<span class="bf" title="start or stop timed by the engine computer over OBD rather than from battery voltage">OBD</span>':'')
         +'</td><td><span class="pill '+k[1]+'">'+k[0]+'</span></td><td>'+(SRC[r.src]||"?")
         +'</td><td>'+(r.v>0?r.v.toFixed(2)+" V":"--")+'</td><td>'+det+'</td></tr>';
     }
@@ -6519,7 +6891,8 @@ $("iv").value=iv; setIv(iv); load();
 //   ts,kind,src,flags,v,dur
 //   kind 0=command 1=engine-on 2=engine-off 3=no-start
 //   src  0=auto 1=manual 2=external(key/FOB)
-//   flags bit0 = RF accepted, bit7 = reconstructed rather than recorded
+//   flags bit0 = RF accepted, bit5 = edge timed by the ECU over OBD,
+//         bit6 = end recovered at boot, bit7 = reconstructed rather than recorded
 void handleRuns() {
   trackReq();
   boundSendStall();
@@ -6889,6 +7262,7 @@ static void loadWifiCfg() {
     strlcpy(g_obdAddr, a.c_str(), sizeof(g_obdAddr));
     g_obdAddrType = prefs.getUChar("obd_type", BLE_ADDR_PUBLIC);
   }
+  g_obdLogEn = prefs.getBool("obd_log", true);      // OBD logging: on unless turned off
   g_sta_pass   = prefs.getString("sta_pass", WIFI_PASS);
   g_ap_ssid    = prefs.getString("ap_ssid",  AP_SSID);
   g_ap_pass    = prefs.getString("ap_pass",  AP_PASS);
@@ -7084,6 +7458,8 @@ void setup() {
   server.on("/obdjson", HTTP_GET, handleObdJson);      // the OBD pages' data; each poll keeps the link up
   server.on("/obdcfg", HTTP_POST, handleObdCfg);       // remember or forget the reader
   server.on("/obdstate", HTTP_GET, handleObdState);    // diagnostics; does not keep the link alive
+  server.on("/obdlog.csv", HTTP_GET, handleObdLogCsv);  // the OBD log as one CSV
+  server.on("/obdlog", HTTP_POST, handleObdLogCfg);      // logging on/off, clear
   server.on("/app.css", HTTP_GET, handleAppCss);       // shared cached stylesheet
   server.on("/app.js", HTTP_GET, handleAppJs);         // shared cached engine
   server.on("/json", handleJson);
@@ -7304,6 +7680,7 @@ void loop() {
     loopMark("logflush"); flushLogToFlash();        // persist any new event-log lines (idle-cheap)
     flushDrainToFlash();                            // and the hourly drain bucket, if one completed
     flushRunsToFlash();                             // and any engine start/stop events
+    flushObdLogToFlash();                           // and any OBD log rows
     flushDailyToFlash();                            // and the daily bucket, at midnight
     // Never while a scan or connect test is live -- it owns the stack until it finishes.
     if (g_btUp && g_btState != BTS_RUNNING && g_bcState != BCS_RUNNING && !g_obdAlive && g_btLastEnd &&
@@ -7311,6 +7688,7 @@ void loop() {
       btStackDown(); g_btLastEnd = millis();
       logLine("BT: radio auto-off after %lu min idle", (unsigned long)(BT_IDLE_OFF_MS / 60000));
     }
+    obdLogMaybeStart();                             // with logging on, a running engine wants the link
     if (!g_runRecDone && timeIsValid() && g_lastV > 5.0f) reconcileOpenRun();
   }
   loopMark("loop");

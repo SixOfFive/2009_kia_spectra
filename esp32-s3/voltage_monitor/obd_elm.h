@@ -76,3 +76,35 @@ bool obdParseText09(const char* reply, uint8_t pid, char* out, int cap);
 // Readiness monitors from PID 01's four data bytes.
 struct ObdMonitor { const char* name; bool available; bool complete; };
 int obdMonitors(const uint8_t d[4], ObdMonitor* out, int max, bool* mil, int* dtcCount, bool* diesel);
+
+// ---- the engine, as the ECU sees it ---------------------------------------------------
+// One observation per poll, with enough hysteresis that a single bad reading cannot
+// end a run. It has no clock of its own -- the caller passes millis() and the wall
+// clock -- which is what lets the logic that feeds the run log be tested on a PC.
+const float    OBD_ENG_RPM_MIN   = 300.0f;            // at or above: running under its own power
+const uint8_t  OBD_ENG_STOP_N    = 2;                 // consecutive not-running readings to call a stop
+const uint32_t OBD_ENG_MAX_RUN_S = 12UL * 3600UL;     // a longer PID 1F is not trusted to date a start
+
+enum ObdEngState : uint8_t { OE_UNKNOWN = 0, OE_RUNNING, OE_STOPPED };
+struct ObdEngine {
+  ObdEngState state;
+  uint8_t  notRunning;     // consecutive not-running readings so far
+  uint32_t changeMs;       // millis() the current state began: the edge
+  uint32_t updMs;          // millis() of the last reading that counted
+  uint32_t firstStopMs;    // millis() of the first not-running reading in the current streak
+  uint32_t onEpoch;        // wall-clock start of the current run; 0 = unknown
+};
+void obdEngReset(ObdEngine* e);
+// rpmOk: the ECU answered PID 0C with `rpm`. carSilent: a whole pass got no answer --
+// which only counts as a stop once the ECU had been reporting the engine running,
+// because a car that never answered says nothing about its engine. runtimeS: PID 1F,
+// seconds since the start, or -1. nowEpoch: wall clock, or 0 if not valid yet.
+void obdEngObserve(ObdEngine* e, bool rpmOk, float rpm, bool carSilent, long runtimeS,
+                   uint32_t nowMs, uint32_t nowEpoch);
+
+// ---- CSV for the OBD log ----------------------------------------------------------------
+// The logged columns: every PID except the Vehicle page's static facts. Writes
+// indices into OBD_PIDS and returns how many.
+int  obdLogColumns(int* cols, int max);
+// A header cell: the key plus an ASCII unit -- "coolant_C", "speed_kmh", "rpm".
+void obdCsvHeaderCell(const ObdPid& p, char* out, size_t cap);

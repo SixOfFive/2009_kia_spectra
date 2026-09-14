@@ -1,6 +1,7 @@
 // obd_elm.cpp -- see obd_elm.h. No Arduino headers, on purpose.
 #include "obd_elm.h"
 
+#include <cstdio>
 #include <cstring>
 
 // ---- tables -----------------------------------------------------------------------------
@@ -397,4 +398,67 @@ int obdMonitors(const uint8_t d[4], ObdMonitor* out, int max, bool* mil, int* dt
     out[n].complete = out[n].available && !((d[3] >> i) & 1);
   }
   return n;
+}
+
+// ---- the engine, as the ECU sees it -------------------------------------------------------
+
+void obdEngReset(ObdEngine* e) {
+  memset(e, 0, sizeof(*e));
+}
+
+void obdEngObserve(ObdEngine* e, bool rpmOk, float rpm, bool carSilent, long runtimeS,
+                   uint32_t nowMs, uint32_t nowEpoch) {
+  bool running = rpmOk && rpm >= OBD_ENG_RPM_MIN;
+  // Silence is only evidence of a stop when the engine had been seen running: the
+  // key going off after a drive. From a car that never answered it means nothing.
+  bool stopped = (rpmOk && rpm < OBD_ENG_RPM_MIN) || (carSilent && e->state == OE_RUNNING);
+  if (!running && !stopped) return;                  // nothing learned from this pass
+  e->updMs = nowMs;
+
+  if (running) {
+    e->notRunning = 0;
+    if (e->state != OE_RUNNING) {
+      e->state = OE_RUNNING;
+      // PID 1F dates the start by the ECU's own counter; without it, the edge is
+      // this reading. Never back-dated past the moment millis() began.
+      bool haveRt = runtimeS >= 0 && (uint32_t)runtimeS <= OBD_ENG_MAX_RUN_S;
+      uint32_t backMs = haveRt ? (uint32_t)runtimeS * 1000UL : 0;
+      if (backMs >= nowMs) backMs = nowMs ? nowMs - 1 : 0;
+      e->changeMs = nowMs - backMs;
+      e->onEpoch = nowEpoch ? nowEpoch - (haveRt ? (uint32_t)runtimeS : 0) : 0;
+    }
+    return;
+  }
+
+  if (e->notRunning == 0) e->firstStopMs = nowMs;
+  if (e->notRunning < 255) e->notRunning++;
+  if (e->state != OE_STOPPED && e->notRunning >= OBD_ENG_STOP_N) {
+    e->state = OE_STOPPED;
+    e->changeMs = e->firstStopMs;                    // stopped by the first reading that said so
+    e->onEpoch = 0;
+  }
+}
+
+// ---- CSV for the OBD log ----------------------------------------------------------------
+
+int obdLogColumns(int* cols, int max) {
+  const int vehicle = obdCatIndex("vehicle");
+  int n = 0;
+  for (int i = 0; i < OBD_PID_COUNT && n < max; i++)
+    if (OBD_PIDS[i].cat != vehicle) cols[n++] = i;
+  return n;
+}
+
+void obdCsvHeaderCell(const ObdPid& p, char* out, size_t cap) {
+  // Spreadsheets and scripts both cope better with plain ASCII column names, and a
+  // unit that only repeats the key ("rpm") adds nothing.
+  static const struct { const char* unit; const char* ascii; } MAP[] = {
+    { "\\u00b0C", "C" }, { "\\u00b0", "deg" }, { "\\u03bb", "" }, { "km/h", "kmh" },
+    { "g/s", "gps" },    { "%", "pct" },       { "rpm", "" },
+  };
+  const char* u = p.unit;
+  for (const auto& m : MAP)
+    if (!strcmp(p.unit, m.unit)) { u = m.ascii; break; }
+  if (*u) snprintf(out, cap, "%s_%s", p.key, u);
+  else    snprintf(out, cap, "%s", p.key);
 }

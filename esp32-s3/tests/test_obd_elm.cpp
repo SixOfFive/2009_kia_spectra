@@ -192,7 +192,131 @@ static void testTables() {
   CHECK(!std::strcmp(obdEnumText(OF_FUELTYPE, 1), "Gasoline"));
 }
 
+static void testEngineTracker() {
+  // Silence before the ECU ever answered says nothing about the engine.
+  ObdEngine e;
+  obdEngReset(&e);
+  obdEngObserve(&e, false, 0, true, -1, 1000, 1000000);
+  obdEngObserve(&e, false, 0, true, -1, 2000, 1000001);
+  CHECK(e.state == OE_UNKNOWN);
+
+  // First running reading, with PID 1F: the start is dated by the ECU's counter.
+  obdEngObserve(&e, true, 812, false, 12, 100000, 1000100);
+  CHECK(e.state == OE_RUNNING && e.changeMs == 88000 && e.onEpoch == 1000088);
+
+  // One zero reading is not a stop, and a running reading resets the streak.
+  obdEngObserve(&e, true, 0, false, -1, 101000, 1000101);
+  CHECK(e.state == OE_RUNNING && e.notRunning == 1);
+  obdEngObserve(&e, true, 790, false, -1, 102000, 1000102);
+  CHECK(e.state == OE_RUNNING && e.notRunning == 0);
+
+  // Two zero readings are a stop, dated at the first of them.
+  obdEngObserve(&e, true, 0, false, -1, 103000, 1000103);
+  obdEngObserve(&e, true, 0, false, -1, 104000, 1000104);
+  CHECK(e.state == OE_STOPPED && e.changeMs == 103000 && e.updMs == 104000 && e.onEpoch == 0);
+
+  // Staying stopped keeps the view fresh without moving the edge.
+  obdEngObserve(&e, true, 0, false, -1, 110000, 1000110);
+  CHECK(e.state == OE_STOPPED && e.changeMs == 103000 && e.updMs == 110000);
+
+  // A run time longer than millis() has existed is clamped, not wrapped.
+  ObdEngine f;
+  obdEngReset(&f);
+  obdEngObserve(&f, true, 900, false, 600, 5000, 2000000);
+  CHECK(f.state == OE_RUNNING && f.changeMs >= 1 && f.changeMs <= 5000 && f.onEpoch == 1999400);
+
+  // An absurd run time is not trusted to date the start.
+  ObdEngine big;
+  obdEngReset(&big);
+  obdEngObserve(&big, true, 900, false, 999999, 500000, 2000000);
+  CHECK(big.state == OE_RUNNING && big.changeMs == 500000 && big.onEpoch == 2000000);
+
+  // Key off after running: silence counts once the ECU had been answering.
+  ObdEngine g;
+  obdEngReset(&g);
+  obdEngObserve(&g, true, 750, false, -1, 10000, 3000000);
+  obdEngObserve(&g, false, 0, true, -1, 12000, 3000002);
+  CHECK(g.state == OE_RUNNING);
+  obdEngObserve(&g, false, 0, true, -1, 14000, 3000004);
+  CHECK(g.state == OE_STOPPED && g.changeMs == 12000);
+
+  // Once stopped, further silence is no reading at all -- the view goes stale.
+  uint32_t upd = g.updMs;
+  obdEngObserve(&g, false, 0, true, -1, 16000, 3000006);
+  CHECK(g.updMs == upd);
+
+  // A failed RPM read while the car answered other PIDs is no reading either.
+  obdEngObserve(&g, false, 0, false, -1, 20000, 3000010);
+  CHECK(g.updMs == upd);
+
+  // No wall clock yet: the run still starts, just without an epoch.
+  ObdEngine h;
+  obdEngReset(&h);
+  obdEngObserve(&h, true, 700, false, 5, 50000, 0);
+  CHECK(h.state == OE_RUNNING && h.onEpoch == 0 && h.changeMs == 45000);
+
+  // Ignition on, engine off: the ECU answers with RPM 0.
+  ObdEngine k;
+  obdEngReset(&k);
+  obdEngObserve(&k, true, 0, false, -1, 1000, 1);
+  obdEngObserve(&k, true, 0, false, -1, 2000, 2);
+  CHECK(k.state == OE_STOPPED);
+
+  // Idle RPM is running; cranking-speed noise below the floor is not.
+  ObdEngine idle;
+  obdEngReset(&idle);
+  obdEngObserve(&idle, true, 300, false, -1, 1000, 1);
+  CHECK(idle.state == OE_RUNNING);
+  ObdEngine low;
+  obdEngReset(&low);
+  obdEngObserve(&low, true, 120, false, -1, 1000, 1);
+  CHECK(low.state == OE_UNKNOWN && low.notRunning == 1);
+}
+
+static void testCsv() {
+  char cell[40];
+  auto cellFor = [&](const char* key) -> const char* {
+    cell[0] = 0;
+    for (int i = 0; i < OBD_PID_COUNT; i++)
+      if (!std::strcmp(OBD_PIDS[i].key, key)) obdCsvHeaderCell(OBD_PIDS[i], cell, sizeof(cell));
+    return cell;
+  };
+  CHECK(!std::strcmp(cellFor("rpm"), "rpm"));
+  CHECK(!std::strcmp(cellFor("coolant"), "coolant_C"));
+  CHECK(!std::strcmp(cellFor("speed"), "speed_kmh"));
+  CHECK(!std::strcmp(cellFor("timing"), "timing_deg"));
+  CHECK(!std::strcmp(cellFor("lambda"), "lambda"));
+  CHECK(!std::strcmp(cellFor("throttle"), "throttle_pct"));
+  CHECK(!std::strcmp(cellFor("maf"), "maf_gps"));
+  CHECK(!std::strcmp(cellFor("ecuv"), "ecuv_V"));
+  CHECK(!std::strcmp(cellFor("runtime"), "runtime_s"));
+  CHECK(!std::strcmp(cellFor("warmups"), "warmups"));
+  CHECK(!std::strcmp(cellFor("fuelsys"), "fuelsys"));
+
+  int cols[64];
+  int n = obdLogColumns(cols, 64);
+  const int vehicle = obdCatIndex("vehicle");
+  int expect = 0;
+  for (int i = 0; i < OBD_PID_COUNT; i++)
+    if (OBD_PIDS[i].cat != vehicle) expect++;
+  CHECK(n == expect && n > 0);
+  for (int c = 0; c < n; c++) CHECK(OBD_PIDS[cols[c]].cat != vehicle);
+
+  // Every header cell and every enum text that lands in a cell is CSV-safe.
+  for (int c = 0; c < n; c++) {
+    obdCsvHeaderCell(OBD_PIDS[cols[c]], cell, sizeof(cell));
+    bool safe = cell[0] != 0;
+    for (const char* p = cell; *p; p++)
+      if (*p <= 0x20 || *p >= 0x7F || *p == ',' || *p == '"') safe = false;
+    CHECK(safe);
+  }
+  for (int code = 0; code <= 16; code++)
+    CHECK(std::strchr(obdEnumText(OF_FUELSYS, code), ',') == nullptr);
+}
+
 int main() {
+  testEngineTracker();
+  testCsv();
   testPidReplies();
   testNoVehicle();
   testSupported();

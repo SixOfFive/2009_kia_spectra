@@ -14,6 +14,103 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-14 — fw 4.75: an OBD log, and the ECU times engine runs
+
+### Added — a CSV of the OBD values, every 30 s while the car answers
+
+- `/obdlog.csv` plus one prior generation `/obdlog.old`, about 512 KB each. The
+  first column is local date and time (the board's `MST7MDT`), then one column per
+  value with the unit in its name (`coolant_C`, `speed_kmh`, `rpm`), then
+  `atrv_V`, `battery_V`, `mil`, `dtc_count`. A value the car did not report is an
+  empty cell, so the columns never shift. The Vehicle page's static facts (VIN, OBD
+  standard, fuel type) are not repeated in every row.
+- **Nothing is written while the car is off.** A row is only queued when the car
+  answered within the last 30 s.
+- **On by default**, with an on/off toggle remembered in NVS (`obd_log`).
+  **Download** returns the whole log as one CSV, older generation first; a
+  generation written with different columns keeps its own header row, so no row is
+  read against the wrong names. **Clear** deletes both generations, behind a
+  confirm. The Overview gains an **OBD log** card with the state, size and newest
+  row. `GET /obdlog.csv`, `POST /obdlog?en=0|1`, `POST /obdlog?clear=1`.
+- Rows are built by the Bluetooth task in RAM and written by the loop core with
+  every other file write, never while an OTA upload streams.
+
+### Changed — with logging on, the board holds the link for the whole drive
+
+The loop core now starts the link itself once the voltage detector confirms the
+engine is running (5 s), and keeps it while the engine runs — not only while a page
+polls. That is about 88 KB of heap for the drive, accepted because the auto-start
+has nothing to do while the engine runs. A refused start (radio busy, heap too
+fragmented) is retried every 30 s and logged once per drive.
+
+### Changed — the engine computer times the run log's edges while its reading is fresh
+
+- RPM (PID `0C`) is now read on every pass, whatever page is open, and feeds an
+  engine tracker: running at 300 rpm or more; stopped after two consecutive
+  readings below that, or — only once it had been running — two passes with no
+  answer at all.
+- While that view is under 15 s old it decides the run log's ON and OFF edges
+  instead of voltage. **OFF is where it matters:** voltage has to stay below
+  13.10 V for 120 s to see past surface charge, where RPM reaching zero is
+  immediate. An ON edge the ECU sees first is dated by PID `1F`, its own run-time
+  counter.
+- Runs timed this way carry flag bit 5 (`RUN_F_OBD`) and an **OBD** badge in the run
+  log.
+- An OBD "stopped" is only accepted once voltage agrees the alternator has stopped
+  charging, so a link that loses the ECU mid-drive cannot end a run early.
+- **The auto-start decision is untouched — checked, not assumed.** `engRunning` is
+  read only by the boot-time run reconciliation and by the edge block itself; the
+  fire gate reads `g_parkS`, accumulated from voltage alone. A Start sent to a
+  running Compustar engine switches it off, so the fire path must trust nothing but
+  voltage.
+- The tracker lives in `obd_elm.cpp` and is tested on the PC: start dating from
+  PID `1F`, the clamp when the board has been up for less time than the engine has
+  run, an implausible run time ignored, the two-reading stop, silence before any
+  answer ignored, and the view going stale after a stop. **640 checks, 0 failures**
+  (545 before).
+
+### Fixed — the flash script retried uploads the board had accepted
+
+The firmware was fine; the script was not. After the board accepted 4.75 it did not
+come back on the LAN (see below), and the script called that a failed upload and
+tried four more times against a board that was off the network. It now stops when
+the image was accepted, and says so. Also caught on the way: a host test whose
+compile failure was hidden behind a pipe let a stale test binary report the old
+count. The build commands now fail on the compiler, not on the filter.
+
+### Found — the router's 2.4 GHz band dropped during the flash
+
+After rebooting into 4.75 at 16:58:00 the board could not rejoin home WiFi — the
+router answered `auth-expire`, six `assoc-expire`, then `auth-fail` — and at 16:58:45
+came up on its fallback AP, `ESP32-Volt` — identified by BSSID `46:1B:F6:81:F2:50`, the board's own
+MAC with the locally-administered bit set. A scan from the laptop at 17:05 showed
+none of the router's 2.4 GHz networks (`Password is Taco` `…:99` on channel 10, the
+one the board uses, and `Password is TacoForYou` `…:9A`), while its 5 GHz networks on
+channel 36 were up. The ESP32-S3 is 2.4 GHz only. It retries home WiFi every
+10 minutes (`AP_RETRY_STA_MS`); the band was back by 17:08, and the first retry, at
+17:07:58, rejoined. Not a firmware fault: the board booted, ran its
+safety task and raised its fallback AP exactly as designed.
+
+### Verified on the board, car off
+
+- A clean boot into 4.75 (`reset=software`), back on the LAN at 17:07:58 once the
+  router's 2.4 GHz band returned.
+- `/obdjson` carries the log status: on by default, and nothing written with the car
+  off (`bytes 0`, `rows 0`).
+- The CSV download is a valid file holding just its header row, 30 columns:
+  `datetime`, 25 values, `atrv_V`, `battery_V`, `mil`, `dtc_count`.
+- Logging off and back on reads back each time, clear works, and each is logged.
+- The run history still serves; the Logs page carries the **OBD** badge and the
+  Overview the log card.
+
+**Still waiting for a drive:** rows actually being written, and OBD-timed edges.
+Not tested: the log setting surviving a reboot, since each reboot costs the
+auto-start its 15-minute park-confirm.
+
+Sketch 1,599,215 → 1,607,351 B (9%); globals 68,816 → 69,648 B.
+
+---
+
 ## 2026-09-14 — fw 4.74: OBD-II pages for the Veepeak
 
 ### Added — an OBD tab: an overview and six category pages

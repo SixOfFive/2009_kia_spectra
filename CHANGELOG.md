@@ -14,6 +14,115 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-14 — fw 4.74: OBD-II pages for the Veepeak
+
+### Added — an OBD tab: an overview and six category pages
+
+The Veepeak BLE dongle proven in 4.73 now feeds pages of its own:
+
+- **Overview** — reader status, engine speed, road speed, coolant, ECU supply
+  voltage, the check-engine light with its stored-code count, and a card per
+  category.
+- **Engine**, **Fuel & air**, **Electrical** (ECU supply beside the dongle's
+  `ATRV` and the board's own battery reading), **Distance & time**, **Fault
+  codes** (stored, pending and permanent, plus readiness monitors) and
+  **Vehicle** (VIN, calibration ID, ECU name, OBD standard, fuel type, protocol).
+
+Table-driven so it can grow: a value is one row in `OBD_PIDS`, a page is one row
+in `OBD_CATS`, and the tabs and overview cards follow from the tables. Only PIDs
+the car reports as supported (`0100`, `0120` ...) are ever requested.
+
+**Read-only by construction.** The session sends a fixed initialisation, modes
+`01` and `09`, and the three fault-code reads (`03`, `07`, `0A`). No path clears
+codes.
+
+### Added — the reader is picked on the page and remembered
+
+**Scan for readers** lists nearby BLE devices, likely OBD readers first; **Use**
+stores the address in NVS (`obd_addr`, `obd_type`); **Change reader** forgets it
+and scans again. Swapping to the second dongle needs no firmware change. Undo with
+`POST /obdcfg?forget=1`.
+
+### Added — `obd_elm.cpp`: the parsing, with no Arduino headers, tested on a PC
+
+The car only answers with the ignition on, so the ELM327 reply parsing is kept
+free of Arduino headers and tested on the host against reply shapes from the
+ELM327 datasheet and SAE J1979 — **545 checks**: one or several ECUs, spaces on
+and off, an echoed command, `SEARCHING...` / `UNABLE TO CONNECT`, supported-PID
+maps, fault codes in CAN and legacy framing including multi-frame, the VIN in CAN
+multi-frame and legacy (out of order) framing, text items, protocol numbers,
+readiness monitors, and the tables themselves. `esp32-s3/tests/test_obd_elm.cpp`;
+the command is in its header.
+
+### Designed around — what a connection costs
+
+A held BLE link cost ~88 KB of heap in 4.73. So the board holds it **only while
+an OBD page is polling**, drops it 60 s after the last poll, and leaves the stack
+up for the usual 5 min so coming back pays no new bring-up. While the link is
+held the Debug page's scanner and connect test refuse with `409` and say why —
+verified.
+
+Measured with the car off: polls opened the link at 16:33:15 (`OBD: link opened
+for 192.168.15.102`), the reader was up 17 s later reporting the car silent,
+polling stopped at 16:33:55 and the link closed at 16:34:56, **61 s later**. Free
+heap held around 92 KB (largest block 43 KB) while connected and came back to
+96 KB after. One page poll timed out at 15 s during the connection attempt: WiFi
+and BLE share the radio, and a connect slows the link while it runs.
+
+### Found — a page left open elsewhere held the link for 25 minutes
+
+The link did not drop when the page under test closed. The firmware was right: an
+OBD page open on another device was still polling. In those 25 minutes the
+once-a-minute heap check caught free heap at **39,860 B** and **36,904 B**, and a
+dashboard `/starts` response failed mid-transfer with the largest free block at
+19 KB. A background tab would do the same, since browsers still run its timers
+about once a minute.
+
+- The page **stops polling while hidden**. Verified: a hidden page sent no
+  `/obdjson` and opened no link in 9 minutes.
+- The log names the device that opens each link: `OBD: link opened for <ip>`.
+- `GET /obdstate` shows the session — idle time, polls, last poller, a loop
+  heartbeat and its current step — **without** counting as a poll.
+
+### Fixed — OTA no longer gives up on a pause in the data
+
+`server.client().setTimeout(OTA_STALL_MS)` (30 s) when an upload starts, so a
+stall is ridden out instead of being reported as a client abort. Every upload
+through the fixed handler has been accepted: **three of three** complete
+`OTA accepted: 1599360 bytes`, against six mid-transfer aborts on 4.73.
+
+**It was flashed three times, not once.** The board replies and reboots ~0.8 s
+later, the reply loses that race, curl reports `connection reset`, and the flash
+script retried an upload that had worked. The script now judges success by the
+build stamp in `/json`. Each extra reboot re-armed park-confirm; harmless at
+12.85 V, but not free.
+
+### Fixed — a stray `POST /cpu?mhz=null` from every `.seg` button
+
+`app.js` bound the CPU-clock action to **every** `button.seg`, so each Debug page
+button since 4.68 — and each OBD page button — also sent `POST /cpu?mhz=null`. The
+board rejected it with `400`, so nothing changed, but it was wrong. Both selectors
+are narrowed to `button.seg[data-mhz]`, and the cache tag on the seven pages that
+load `app.js` moves `v=471` → `v=474` so browsers fetch the fix.
+
+### Changed — the connect test
+
+OBD requests wait 12 s instead of 6 s (a first request may have to search
+protocols), the backstop goes 150 s → 180 s, and its service discovery and raw
+ELM327 exchange are now shared with the OBD session (`btFindSerialPair`,
+`btElmRaw`).
+
+### Not yet verified — anything that needs the ignition on
+
+Verified with the car off: scan and **Use**, connect, ELM327 initialisation
+(`ELM327 v1.5`), `ATRV` 11.8 V, "the car is not answering" with the 15 s re-probe,
+every sub-page rendering, and the Debug refusals. PID decoding against this car,
+fault codes and the VIN wait for a drive — deliberately, at the owner's call.
+
+Sketch 1,561,783 → 1,599,215 B (9% of 16 MB); globals 66,088 → 68,816 B.
+
+---
+
 ## 2026-09-14 — fw 4.73: a BLE connect test, and the Veepeak passes it
 
 ### Added — can the board *talk* to a dongle, not just see it?

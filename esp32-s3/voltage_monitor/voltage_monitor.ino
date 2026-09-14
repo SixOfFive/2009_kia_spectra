@@ -34,6 +34,7 @@
 #include <BLEClient.h>      // /btconnect -- can the board talk to a dongle, not just see it
 #include <BLERemoteService.h>
 #include <BLERemoteCharacteristic.h>
+#include "obd_elm.h"      // OBD pages: ELM327 reply parsing and J1979 decoding, host-tested
 #include "esp_attr.h"       // RTC_NOINIT_ATTR -- WDT breadcrumbs that survive a reset
 #include <stdarg.h>         // logLine() variadic formatting
 #include <Adafruit_GFX.h>
@@ -111,7 +112,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.73";
+const char* FW_VERSION = "4.74";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -299,6 +300,12 @@ const uint32_t AS_BOOT_GRACE_MS = 120000;   // no auto-start in the first 2 min 
 const float    AS_V_MIN_CFG     = 10.0f;    // accepted config range for the threshold
 const float    AS_V_MAX_CFG     = 13.0f;
 const int      START_N          = 64;       // start-event ring buffer length
+// The WebServer abandons an upload when no byte arrives within the connection's
+// read timeout -- 5 s, set when it accepts the client -- and reports that as
+// UPLOAD_FILE_ABORTED, which the handler logs as "aborted by client" although the
+// client never gave up. Six uploads of fw 4.73 died that way at random offsets
+// over a -60 dBm link, with and without WiFi power-save. A stall is not a failure.
+const uint32_t OTA_STALL_MS     = 30000;
 
 // ----- SNMP (read-only, for Cacti / LibreNMS / snmpwalk) -----
 // Enterprise subtree 1.3.6.1.4.1.99999.**8** -- the Pi-side responder uses .7,
@@ -3129,7 +3136,7 @@ function poll(){fetch("/json",{cache:"no-store"}).then(function(r){return r.json
   T("rfstat",RF[d.rf]||d.rf||"?");C("rfstat",(d.rf=="armed")?"#3fb950":(d.rf=="blocked"?"#d29922":"#8b949e"));
   T("cpu",d.cpu_mhz);
   if(d.cpu0!==undefined){T("cpu0",d.cpu0.toFixed(1));T("cpu1",d.cpu1.toFixed(1));T("cpuavg",Math.round((d.cpu0+d.cpu1)/2));}
-  document.querySelectorAll("button.seg").forEach(function(b){b.classList.toggle("on",+b.getAttribute("data-mhz")===d.cpu_mhz)});
+  document.querySelectorAll("button.seg[data-mhz]").forEach(function(b){b.classList.toggle("on",+b.getAttribute("data-mhz")===d.cpu_mhz)});
   var ps=!!d.wifi_ps;H("psbadge",'<span class="badge '+(ps?"on":"off")+'">'+(ps?"ON":"OFF")+'</span>');
   var pb=$("psbtn");if(pb){pb.textContent=ps?"Turn OFF":"Turn ON";pb.setAttribute("data-next",ps?"0":"1");}
   // long-term drain (Voltage tab)
@@ -3378,7 +3385,9 @@ function attachHandlers(){
     fetch("/transmit?button="+b,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
       T("rfmsg",d.ok?(b+" sent x"+d.repeats):(b+" failed: "+(d.detail||"error")));
     }).catch(function(e){T("rfmsg",b+" request error")})})});
-  document.querySelectorAll("button.seg").forEach(function(b){b.addEventListener("click",function(){
+  // Only the CPU clock buttons. Other pages use .seg for their own buttons, and
+  // binding every .seg here sent a stray POST /cpu?mhz=null from each of them.
+  document.querySelectorAll("button.seg[data-mhz]").forEach(function(b){b.addEventListener("click",function(){
     var m=b.getAttribute("data-mhz");T("pwrmsg","setting CPU to "+m+" MHz...");
     fetch("/cpu?mhz="+m,{method:"POST"}).then(function(r){return r.json()}).then(function(d){
       T("pwrmsg",d.ok?("CPU now "+d.cpu_mhz+" MHz"):("CPU change failed: "+(d.detail||"error")));poll();
@@ -3502,6 +3511,7 @@ const char MAIN_HTML[] PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/obd" data-p="/obd">OBD</a>
 <a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
@@ -3609,7 +3619,7 @@ which removes the only guard against cranking a car that will never start.
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; samples <span id="ns">0</span>/1440 &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=471"></script>
+<script src="/app.js?v=474"></script>
 </body></html>
 )HTML";
 const char WIFI_HTML[] PROGMEM = R"HTML(
@@ -3626,6 +3636,7 @@ const char WIFI_HTML[] PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/obd" data-p="/obd">OBD</a>
 <a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
@@ -3705,7 +3716,7 @@ here is stored in NVS and survives reboots.
 {id:"g_link",col:"link",dec:0,unit:"Mbps",color:"#39c5cf",anchor0:true,floor:20},
 {id:"g_nin",col:"net_in",dec:0,unit:"B/min",color:"#ffa657"},
 {id:"g_nout",col:"net_out",dec:0,unit:"B/min",color:"#7ee787"}]};</script>
-<script src="/app.js?v=471"></script>
+<script src="/app.js?v=474"></script>
 </body></html>
 )HTML";
 const char VOLT_HTML[] PROGMEM = R"HTML(
@@ -3722,6 +3733,7 @@ const char VOLT_HTML[] PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/obd" data-p="/obd">OBD</a>
 <a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
@@ -3777,7 +3789,7 @@ and keeps extending for as long as the car sits. It needs 6&nbsp;h of baseline b
 {id:"g_v",col:"vbatt",dec:2,unit:"V",color:"#3fb950"},
 {id:"g_t",col:"temp",dec:1,unit:"degC",color:"#d29922"},
 {id:"g_d",col:"drain",dec:0,unit:"mV/h",color:"#ff7b72",keep0:true}]};</script>
-<script src="/app.js?v=471"></script>
+<script src="/app.js?v=474"></script>
 </body></html>
 )HTML";
 const char DEBUG_HTML[] PROGMEM = R"HTML(
@@ -3794,6 +3806,7 @@ const char DEBUG_HTML[] PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/obd" data-p="/obd">OBD</a>
 <a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
@@ -3873,7 +3886,7 @@ answer from a working dongle. A device that is not there takes about 30&nbsp;s t
 </div>
 </div>
 <footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; <span id="clk">--</span></footer>
-<script src="/app.js?v=471"></script>
+<script src="/app.js?v=474"></script>
 <script>
 function esc(t){return String(t).replace(/[&<>]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
 var btTimer=null;
@@ -4023,6 +4036,236 @@ fetch("/json",{cache:"no-store"}).then(function(r){return r.json()}).then(functi
 </body></html>
 )HTML";
 
+const char OBD_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vroom &middot; OBD-II</title><link rel="stylesheet" href="/app.css?v=471">
+<style>
+.obdsub{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 16px}
+.obdsub a{background:#161b22;border:1px solid #30363d;color:#8b949e;border-radius:6px;padding:5px 12px;font-size:13px;text-decoration:none}
+.obdsub a:hover{border-color:#58a6ff;color:#c9d1d9}
+.obdsub a.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+a.card{display:block;text-decoration:none;color:inherit}
+.dim{color:#6e7681!important}
+.dtc{font-family:ui-monospace,Consolas,monospace;font-size:17px;font-weight:700;margin-right:12px}
+.note{color:var(--mut);font-size:13px;line-height:1.6;margin-top:14px}
+</style></head><body>
+<div id="tip"></div>
+<header><h1>&#9889; ESP32-S3 &middot; OBD-II</h1>
+<span id="status"><span id="dot"></span><span id="stxt">connecting&hellip;</span></span></header>
+<nav class="tabs">
+<a href="/" data-p="/">Main</a>
+<a href="/wifi" data-p="/wifi">WiFi / Net</a>
+<a href="/voltage" data-p="/voltage">Voltage</a>
+<a href="/cpu" data-p="/cpu">CPU</a>
+<a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
+<a href="/logs" data-p="/logs">Log</a>
+<a href="/obd" data-p="/obd">OBD</a>
+<a href="/debug" data-p="/debug">Debug</a>
+<a href="/update" data-p="/update">Update</a>
+</nav>
+<div class="wrap">
+<div class="obdsub" id="obdsub"></div>
+<div class="card">
+<div class="pwrrow">
+<div style="flex:1;min-width:220px"><div class="k">OBD-II reader</div>
+<div class="v" style="font-size:16px" id="lstat">loading&hellip;</div>
+<div class="note" id="ldet" style="margin-top:6px"></div></div>
+<button class="seg" id="chg" style="display:none">Change reader</button>
+</div></div>
+<div id="setup" style="display:none">
+<div class="clbl">Set up a reader</div>
+<div class="card">
+<div class="pwrrow"><div class="note" style="margin:0;flex:1;min-width:220px">Plug a <b>BLE</b> ELM327 dongle into
+the OBD port and close any phone app that is connected to it, then scan. Likely readers are listed first, and
+the one you pick is remembered across reboots. A reader that has gone to sleep can miss a scan: turn the key to ON to wake it and scan again.</div>
+<button class="seg" id="scan">Scan for readers</button></div>
+<div style="overflow-x:auto;margin-top:10px"><table class="st" id="slist"><tbody><tr><td class="k">&mdash;</td></tr></tbody></table></div>
+</div></div>
+<div id="body" style="margin-top:18px"></div>
+</div>
+<footer><span id="net">&hellip;</span> &middot; fw <span id="fw">?</span> &middot; <span id="clk">--</span></footer>
+<script src="/app.js?v=474"></script>
+<script>
+function esc(t){return String(t==null?"":t).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]})}
+var CAT=location.pathname.split("/")[2]||"", REFRESH=false, BUILT=false, TICKS=0, SCANNING=false;
+document.querySelectorAll("nav.tabs a[data-p='/obd']").forEach(function(a){a.classList.add("on")});
+// This page runs the only poller. The WebServer takes one connection at a time,
+// and two pollers on a weak link is enough to start resetting connections.
+if(window.POLLIV){clearInterval(window.POLLIV);window.POLLIV=null;}
+var LINK={none:["No reader set up","#8b949e"],off:["Not connected","#8b949e"],
+  connecting:["Connecting to the reader\u2026","#d29922"],starting:["Reader connected \u2014 starting it up","#d29922"],
+  "no-car":["Reader connected \u2014 the car is not answering","#d29922"],live:["Live","#3fb950"],
+  failed:["Reader problem","#f85149"]};
+function num(x){return x.v===undefined?"?":x.v.toFixed(x.d)}
+function valHtml(x){
+  if(x.s===3)return "<span class=\"dim\">not supported by this car</span>";
+  if(x.s===2)return "<span class=\"dim\">no data</span>";
+  if(x.s!==1)return "<span class=\"dim\">\u2026</span>";
+  if(x.x!==undefined)return esc(x.x);
+  return num(x)+(x.u?" <span style=\"font-size:13px;color:#8b949e\">"+esc(x.u)+"</span>":"");
+}
+function cards(vals){
+  if(!vals.length)return "";
+  var h="<div class=\"grid\" style=\"margin-top:0\">";
+  vals.forEach(function(x){
+    h+="<div class=\"card\" title=\""+esc(x.t)+"\"><div class=\"k\">"+esc(x.n)+"</div><div class=\"v\">"+valHtml(x)+"</div>"
+      +(x.s===1&&x.age>4000?"<div class=\"sv\">"+Math.round(x.age/1000)+" s ago</div>":"")+"</div>";});
+  return h+"</div>";
+}
+function needCar(d,what){
+  return d.link==="live"?"":"<div class=\"note\" style=\"margin:0 0 14px\">"+what
+    +" need the car to answer: turn the key to ON &mdash; the engine does not have to run.</div>";
+}
+function milLine(d){
+  return d.mil===undefined?"":"check-engine light <span class=\"badge "+(d.mil?"arm":"off")+"\" style=\"font-size:12px\">"
+    +(d.mil?"ON":"off")+"</span> &middot; "+d.dtc+" stored code"+(d.dtc===1?"":"s");
+}
+function overview(d){
+  var h=needCar(d,"Live values")+"<div class=\"hero\">";
+  d.vals.forEach(function(x){
+    h+="<div class=\"metric\" title=\""+esc(x.t)+"\"><div class=\"lbl\">"+esc(x.n)+"</div><span class=\"big\" style=\"font-size:34px\">"
+      +(x.s===1?(x.x!==undefined?esc(x.x):num(x)):"--")+"</span>"+(x.s===1&&x.u?"<span class=\"u\"> "+esc(x.u)+"</span>":"")+"</div>";});
+  h+="</div>";
+  if(d.mil!==undefined)h+="<div class=\"sub\">"+milLine(d)+"</div>";
+  h+="<div class=\"clbl\">Categories</div><div class=\"grid\" style=\"margin-top:0\">";
+  d.cats.forEach(function(c){
+    h+="<a class=\"card\" href=\"/obd/"+esc(c.k)+"\"><div class=\"k\">"+esc(c.n)+"</div><div class=\"v\" style=\"font-size:14px;font-weight:400\">"
+      +esc(c.b)+"</div>"+(c.tot?"<div class=\"sv\">"+(c.sup===null?c.tot+(c.tot===1?" value":" values"):c.sup+" of "+c.tot+" supported")+"</div>":"")+"</a>";});
+  return h+"</div>";
+}
+function electrical(d){
+  return needCar(d,"ECU values")+cards(d.vals.concat([
+    {n:"Dongle supply (ATRV)",t:"The dongle measuring its own supply on OBD pin 16. Cheap ELM327s read low; the car's Veepeak read about 1 V under the board",
+     u:"V",d:1,s:d.atrv===null?0:1,v:d.atrv,age:0},
+    {n:"Battery (board divider)",t:"The board's own calibrated measurement - the reference",u:"V",d:2,s:1,v:d.board_v,age:0}]));
+}
+function codes(d){
+  var c=d.codes||{};
+  var h="<div class=\"pwrrow\" style=\"margin-bottom:12px\"><div class=\"sub\" style=\"margin:0;text-align:left\">"
+    +(d.mil===undefined?"":milLine(d)+" &middot; ")+(c.known?"read "+Math.round(c.age/1000)+" s ago":"not read yet")+"</div>"
+    +"<button class=\"seg\" id=\"refresh\""+(d.link==="live"?"":" disabled")+">Read again</button></div>";
+  h+=needCar(d,"Fault codes");
+  function list(title,arr,tip){
+    var body=!c.known?"<span class=\"dim\">\u2026</span>":arr===null?"<span class=\"dim\">not reported by this car</span>"
+      :!arr.length?"<span style=\"color:#3fb950\">none</span>"
+      :arr.map(function(x){return "<span class=\"dtc\">"+esc(x)+"</span>"}).join("");
+    return "<div class=\"card\" title=\""+esc(tip)+"\"><div class=\"k\">"+title+"</div><div class=\"v\" style=\"font-size:15px\">"+body+"</div></div>";
+  }
+  h+="<div class=\"grid\" style=\"margin-top:0\">"
+    +list("Stored",c.stored,"Confirmed faults - the ones that light the check-engine light")
+    +list("Pending",c.pending,"Seen once but not yet confirmed; they become stored if they happen again")
+    +list("Permanent",c.perm,"Survive a scan-tool clear, and only go once the car has proven the fault fixed")+"</div>";
+  if(c.mon){
+    h+="<div class=\"clbl\">Readiness monitors"+(c.diesel?" (diesel)":"")+"</div><div class=\"card\"><table class=\"st\"><tbody>";
+    c.mon.forEach(function(m){ if(m.n==="Reserved")return;
+      h+="<tr><td>"+esc(m.n)+"</td><td>"+(!m.a?"<span class=\"dim\">not on this car</span>"
+        :(m.c?"<span style=\"color:#3fb950\">complete</span>":"<span style=\"color:#d29922\">not complete</span>"))+"</td></tr>";});
+    h+="</tbody></table><div class=\"note\">Monitors go back to &ldquo;not complete&rdquo; when codes are cleared or the battery is "
+      +"disconnected, and complete again over ordinary driving. An emissions test usually wants them complete.</div></div>";
+  }
+  return h+"<div class=\"note\">This page only reads. Clearing codes is deliberately not offered: it resets the readiness "
+    +"monitors too, and a code cleared without a repair comes straight back.</div>";
+}
+function vehicle(d){
+  var i=d.info||{};
+  function v(x){return x?esc(x):"<span class=\"dim\">"+(i.known?"not reported":"\u2026")+"</span>"}
+  var h=needCar(d,"Vehicle details")+"<div class=\"grid\" style=\"margin-top:0\">";
+  [["VIN",v(i.vin)],["Calibration ID",v(i.calid)],["ECU name",v(i.ecu)],
+   ["Protocol",d.proto_name?esc(d.proto_name):"<span class=\"dim\">\u2026</span>"],
+   ["Reader",esc(d.elm||"")+(d.reader?" <span class=\"dim\">"+esc(d.reader)+"</span>":"")]].forEach(function(r){
+    h+="<div class=\"card\"><div class=\"k\">"+r[0]+"</div><div class=\"v\" style=\"font-size:15px\">"+r[1]+"</div></div>";});
+  return h+"</div>"+cards(d.vals);
+}
+function render(d){
+  if(!BUILT&&d.cats){ BUILT=true;
+    var s="<a href=\"/obd\""+(CAT===""?" class=\"on\"":"")+">Overview</a>";
+    d.cats.forEach(function(c){s+="<a href=\"/obd/"+esc(c.k)+"\""+(CAT===c.k?" class=\"on\"":"")+">"+esc(c.n)+"</a>"});
+    $("obdsub").innerHTML=s; }
+  var L=LINK[d.link]||[d.link,"#8b949e"];
+  $("lstat").textContent=L[0]+(d.link==="live"&&d.proto_name?" \u00b7 "+d.proto_name:"");
+  $("lstat").style.color=L[1];
+  var det=[];
+  if(d.why&&d.link!=="live")det.push(esc(d.why));
+  if(d.elm)det.push(esc(d.elm));
+  if(d.atrv!==null)det.push("dongle supply "+d.atrv.toFixed(1)+" V");
+  if(d.rssi&&(d.link==="live"||d.link==="no-car"||d.link==="starting"))det.push("signal "+d.rssi+" dBm");
+  if(d.reader)det.push("reader <code>"+esc(d.reader)+"</code>");
+  if(d.link==="no-car")det.push("turn the key to ON and it picks up within about 15 s");
+  $("ldet").innerHTML=det.join(" &middot; ");
+  $("chg").style.display=d.reader?"":"none";
+  $("setup").style.display=(!d.reader||SCANNING)?"":"none";
+  var h="";
+  if(d.reader){
+    if(CAT==="")h=overview(d);
+    else if(CAT==="codes")h=codes(d);
+    else if(CAT==="vehicle")h=vehicle(d);
+    else if(CAT==="electrical")h=electrical(d);
+    else h=needCar(d,"These values")+cards(d.vals);
+  }
+  $("body").innerHTML=h;
+  var rb=$("refresh"); if(rb)rb.onclick=function(){REFRESH=true;rb.disabled=true;rb.textContent="reading\u2026"};
+}
+// A hidden tab stops polling, so the board drops the link a minute later instead of
+// holding ~88 KB for a page nobody is looking at. Browsers still run a background
+// tab's timers about once a minute, which would otherwise keep the link up forever.
+function tick(){
+  if(SCANNING||document.hidden){setTimeout(tick,2000);return;}
+  var q="/obdjson"+(CAT?"?cat="+encodeURIComponent(CAT):"");
+  if(REFRESH){q+=(CAT?"&":"?")+"refresh=1";REFRESH=false;}
+  fetch(q,{cache:"no-store"}).then(function(r){return r.json()}).then(render)
+    .catch(function(){$("lstat").textContent="board unreachable \u2014 retrying";$("lstat").style.color="#f85149";})
+    .then(function(){ if(++TICKS%15===0){poll();setTimeout(tick,3000);} else setTimeout(tick,2000); });
+}
+// ---- picking a reader ----
+function likely(x){return /fff0|ffe0|18f0|e7810a71/i.test(x.uuids||"")||/obd|elm|veepeak|vlink|vgate|konnwei/i.test(x.name||"")}
+function slist(t){$("slist").innerHTML="<tbody><tr><td class=\"k\">"+esc(t)+"</td></tr></tbody>"}
+function scan(){
+  SCANNING=true; $("scan").disabled=true; slist("scanning \u2014 about 15 s");
+  var tries=0;
+  (function start(){
+    fetch("/btscan?s=12&keep=1",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+      if(d.ok){waitScan();return;}
+      // A reader being released, or the radio settling, clears on its own.
+      if(++tries<15&&/OBD|settling|running/.test((d.detail||"")+(d.state||""))){slist("waiting for the radio\u2026");setTimeout(start,3000);return;}
+      SCANNING=false;$("scan").disabled=false;slist(d.detail||"scan refused");
+    }).catch(function(){ if(++tries<15)setTimeout(start,3000); else {SCANNING=false;$("scan").disabled=false;slist("board unreachable");} });
+  })();
+}
+function waitScan(){
+  setTimeout(function(){
+    fetch("/btscan",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
+      if(d.state==="running"){waitScan();return;}
+      SCANNING=false;$("scan").disabled=false;
+      if(d.state!=="done"){slist(d.detail||"scan failed");return;}
+      var dv=(d.dev||[]).slice().sort(function(a,b){return (likely(b)-likely(a))||(b.rssi-a.rssi)});
+      if(!dv.length){slist("nothing found \u2014 a Bluetooth Classic dongle cannot appear here");return;}
+      var h="<thead><tr><th>Name</th><th>Address</th><th>Signal</th><th></th></tr></thead><tbody>";
+      dv.forEach(function(x){
+        h+="<tr><td>"+(x.name?esc(x.name):"<span class=\"dim\">(no name)</span>")+(likely(x)?" <span class=\"pill auto\">likely OBD</span>":"")
+          +"</td><td><code>"+esc(x.mac)+"</code></td><td>"+x.rssi+" dBm</td><td><button class=\"seg\" data-mac=\""+esc(x.mac)
+          +"\" data-t=\""+esc(x.type)+"\">Use</button></td></tr>";});
+      $("slist").innerHTML=h+"</tbody>";
+    }).catch(function(){waitScan();});
+  },2000);
+}
+$("slist").onclick=function(e){
+  var b=e.target.closest("button[data-mac]"); if(!b)return;
+  b.disabled=true; b.textContent="saving\u2026";
+  fetch("/obdcfg?addr="+encodeURIComponent(b.getAttribute("data-mac"))+"&t="+encodeURIComponent(b.getAttribute("data-t")),{method:"POST"})
+    .then(function(r){return r.json()}).then(function(d){ if(d.ok){location.href="/obd";} else b.textContent="failed"; })
+    .catch(function(){b.textContent="failed";});
+};
+$("scan").onclick=scan;
+$("chg").onclick=function(){
+  if(!confirm("Forget this reader and scan for another?"))return;
+  fetch("/obdcfg?forget=1",{method:"POST"}).then(function(){ $("setup").style.display=""; scan(); });
+};
+tick();
+</script>
+</body></html>
+)HTML";
+
 const char CPU_HTML[]  PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -4037,6 +4280,7 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/obd" data-p="/obd">OBD</a>
 <a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
@@ -4059,7 +4303,7 @@ const char CPU_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["cpu0","cpu1"],charts:[
 {id:"g_c0",col:"cpu0",dec:0,unit:"%",color:"#7ee787",anchor0:true},
 {id:"g_c1",col:"cpu1",dec:0,unit:"%",color:"#e3b341",anchor0:true}]};</script>
-<script src="/app.js?v=471"></script>
+<script src="/app.js?v=474"></script>
 </body></html>
 )HTML";
 const char MEM_HTML[]  PROGMEM = R"HTML(
@@ -4076,6 +4320,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/obd" data-p="/obd">OBD</a>
 <a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
@@ -4092,7 +4337,7 @@ const char MEM_HTML[]  PROGMEM = R"HTML(
 <script>window.PAGE={cols:["heap_kb","disk_kb"],charts:[
 {id:"g_heap",col:"heap_kb",dec:0,unit:"KB",color:"#58a6ff"},
 {id:"g_disk",col:"disk_kb",dec:0,unit:"KB",color:"#bc8cff"}]};</script>
-<script src="/app.js?v=471"></script>
+<script src="/app.js?v=474"></script>
 </body></html>
 )HTML";
 
@@ -4113,6 +4358,7 @@ void handleDash()        { trackReq(); sendPage(MAIN_HTML); }   // "/" = Main ta
 void handleWifiPage()    { trackReq(); sendPage(WIFI_HTML); }
 void handleVoltagePage() { trackReq(); sendPage(VOLT_HTML); }
 void handleDebugPage()   { trackReq(); sendPage(DEBUG_HTML); }
+void handleObdPage()     { trackReq(); sendPage(OBD_HTML); }     // OBD tab and every /obd/<category>
 void handleCpuPage()     { trackReq(); sendPage(CPU_HTML); }
 void handleMemPage()     { trackReq(); sendPage(MEM_HTML); }
 
@@ -4460,6 +4706,7 @@ volatile int    g_bcState   = BCS_IDLE;
 static uint32_t g_bcStart   = 0;           // millis, for the stuck-task backstop
 static String   g_bcJson;                  // built by the task; read only once state != RUNNING
 static char     g_bcErr[72] = "";
+static volatile bool g_obdAlive = false;   // an OBD page session holds the radio (see obdTask)
 
 // The one connect-test client, reused for as long as the stack stays up.
 // BLEDevice keeps its own pointer to the last client it created and DELETES it
@@ -4595,6 +4842,9 @@ void handleBtScan() {
     if (g_bcState == BCS_RUNNING) {
       say(409, "{\"ok\":false,\"detail\":\"a connect test is using the radio\"}"); return;
     }
+    if (g_obdAlive) {
+      say(409, "{\"ok\":false,\"detail\":\"the OBD pages are using the radio; it frees itself a minute after they close\"}"); return;
+    }
     int secs = server.arg("s").toInt();
     if (secs < 2) secs = 2;
     if (secs > BT_SCAN_MAX_S) secs = BT_SCAN_MAX_S;
@@ -4627,6 +4877,7 @@ void handleBtScan() {
   if (server.hasArg("off")) {                        // ---- put the radio down ----
     if (g_btState == BTS_RUNNING) { say(409, "{\"ok\":false,\"detail\":\"a scan is running\"}"); return; }
     if (g_bcState == BCS_RUNNING) { say(409, "{\"ok\":false,\"detail\":\"a connect test is running\"}"); return; }
+    if (g_obdAlive) { say(409, "{\"ok\":false,\"detail\":\"the OBD pages are using the radio\"}"); return; }
     if (g_btUp) { btStackDown(); g_btLastEnd = millis();
                   logLine("BT: radio switched off from the debug page"); }
     say(200, String("{\"ok\":true,\"bt_up_now\":false,\"heap_block\":") + ESP.getMaxAllocHeap() + "}");
@@ -4722,41 +4973,123 @@ static bool btStdService(const String& u) {      // GAP, GATT, device informatio
          u.startsWith("0000180a-") || u.startsWith("0000180f-");
 }
 
-// Send one command and collect its reply up to the ELM327 '>' prompt. A reply
+// Send one command and collect its raw reply up to the ELM327 '>' prompt. A reply
 // arrives split across notifications (20 bytes each at the default MTU), so this
-// waits for the prompt, not the first packet. The reply is bytes from a device we
-// do not control: printable ASCII only, CR/LF runs shown as " | ", prompt dropped,
-// JSON-escaped, capped.
-static String btElmExchange(BLEClient* cl, BLERemoteCharacteristic* tx, bool withResp,
-                            const String& cmd, uint32_t timeoutMs, uint32_t& tookMs, bool& prompt) {
+// waits for the prompt, not the first packet. `out` is NUL-terminated with the
+// prompt removed and stray NUL bytes dropped. Returns false only if the write
+// failed; `prompt` says whether the reply finished.
+static bool btElmRaw(BLEClient* cl, BLERemoteCharacteristic* tx, bool withResp, const char* cmd,
+                     uint32_t timeoutMs, uint32_t& tookMs, bool& prompt, char* out, size_t cap) {
   portENTER_CRITICAL(&g_bcMux); g_bcRxLen = 0; portEXIT_CRITICAL(&g_bcMux);
-  String line = cmd + "\r";
+  char line[24];
+  int ll = snprintf(line, sizeof(line), "%s\r", cmd);
   uint32_t t0 = millis();
   prompt = false;
-  if (!tx->writeValue((uint8_t*)line.c_str(), line.length(), withResp)) {
+  out[0] = 0;
+  if (ll <= 0 || ll >= (int)sizeof(line) || !tx->writeValue((uint8_t*)line, (size_t)ll, withResp)) {
     tookMs = millis() - t0;
-    return "(write failed)";
+    return false;
   }
-  char buf[sizeof(g_bcRx)];
-  size_t n = 0;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(25));
-    portENTER_CRITICAL(&g_bcMux); n = g_bcRxLen; memcpy(buf, g_bcRx, n); portEXIT_CRITICAL(&g_bcMux);
-    if (n && memchr(buf, '>', n)) { prompt = true; break; }
+    size_t k = 0;
+    portENTER_CRITICAL(&g_bcMux);
+    for (size_t i = 0; i < g_bcRxLen && k + 1 < cap; i++)
+      if (g_bcRx[i]) out[k++] = g_bcRx[i];
+    portEXIT_CRITICAL(&g_bcMux);
+    out[k] = 0;
+    char* gt = strchr(out, '>');
+    if (gt) { *gt = 0; prompt = true; break; }
     if (millis() - t0 >= timeoutMs || !cl->isConnected()) break;
   }
   tookMs = millis() - t0;
-  String o; o.reserve(n + 16);
+  return true;
+}
+
+// After a reply timed out, wait -- without sending anything -- for its prompt.
+static void btElmWaitPrompt(BLEClient* cl, uint32_t ms) {
+  for (uint32_t t0 = millis(); millis() - t0 < ms && cl->isConnected(); ) {
+    bool done;
+    portENTER_CRITICAL(&g_bcMux);
+    done = g_bcRxLen && memchr(g_bcRx, '>', g_bcRxLen);
+    portEXIT_CRITICAL(&g_bcMux);
+    if (done) return;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// The connect test's view of a reply. It is bytes from a device we do not
+// control: printable ASCII only, CR/LF runs shown as " | ", JSON-escaped, capped.
+static String btElmExchange(BLEClient* cl, BLERemoteCharacteristic* tx, bool withResp,
+                            const String& cmd, uint32_t timeoutMs, uint32_t& tookMs, bool& prompt) {
+  char buf[sizeof(g_bcRx) + 1];
+  if (!btElmRaw(cl, tx, withResp, cmd.c_str(), timeoutMs, tookMs, prompt, buf, sizeof(buf)))
+    return "(write failed)";
+  String o;
+  o.reserve(strlen(buf) + 16);
   bool sep = false;
-  for (size_t i = 0; i < n && o.length() < 200; i++) {
+  for (size_t i = 0; buf[i] && o.length() < 200; i++) {
     char c = buf[i];
     if (c == '\r' || c == '\n') { sep = o.length() > 0; continue; }
-    if (c == '>' || c < 0x20 || c > 0x7E) continue;
+    if (c < 0x20 || c > 0x7E) continue;
     if (sep) { o += " | "; sep = false; }
     if (c == '"' || c == '\\') o += '\\';
     o += c;
   }
   return o;
+}
+
+// Discover services and pick the serial pair: a notify characteristic for
+// replies and a write one for commands. With `listing`, the services are also
+// written to it as a JSON array, for the connect test's report.
+static bool btFindSerialPair(BLEClient* cl, BLERemoteCharacteristic*& rx, BLERemoteCharacteristic*& tx,
+                             String& svcOut, String* listing) {
+  rx = tx = nullptr;
+  int rank = 99, nSvc = 0;
+  if (listing) *listing += "[";
+  for (auto& sp : *cl->getServices()) {
+    BLERemoteService* s = sp.second;
+    String su = btUuidStr(s->getUUID());
+    bool show = listing && nSvc < 12;              // enough to recognise a device; not unbounded
+    if (show) {
+      if (nSvc) *listing += ",";
+      *listing += "{\"uuid\":\""; *listing += su; *listing += "\",\"chars\":[";
+    }
+    nSvc++;
+    BLERemoteCharacteristic* sRx = nullptr;
+    BLERemoteCharacteristic* sTxOnly = nullptr;
+    BLERemoteCharacteristic* sTxAny = nullptr;
+    int nChr = 0;
+    for (auto& cp : *s->getCharacteristics()) {
+      BLERemoteCharacteristic* c = cp.second;
+      bool ntf = c->canNotify() || c->canIndicate();
+      bool wr  = c->canWrite() || c->canWriteNoResponse();
+      if (ntf && !sRx) sRx = c;
+      if (wr && !ntf && !sTxOnly) sTxOnly = c;
+      if (wr && !sTxAny) sTxAny = c;
+      if (!show || nChr >= 10) continue;
+      if (nChr++) *listing += ",";
+      *listing += "{\"uuid\":\""; *listing += btUuidStr(c->getUUID()); *listing += "\",\"props\":\"";
+      if (c->canRead()) *listing += 'R';
+      if (c->canWrite()) *listing += 'W';
+      if (c->canWriteNoResponse()) *listing += 'w';
+      if (c->canNotify()) *listing += 'N';
+      if (c->canIndicate()) *listing += 'I';
+      *listing += "\"}";
+    }
+    if (show) *listing += "]}";
+    // Prefer a write characteristic that is not also the notify one: clones that
+    // split the pair (replies on one, commands on the other) ignore commands sent
+    // to the wrong one. A single notify+write characteristic is the fallback.
+    BLERemoteCharacteristic* sTx = sTxOnly ? sTxOnly : sTxAny;
+    if (!sRx || !sTx || btStdService(su)) continue;
+    int r = 50;
+    for (size_t k = 0; k < sizeof(BT_SERIAL_SVCS) / sizeof(BT_SERIAL_SVCS[0]); k++)
+      if (su == BT_SERIAL_SVCS[k]) r = (int)k;
+    if (r < rank) { rank = r; rx = sRx; tx = sTx; svcOut = su; }
+  }
+  if (listing) *listing += "]";
+  return rx && tx;
 }
 
 void btConnTask(void* arg) {
@@ -4803,47 +5136,8 @@ void btConnTask(void* arg) {
     out += b;
 
     String rxSvc;
-    int rank = 99, nSvc = 0;
-    out += ",\"svcs\":[";
-    for (auto& sp : *cl->getServices()) {
-      BLERemoteService* s = sp.second;
-      String su = btUuidStr(s->getUUID());
-      bool show = nSvc < 12;                       // enough to recognise a device; not unbounded
-      if (show) { if (nSvc) out += ","; out += "{\"uuid\":\""; out += su; out += "\",\"chars\":["; }
-      nSvc++;
-      BLERemoteCharacteristic* sRx = nullptr;
-      BLERemoteCharacteristic* sTxOnly = nullptr;
-      BLERemoteCharacteristic* sTxAny = nullptr;
-      int nChr = 0;
-      for (auto& cp : *s->getCharacteristics()) {
-        BLERemoteCharacteristic* c = cp.second;
-        bool ntf = c->canNotify() || c->canIndicate();
-        bool wr  = c->canWrite() || c->canWriteNoResponse();
-        if (ntf && !sRx) sRx = c;
-        if (wr && !ntf && !sTxOnly) sTxOnly = c;
-        if (wr && !sTxAny) sTxAny = c;
-        if (!show || nChr >= 10) continue;
-        if (nChr++) out += ",";
-        out += "{\"uuid\":\""; out += btUuidStr(c->getUUID()); out += "\",\"props\":\"";
-        if (c->canRead()) out += 'R';
-        if (c->canWrite()) out += 'W';
-        if (c->canWriteNoResponse()) out += 'w';
-        if (c->canNotify()) out += 'N';
-        if (c->canIndicate()) out += 'I';
-        out += "\"}";
-      }
-      if (show) out += "]}";
-      // Prefer a write characteristic that is not also the notify one: clones that
-      // split the pair (replies on one, commands on the other) ignore commands sent
-      // to the wrong one. A single notify+write characteristic is the fallback.
-      BLERemoteCharacteristic* sTx = sTxOnly ? sTxOnly : sTxAny;
-      if (!sRx || !sTx || btStdService(su)) continue;
-      int r = 50;
-      for (size_t k = 0; k < sizeof(BT_SERIAL_SVCS) / sizeof(BT_SERIAL_SVCS[0]); k++)
-        if (su == BT_SERIAL_SVCS[k]) r = (int)k;
-      if (r < rank) { rank = r; rx = sRx; tx = sTx; rxSvc = su; }
-    }
-    out += "]";
+    out += ",\"svcs\":";
+    btFindSerialPair(cl, rx, tx, rxSvc, &out);
 
     if (rx && tx) {
       withResp = !tx->canWriteNoResponse();
@@ -4865,7 +5159,7 @@ void btConnTask(void* arg) {
       for (int from = 0, comma; (comma = list.indexOf(',', from)) >= 0 && cl->isConnected(); from = comma + 1) {
         String cmd = list.substring(from, comma);
         if (!cmd.length()) continue;
-        uint32_t tmo = (cmd == "ATZ" || cmd == "ATWS") ? 4000 : cmd.startsWith("AT") ? 2500 : 6000;
+        uint32_t tmo = (cmd == "ATZ" || cmd == "ATWS") ? 4000 : cmd.startsWith("AT") ? 2500 : 12000;
         uint32_t took = 0;
         bool prompt = false;
         String reply = btElmExchange(cl, tx, withResp, cmd, tmo, took, prompt);
@@ -4925,15 +5219,15 @@ void handleBtConnect() {
   };
 
   // Backstop, sized for the worst honest case: a 30 s connect, discovery, then
-  // eight commands at up to 6 s each.
-  if (g_bcState == BCS_RUNNING && millis() - g_bcStart > 150000UL) {
-    snprintf(g_bcErr, sizeof(g_bcErr), "connect task did not finish within 150 s");
+  // eight commands at up to 12 s each.
+  if (g_bcState == BCS_RUNNING && millis() - g_bcStart > 180000UL) {
+    snprintf(g_bcErr, sizeof(g_bcErr), "connect task did not finish within 180 s");
     g_bcState = BCS_ERR;
   }
 
   if (server.hasArg("addr")) {                      // ---- start ----
-    if (g_bcState == BCS_RUNNING || g_btState == BTS_RUNNING) {
-      say(409, "{\"ok\":false,\"detail\":\"the radio is busy with a scan or another test\"}"); return;
+    if (g_bcState == BCS_RUNNING || g_btState == BTS_RUNNING || g_obdAlive) {
+      say(409, "{\"ok\":false,\"detail\":\"the radio is busy with a scan, another test, or the OBD pages\"}"); return;
     }
     String a = server.arg("addr"); a.trim(); a.toLowerCase();
     bool addrOk = a.length() == 17;
@@ -4987,6 +5281,641 @@ void handleBtConnect() {
                       g_bcState = BCS_IDLE; break;
     default:          say(200, "{\"ok\":true,\"state\":\"idle\"}"); break;
   }
+}
+
+// ---------------------------------------------------------------------------
+// OBD-II pages (fw 4.74) -- live data from the car through the BLE ELM327
+// dongle whose connection 4.73 proved.
+//
+// The link is held only while an OBD page is open. A live BLE connection cost
+// ~88 KB of heap in the 4.73 measurements, on a board whose real job is the
+// auto-start, so the pages keep the link alive by polling and it is dropped
+// OBD_IDLE_MS after the last poll. The stack itself then stays up for the usual
+// BT_IDLE_OFF_MS, so coming straight back does not pay another bring-up --
+// bring-ups, not connections, are what fragment the heap.
+//
+// One task owns the dongle: connect, initialise the ELM327, ask the car which
+// PIDs it supports, then poll only what the open page shows. Results go into
+// g_obd under a spinlock; the HTTP handler copies a snapshot and builds the JSON
+// outside the lock.
+//
+// Read-only by construction. The task sends a fixed initialisation, mode 01 and
+// 09 requests, and the three fault-code reads (03 / 07 / 0A). No path clears codes.
+//
+// The reader is whatever was picked on the page and saved to NVS -- changing
+// dongles is a scan and a click, not a firmware change.
+// ---------------------------------------------------------------------------
+const uint32_t OBD_IDLE_MS  = 60000;   // drop the link this long after the last page poll
+const uint32_t OBD_RETRY_MS = 15000;   // gap between failed connection attempts
+const uint32_t OBD_PROBE_MS = 15000;   // how often a silent car is asked again
+const uint32_t OBD_SLOW_MS  = 10000;   // dongle supply, link RSSI and PID 01 status
+const uint32_t OBD_CODES_MS = 60000;   // fault codes re-read while the codes page is open
+const int      OBD_MAX_PIDS = 40;      // value slots, indexed like OBD_PIDS (27 rows today)
+const int      OBD_MAX_DTC  = 16;
+
+enum { OBD_OFF = 0, OBD_CONNECTING, OBD_INIT, OBD_NO_CAR, OBD_LIVE, OBD_FAILED };
+static const char* const OBD_LINK_NAMES[] = { "off", "connecting", "starting", "no-car", "live", "failed" };
+
+struct ObdVal { float v; uint32_t atMs; uint8_t state; };   // state: 0 not read yet, 1 value, 2 no data
+
+struct ObdShared {
+  int      link;
+  uint32_t linkSince;
+  char     why[80];                   // what the last failure or silence looked like
+  char     elm[24];                   // ATI
+  float    atrv;                      // the dongle's own supply reading; 0 = unknown
+  int      rssi;
+  int      proto;                     // ATDPN; -1 = unknown
+  char     protoName[48];             // ATDP
+  bool     supKnown;
+  uint32_t sup[4];
+  ObdVal   val[OBD_MAX_PIDS];
+  bool     monKnown;
+  uint8_t  mon[4];                    // PID 01: check-engine light, code count, readiness
+  bool     codesKnown;
+  uint32_t codesAt;
+  int      nStored, nPending, nPerm;  // -1 = the car did not report that list at all
+  char     stored[OBD_MAX_DTC][6];
+  char     pending[OBD_MAX_DTC][6];
+  char     perm[OBD_MAX_DTC][6];
+  bool     infoKnown;
+  char     vin[18];
+  char     calid[24];
+  char     ecuName[24];
+};
+static ObdShared    g_obd;                           // guarded by g_obdMux
+static portMUX_TYPE g_obdMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t g_obdLastPoll     = 0;      // millis of the last page poll
+static volatile uint32_t g_obdPolls = 0;             // /obdjson requests served (for /obdstate)
+static IPAddress         g_obdPoller;                // who polled last
+static volatile uint32_t g_obdBeat  = 0;             // session loop passes (for /obdstate)
+static char              g_obdStage[16] = "idle";    // the command or step the session is on
+static volatile int      g_obdWant         = -1;     // category on screen; -1 = the main OBD page
+static volatile bool     g_obdCodesRefresh = false;
+static volatile bool     g_obdFatal        = false;  // the last session hit something a retry cannot fix
+static uint32_t          g_obdHoldFrom     = 0;      // no new session until g_obdHoldMs after this
+static uint32_t          g_obdHoldMs       = 0;
+static char    g_obdAddr[18] = "";                   // the reader, from NVS; "" = none set up
+static uint8_t g_obdAddrType = BLE_ADDR_PUBLIC;
+
+// why == nullptr keeps the previous reason, so a retry does not wipe the
+// explanation of what the last attempt ran into.
+static void obdSetLink(int link, const char* why) {
+  portENTER_CRITICAL(&g_obdMux);
+  if (g_obd.link != link) g_obd.linkSince = millis();
+  g_obd.link = link;
+  if (why) strlcpy(g_obd.why, why, sizeof(g_obd.why));
+  portEXIT_CRITICAL(&g_obdMux);
+}
+
+// A reply as display text: printable ASCII, whitespace runs as one space, quotes
+// and backslashes dropped so it can go into JSON as-is.
+static void obdCopyText(char* dst, size_t cap, const char* src) {
+  size_t k = 0;
+  bool gap = false;
+  for (const char* p = src; *p && k + 1 < cap; p++) {
+    char c = *p;
+    if (c == '\r' || c == '\n' || c == ' ') { gap = k > 0; continue; }
+    if (c < 0x21 || c > 0x7E || c == '"' || c == '\\') continue;
+    if (gap) {
+      if (k + 2 >= cap) break;
+      dst[k++] = ' ';
+      gap = false;
+    }
+    dst[k++] = c;
+  }
+  dst[k] = 0;
+}
+
+// Device-sourced text into JSON: anything that could break the string is dropped.
+static void obdJsonText(String& o, const char* s) {
+  for (; *s; s++)
+    if (*s >= 0x20 && *s <= 0x7E && *s != '"' && *s != '\\') o += *s;
+}
+
+static bool obdShouldStop(const char* addr) {
+  uint32_t last = g_obdLastPoll;                 // read before millis(), so never "in the future"
+  return millis() - last > OBD_IDLE_MS || strcmp(addr, g_obdAddr) != 0;
+}
+
+// Sleep in short slices, waking early when the pages close or the reader changes.
+static void obdNap(uint32_t ms, const char* addr) {
+  strlcpy(g_obdStage, "nap", sizeof(g_obdStage));
+  for (uint32_t t0 = millis(); millis() - t0 < ms && !obdShouldStop(addr); )
+    vTaskDelay(pdMS_TO_TICKS(250));
+}
+
+// One command. True when the ELM327 finished (sent its prompt). When it did not,
+// wait for the prompt before going on: any character sent to an ELM327 that is
+// still busy -- searching protocols, say -- interrupts what it was doing.
+static bool obdCmd(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, const char* cmd,
+                   uint32_t timeoutMs, char* r, size_t cap) {
+  uint32_t took = 0;
+  bool prompt = false;
+  strlcpy(g_obdStage, cmd, sizeof(g_obdStage));
+  if (!btElmRaw(cl, tx, wr, cmd, timeoutMs, took, prompt, r, cap)) return false;
+  if (!prompt) btElmWaitPrompt(cl, 5000);
+  return prompt;
+}
+
+static void obdDrop(BLEClient* cl) {
+  strlcpy(g_obdStage, "drop", sizeof(g_obdStage));
+  cl->disconnect();
+  for (uint32_t w = millis(); cl->getConnId() != BLE_HS_CONN_HANDLE_NONE && millis() - w < 5000; )
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+static void obdReadAtrv(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, char* r, size_t cap) {
+  float v = 0;
+  if (obdCmd(cl, tx, wr, "ATRV", 2000, r, cap))
+    for (char* p = r; *p; p++)
+      if (*p >= '0' && *p <= '9') { v = strtof(p, nullptr); break; }
+  int rssi = cl->getRssi();
+  portENTER_CRITICAL(&g_obdMux);
+  if (v > 0) g_obd.atrv = v;
+  g_obd.rssi = rssi;
+  portEXIT_CRITICAL(&g_obdMux);
+}
+
+// Ask the car which PIDs it supports. This doubles as "is the car there": with
+// the ignition off the first request searches every protocol and ends in
+// UNABLE TO CONNECT, which takes several seconds -- hence the long timeout.
+static bool obdProbe(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, char* r, size_t cap) {
+  uint32_t sup[4] = { 0, 0, 0, 0 };
+  obdCmd(cl, tx, wr, "0100", 20000, r, cap);
+  if (!obdParseSupported(r, 0x00, sup)) {
+    obdSetLink(OBD_NO_CAR, elmFailText(r));
+    return false;
+  }
+  for (int base = 0x20; base <= 0x60; base += 0x20) {
+    if (!obdIsSupported(sup, (uint8_t)base)) break;   // each map's last bit says whether the next exists
+    char q[8];
+    snprintf(q, sizeof(q), "01%02X", base);
+    obdCmd(cl, tx, wr, q, 4000, r, cap);
+    obdParseSupported(r, (uint8_t)base, sup);
+  }
+  int proto = -1;
+  char name[48] = "";
+  if (obdCmd(cl, tx, wr, "ATDPN", 2000, r, cap)) proto = elmProtocolNum(r);
+  if (obdCmd(cl, tx, wr, "ATDP", 2000, r, cap)) obdCopyText(name, sizeof(name), r);
+  portENTER_CRITICAL(&g_obdMux);
+  memcpy(g_obd.sup, sup, sizeof(sup));
+  g_obd.supKnown = true;
+  g_obd.proto = proto;
+  strlcpy(g_obd.protoName, name, sizeof(g_obd.protoName));
+  portEXIT_CRITICAL(&g_obdMux);
+  obdSetLink(OBD_LIVE, "");
+  return true;
+}
+
+static bool obdReadMonitor(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, char* r, size_t cap) {
+  obdCmd(cl, tx, wr, "0101", 4000, r, cap);
+  uint8_t d[8];
+  if (obdFindPid(r, 0x01, 0x01, d, sizeof(d)) < 4) return false;
+  portENTER_CRITICAL(&g_obdMux);
+  memcpy(g_obd.mon, d, 4);
+  g_obd.monKnown = true;
+  portEXIT_CRITICAL(&g_obdMux);
+  return true;
+}
+
+// Stored (03), pending (07) and permanent (0A) codes. A list the car does not
+// answer at all is kept as -1, "not reported", which is not the same as empty:
+// not every car supports every list.
+static void obdReadCodes(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, char* r, size_t cap) {
+  char c3[OBD_MAX_DTC][6], c7[OBD_MAX_DTC][6], cA[OBD_MAX_DTC][6];
+  obdCmd(cl, tx, wr, "03", 6000, r, cap);
+  int n3 = elmVehicleAnswered(r) ? obdParseDtcs(r, 0x03, c3, OBD_MAX_DTC) : -1;
+  obdCmd(cl, tx, wr, "07", 6000, r, cap);
+  int n7 = elmVehicleAnswered(r) ? obdParseDtcs(r, 0x07, c7, OBD_MAX_DTC) : -1;
+  obdCmd(cl, tx, wr, "0A", 6000, r, cap);
+  int nA = elmVehicleAnswered(r) ? obdParseDtcs(r, 0x0A, cA, OBD_MAX_DTC) : -1;
+  portENTER_CRITICAL(&g_obdMux);
+  g_obd.nStored = n3;
+  g_obd.nPending = n7;
+  g_obd.nPerm = nA;
+  if (n3 > 0) memcpy(g_obd.stored, c3, (size_t)n3 * 6);
+  if (n7 > 0) memcpy(g_obd.pending, c7, (size_t)n7 * 6);
+  if (nA > 0) memcpy(g_obd.perm, cA, (size_t)nA * 6);
+  g_obd.codesKnown = true;
+  g_obd.codesAt = millis();
+  portEXIT_CRITICAL(&g_obdMux);
+}
+
+static void obdReadInfo(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, char* r, size_t cap) {
+  char vin[18] = "", calid[24] = "", ecu[24] = "";
+  obdCmd(cl, tx, wr, "0902", 6000, r, cap);
+  obdParseVin(r, vin);
+  obdCmd(cl, tx, wr, "0904", 6000, r, cap);
+  obdParseText09(r, 0x04, calid, sizeof(calid));
+  obdCmd(cl, tx, wr, "090A", 6000, r, cap);
+  obdParseText09(r, 0x0A, ecu, sizeof(ecu));
+  portENTER_CRITICAL(&g_obdMux);
+  strlcpy(g_obd.vin, vin, sizeof(g_obd.vin));
+  strlcpy(g_obd.calid, calid, sizeof(g_obd.calid));
+  strlcpy(g_obd.ecuName, ecu, sizeof(g_obd.ecuName));
+  g_obd.infoKnown = true;
+  portEXIT_CRITICAL(&g_obdMux);
+}
+
+// One pass over the values the open page shows. Returns how many the car
+// answered, or -1 when there was nothing to ask.
+static int obdPollValues(BLEClient* cl, BLERemoteCharacteristic* tx, bool wr, int want, char* r, size_t cap) {
+  uint32_t sup[4];
+  portENTER_CRITICAL(&g_obdMux);
+  memcpy(sup, g_obd.sup, sizeof(sup));
+  portEXIT_CRITICAL(&g_obdMux);
+  const int vehicleCat = obdCatIndex("vehicle");
+  int asked = 0, answered = 0;
+  for (int i = 0; i < OBD_PID_COUNT && i < OBD_MAX_PIDS && cl->isConnected(); i++) {
+    const ObdPid& p = OBD_PIDS[i];
+    if (want < 0 ? !p.hub : p.cat != want) continue;
+    if (!obdIsSupported(sup, p.pid)) continue;
+    uint8_t st;
+    portENTER_CRITICAL(&g_obdMux);
+    st = g_obd.val[i].state;
+    portEXIT_CRITICAL(&g_obdMux);
+    if (p.cat == vehicleCat && st == 1) continue;     // static facts: once per session is enough
+    char q[8];
+    snprintf(q, sizeof(q), "01%02X", p.pid);
+    obdCmd(cl, tx, wr, q, 4000, r, cap);
+    uint8_t d[8];
+    float v = 0;
+    int n = obdFindPid(r, 0x01, p.pid, d, sizeof(d));
+    bool ok = n >= 0 && obdDecode(p.pid, d, n, &v);
+    asked++;
+    if (ok) answered++;
+    portENTER_CRITICAL(&g_obdMux);
+    if (ok) {
+      g_obd.val[i].v = v;
+      g_obd.val[i].atMs = millis();
+      g_obd.val[i].state = 1;
+    } else if (g_obd.val[i].state != 1) {
+      g_obd.val[i].state = 2;                         // keep a last good value; its age shows it is old
+    }
+    portEXIT_CRITICAL(&g_obdMux);
+  }
+  return asked ? answered : -1;
+}
+
+static void obdSession(const char* addr, uint8_t type) {
+  static char r[sizeof(g_bcRx) + 1];            // one session at a time; kept off the task stack
+  if (!g_btUp) {
+    if (!BLEDevice::init("")) {
+      obdSetLink(OBD_FAILED, "Bluetooth would not start");
+      g_obdFatal = true;
+      return;
+    }
+    g_btUp = true;
+  }
+  if (!g_bcClient) g_bcClient = BLEDevice::createClient();
+  BLEClient* cl = g_bcClient;
+  if (!cl) {
+    obdSetLink(OBD_FAILED, "could not create a BLE client");
+    g_obdFatal = true;
+    return;
+  }
+  const int codesCat = obdCatIndex("codes"), vehicleCat = obdCatIndex("vehicle");
+
+  while (!obdShouldStop(addr)) {
+    obdSetLink(OBD_CONNECTING, nullptr);
+    strlcpy(g_obdStage, "connect", sizeof(g_obdStage));
+    if (!cl->connect(BLEAddress(String(addr), type), type)) {
+      obdSetLink(OBD_FAILED, "could not connect - out of range, unpowered, or held by a phone app");
+      obdNap(OBD_RETRY_MS, addr);
+      continue;
+    }
+    BLERemoteCharacteristic* rx = nullptr;
+    BLERemoteCharacteristic* tx = nullptr;
+    String svc;
+    strlcpy(g_obdStage, "discover", sizeof(g_obdStage));
+    if (!btFindSerialPair(cl, rx, tx, svc, nullptr) || !rx->subscribe(rx->canNotify(), btRxNotify)) {
+      obdSetLink(OBD_FAILED, "connected, but found no usable ELM327 serial service");
+      obdDrop(cl);
+      g_obdFatal = true;                         // its services will not be different on a retry
+      return;
+    }
+    bool wr = !tx->canWriteNoResponse();
+    obdSetLink(OBD_INIT, "");
+    // Settings the parsing relies on, whatever a phone app left behind. All are
+    // volatile except ATSP0, which only restores automatic protocol search.
+    obdCmd(cl, tx, wr, "ATZ", 4000, r, sizeof(r));
+    obdCmd(cl, tx, wr, "ATE0", 1500, r, sizeof(r));
+    obdCmd(cl, tx, wr, "ATL0", 1500, r, sizeof(r));
+    obdCmd(cl, tx, wr, "ATS1", 1500, r, sizeof(r));
+    obdCmd(cl, tx, wr, "ATH0", 1500, r, sizeof(r));
+    obdCmd(cl, tx, wr, "ATSP0", 1500, r, sizeof(r));
+    if (obdCmd(cl, tx, wr, "ATI", 1500, r, sizeof(r))) {
+      char v[24];
+      obdCopyText(v, sizeof(v), r);
+      portENTER_CRITICAL(&g_obdMux);
+      strlcpy(g_obd.elm, v, sizeof(g_obd.elm));
+      portEXIT_CRITICAL(&g_obdMux);
+    }
+    obdReadAtrv(cl, tx, wr, r, sizeof(r));
+
+    bool live = obdProbe(cl, tx, wr, r, sizeof(r));
+    logLine("OBD: reader up, car %s", live ? "answering" : "not answering");
+    uint32_t lastProbe = millis(), lastSlow = millis(), lastMon = 0;
+    int silent = 0;
+    while (cl->isConnected() && !obdShouldStop(addr)) {
+      const int want = g_obdWant;
+      g_obdBeat++;
+      if (millis() - lastSlow >= OBD_SLOW_MS) {
+        lastSlow = millis();
+        obdReadAtrv(cl, tx, wr, r, sizeof(r));
+      }
+      if (!live) {
+        if (millis() - lastProbe >= OBD_PROBE_MS) {
+          lastProbe = millis();
+          live = obdProbe(cl, tx, wr, r, sizeof(r));
+          silent = 0;
+          if (live) logLine("OBD: car answering");
+        } else {
+          vTaskDelay(pdMS_TO_TICKS(250));
+        }
+        continue;
+      }
+      bool answered = true;
+      if ((want < 0 || want == codesCat) && millis() - lastMon >= OBD_SLOW_MS) {
+        lastMon = millis();
+        answered = obdReadMonitor(cl, tx, wr, r, sizeof(r));
+      }
+      if (answered && want == codesCat) {
+        bool due;
+        portENTER_CRITICAL(&g_obdMux);
+        due = !g_obd.codesKnown || millis() - g_obd.codesAt >= OBD_CODES_MS;
+        portEXIT_CRITICAL(&g_obdMux);
+        if (due || g_obdCodesRefresh) {
+          g_obdCodesRefresh = false;
+          obdReadCodes(cl, tx, wr, r, sizeof(r));
+        }
+      }
+      if (answered && want == vehicleCat) {
+        bool known;
+        portENTER_CRITICAL(&g_obdMux);
+        known = g_obd.infoKnown;
+        portEXIT_CRITICAL(&g_obdMux);
+        if (!known) obdReadInfo(cl, tx, wr, r, sizeof(r));
+      }
+      int got = answered ? obdPollValues(cl, tx, wr, want, r, sizeof(r)) : 0;
+      if (got == 0 && ++silent >= 3) {             // the ignition went off mid-session
+        live = false;
+        lastProbe = millis();
+        obdSetLink(OBD_NO_CAR, elmFailText(r));
+        logLine("OBD: car stopped answering");
+      } else if (got > 0) {
+        silent = 0;
+      }
+      vTaskDelay(pdMS_TO_TICKS(got < 0 ? 400 : 120));
+    }
+    obdDrop(cl);
+    if (!obdShouldStop(addr)) {                   // the link fell over rather than being closed
+      obdSetLink(OBD_FAILED, "the link to the reader dropped");
+      obdNap(OBD_RETRY_MS / 3, addr);
+    }
+  }
+}
+
+void obdTask(void* arg) {
+  vTaskDelay(pdMS_TO_TICKS(150));                 // let the HTTP reply go first, as the scan does
+  char addr[18];
+  strlcpy(addr, g_obdAddr, sizeof(addr));
+  uint8_t type = g_obdAddrType;
+  uint32_t t0 = millis();
+  obdSession(addr, type);
+  obdSetLink(OBD_OFF, nullptr);                   // keep the last reason for the page to show
+  g_obdHoldFrom = millis();
+  g_obdHoldMs = g_obdFatal ? 60000UL : 0UL;
+  g_btLastEnd = millis();                         // the idle auto-off counts from here
+  logLine("OBD: link closed after %lu s", (unsigned long)((millis() - t0) / 1000));
+  g_obdAlive = false;                             // LAST: a new session may start from here on
+  vTaskDelete(nullptr);
+}
+
+// Start a session for the page that just polled, unless something else holds the
+// radio or the heap cannot place the stack. `why` explains a refusal.
+static bool obdStartSession(String& why) {
+  if (g_btState == BTS_RUNNING || g_bcState == BCS_RUNNING) {
+    why = "the Debug page is using the radio";
+    return false;
+  }
+  if (!g_btUp) {
+    String body;
+    int code = btBringUpRefusal(body);
+    if (code == 429) { why = "the radio is settling after its last use"; return false; }
+    if (code) { why = "memory is too fragmented to start Bluetooth - reboot the board to fix it"; return false; }
+  }
+  portENTER_CRITICAL(&g_obdMux);
+  memset(&g_obd, 0, sizeof(g_obd));
+  g_obd.proto = -1;
+  g_obd.link = OBD_CONNECTING;
+  g_obd.linkSince = millis();
+  g_obd.nStored = g_obd.nPending = g_obd.nPerm = -1;
+  portEXIT_CRITICAL(&g_obdMux);
+  g_obdFatal = false;
+  g_obdAlive = true;                              // before the task exists: a second poll must not start a second
+  logLine("OBD: link opened for %s", g_obdPoller.toString().c_str());
+  if (xTaskCreatePinnedToCore(obdTask, "obd", 8192, nullptr, 1, nullptr, 1) != pdPASS) {
+    g_obdAlive = false;
+    why = "could not start the OBD task";
+    return false;
+  }
+  return true;
+}
+
+// GET /obdjson[?cat=<key>][&refresh=1] -- everything the OBD pages show. Every
+// poll keeps the link alive and says which page is open, so the task reads what
+// that page shows and nothing else.
+void handleObdJson() {
+  trackReq();
+  String cat = server.arg("cat");
+  int want = cat.length() ? obdCatIndex(cat.c_str()) : -1;
+  g_obdWant = want;
+  g_obdLastPoll = millis();
+  g_obdPolls++;
+  g_obdPoller = server.client().remoteIP();
+  if (server.hasArg("refresh")) g_obdCodesRefresh = true;
+
+  String note;
+  if (g_obdAddr[0] && !g_obdAlive && millis() - g_obdHoldFrom >= g_obdHoldMs) obdStartSession(note);
+
+  static ObdShared s;                             // loop task only; keeps ~1.3 KB off its stack
+  portENTER_CRITICAL(&g_obdMux);
+  memcpy(&s, &g_obd, sizeof(s));
+  portEXIT_CRITICAL(&g_obdMux);
+  bool alive = g_obdAlive;
+  uint32_t now = millis();
+  int link = (s.link >= OBD_OFF && s.link <= OBD_FAILED) ? s.link : OBD_OFF;
+
+  String o;
+  o.reserve(2600);
+  o += "{\"reader\":\"";       o += g_obdAddr;
+  o += "\",\"link\":\"";       o += !g_obdAddr[0] ? "none" : (alive ? OBD_LINK_NAMES[link] : "off");
+  o += "\",\"why\":\"";        obdJsonText(o, note.length() ? note.c_str() : s.why);
+  o += "\",\"elm\":\"";        obdJsonText(o, s.elm);
+  o += "\",\"proto_name\":\""; obdJsonText(o, s.protoName);
+  o += "\",\"proto\":";        o += s.proto;
+  o += ",\"since\":";          o += (now - s.linkSince) / 1000;
+  o += ",\"rssi\":";           o += s.rssi;
+  o += ",\"atrv\":";
+  if (s.atrv > 0) o += String(s.atrv, 1); else o += "null";
+  o += ",\"board_v\":";        o += String(g_lastV, 2);
+  if (s.monKnown) {
+    o += ",\"mil\":";          o += (s.mon[0] & 0x80) ? "true" : "false";
+    o += ",\"dtc\":";          o += (int)(s.mon[0] & 0x7F);
+  }
+
+  o += ",\"cats\":[";
+  for (int c = 0; c < OBD_CAT_COUNT; c++) {
+    int tot = 0, sup = 0;
+    for (int i = 0; i < OBD_PID_COUNT; i++)
+      if (OBD_PIDS[i].cat == c) {
+        tot++;
+        if (obdIsSupported(s.sup, OBD_PIDS[i].pid)) sup++;
+      }
+    if (c) o += ",";
+    o += "{\"k\":\"";   o += OBD_CATS[c].key;
+    o += "\",\"n\":\""; o += OBD_CATS[c].name;
+    o += "\",\"b\":\""; o += OBD_CATS[c].blurb;
+    o += "\",\"tot\":"; o += tot;
+    o += ",\"sup\":";
+    if (s.supKnown) o += sup; else o += "null";
+    o += "}";
+  }
+  o += "]";
+
+  o += ",\"vals\":[";
+  int nv = 0;
+  for (int i = 0; i < OBD_PID_COUNT && i < OBD_MAX_PIDS; i++) {
+    const ObdPid& p = OBD_PIDS[i];
+    if (want < 0 ? !p.hub : p.cat != want) continue;
+    int st = s.val[i].state;
+    if (s.supKnown && !obdIsSupported(s.sup, p.pid)) st = 3;      // 3 = the car says it has no such value
+    if (nv++) o += ",";
+    o += "{\"k\":\"";   o += p.key;
+    o += "\",\"n\":\""; o += p.name;
+    o += "\",\"u\":\""; o += p.unit;
+    o += "\",\"t\":\""; o += p.tip;
+    o += "\",\"d\":";   o += (int)p.dec;
+    o += ",\"s\":";     o += st;
+    if (st == 1) {
+      if (p.fmt != OF_NUM) {
+        o += ",\"x\":\""; o += obdEnumText(p.fmt, (int)s.val[i].v); o += "\"";
+      } else if (isfinite(s.val[i].v)) {
+        o += ",\"v\":"; o += String(s.val[i].v, (unsigned int)p.dec);
+      }
+      o += ",\"age\":"; o += now - s.val[i].atMs;
+    }
+    o += "}";
+  }
+  o += "]";
+
+  if (want >= 0 && !strcmp(OBD_CATS[want].key, "codes")) {
+    o += ",\"codes\":{\"known\":"; o += s.codesKnown ? "true" : "false";
+    if (s.codesKnown) {
+      o += ",\"age\":"; o += now - s.codesAt;
+      const char* names[3] = { "stored", "pending", "perm" };
+      int counts[3] = { s.nStored, s.nPending, s.nPerm };
+      const char* lists[3] = { s.stored[0], s.pending[0], s.perm[0] };
+      for (int l = 0; l < 3; l++) {
+        o += ",\""; o += names[l]; o += "\":";
+        if (counts[l] < 0) { o += "null"; continue; }
+        o += "[";
+        for (int i = 0; i < counts[l] && i < OBD_MAX_DTC; i++) {
+          if (i) o += ",";
+          o += "\""; obdJsonText(o, lists[l] + i * 6); o += "\"";
+        }
+        o += "]";
+      }
+    }
+    if (s.monKnown) {
+      ObdMonitor mon[11];
+      bool mil = false, diesel = false;
+      int cnt = 0;
+      int nm = obdMonitors(s.mon, mon, 11, &mil, &cnt, &diesel);
+      o += ",\"diesel\":"; o += diesel ? "true" : "false";
+      o += ",\"mon\":[";
+      for (int i = 0; i < nm; i++) {
+        if (i) o += ",";
+        o += "{\"n\":\""; o += mon[i].name;
+        o += "\",\"a\":"; o += mon[i].available ? 1 : 0;
+        o += ",\"c\":";   o += mon[i].complete ? 1 : 0;
+        o += "}";
+      }
+      o += "]";
+    }
+    o += "}";
+  }
+
+  if (want >= 0 && !strcmp(OBD_CATS[want].key, "vehicle")) {
+    o += ",\"info\":{\"known\":"; o += s.infoKnown ? "true" : "false";
+    o += ",\"vin\":\"";   obdJsonText(o, s.vin);
+    o += "\",\"calid\":\""; obdJsonText(o, s.calid);
+    o += "\",\"ecu\":\"";   obdJsonText(o, s.ecuName);
+    o += "\"}";
+  }
+
+  o += "}";
+  g_out_total += o.length();
+  server.send(200, "application/json", o);
+}
+
+// GET /obdstate -- the session as seen from outside, WITHOUT counting as a page
+// poll, so it can watch the idle timeout run out. Diagnostics only.
+void handleObdState() {
+  trackReq();
+  int link;
+  portENTER_CRITICAL(&g_obdMux);
+  link = g_obd.link;
+  portEXIT_CRITICAL(&g_obdMux);
+  char b[320];
+  snprintf(b, sizeof(b),
+           "{\"alive\":%s,\"link\":\"%s\",\"idle_ms\":%lu,\"polls\":%lu,\"poller\":\"%s\",\"beat\":%lu,"
+           "\"stage\":\"%s\",\"want\":%d,\"heap\":%lu,\"block\":%lu,\"bt_up\":%s}",
+           g_obdAlive ? "true" : "false",
+           (link >= OBD_OFF && link <= OBD_FAILED) ? OBD_LINK_NAMES[link] : "?",
+           (unsigned long)(millis() - g_obdLastPoll), (unsigned long)g_obdPolls,
+           g_obdPoller.toString().c_str(), (unsigned long)g_obdBeat, g_obdStage, (int)g_obdWant,
+           (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), g_btUp ? "true" : "false");
+  g_out_total += strlen(b);
+  server.send(200, "application/json", b);
+}
+
+// POST /obdcfg?addr=aa:bb:cc:dd:ee:ff&t=public|random   remember the reader (NVS)
+// POST /obdcfg?forget=1                                  forget it; a running session ends
+void handleObdCfg() {
+  trackReq();
+  auto say = [&](int code, const String& body) {
+    g_out_total += body.length();
+    server.send(code, "application/json", body);
+  };
+  if (server.hasArg("forget")) {
+    g_obdAddr[0] = 0;
+    prefs.remove("obd_addr");
+    prefs.remove("obd_type");
+    logLine("OBD: reader forgotten");
+    say(200, "{\"ok\":true,\"reader\":\"\"}");
+    return;
+  }
+  String a = server.arg("addr");
+  a.trim();
+  a.toLowerCase();
+  bool ok = a.length() == 17;
+  for (int i = 0; ok && i < 17; i++)
+    ok = (i % 3 == 2) ? a[i] == ':' : isxdigit((unsigned char)a[i]);
+  if (!ok) {
+    say(400, "{\"ok\":false,\"detail\":\"addr must look like aa:bb:cc:dd:ee:ff\"}");
+    return;
+  }
+  uint8_t type = (server.arg("t") == "random") ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+  g_obdAddrType = type;
+  strlcpy(g_obdAddr, a.c_str(), sizeof(g_obdAddr));
+  prefs.putString("obd_addr", a);
+  prefs.putUChar("obd_type", type);
+  g_obdHoldMs = 0;                                // a new reader gets a session straight away
+  logLine("OBD: reader set to %s", g_obdAddr);
+  say(200, String("{\"ok\":true,\"reader\":\"") + g_obdAddr + "\"}");
 }
 
 void handleTransmit() {
@@ -5463,6 +6392,7 @@ table.rh tr.gap td{background:#0d1117;color:var(--mut);font-style:italic}
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/obd" data-p="/obd">OBD</a>
 <a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
@@ -5784,6 +6714,7 @@ const char UPDATE_HTML[] PROGMEM = R"HTML(
 <a href="/cpu" data-p="/cpu">CPU</a>
 <a href="/memdisk" data-p="/memdisk">Mem / Disk</a>
 <a href="/logs" data-p="/logs">Log</a>
+<a href="/obd" data-p="/obd">OBD</a>
 <a href="/debug" data-p="/debug">Debug</a>
 <a href="/update" data-p="/update">Update</a>
 </nav>
@@ -5953,6 +6884,11 @@ static void loadWifiCfg() {
   g_ltRefV  = prefs.getFloat("lt_ref_v",  0.0f);
   g_ltDue   = prefs.getUInt ("lt_due",    0);
   g_sta_ssid   = prefs.getString("sta_ssid", WIFI_SSID);
+  if (prefs.isKey("obd_addr")) {                    // the reader picked on the OBD page, if any
+    String a = prefs.getString("obd_addr", "");
+    strlcpy(g_obdAddr, a.c_str(), sizeof(g_obdAddr));
+    g_obdAddrType = prefs.getUChar("obd_type", BLE_ADDR_PUBLIC);
+  }
   g_sta_pass   = prefs.getString("sta_pass", WIFI_PASS);
   g_ap_ssid    = prefs.getString("ap_ssid",  AP_SSID);
   g_ap_pass    = prefs.getString("ap_pass",  AP_PASS);
@@ -6142,6 +7078,12 @@ void setup() {
   server.on("/debug", HTTP_GET, handleDebugPage);      // Debug tab (BLE scanner)
   server.on("/btscan", HTTP_GET, handleBtScan);        // brings BLE up, scans, puts it back down
   server.on("/btconnect", HTTP_GET, handleBtConnect);  // one short connection, read-only ELM327 questions
+  server.on("/obd", HTTP_GET, handleObdPage);          // OBD tab: overview
+  for (int i = 0; i < OBD_CAT_COUNT; i++)              // one sub-page per category, all the same template
+    server.on(String("/obd/") + OBD_CATS[i].key, HTTP_GET, handleObdPage);
+  server.on("/obdjson", HTTP_GET, handleObdJson);      // the OBD pages' data; each poll keeps the link up
+  server.on("/obdcfg", HTTP_POST, handleObdCfg);       // remember or forget the reader
+  server.on("/obdstate", HTTP_GET, handleObdState);    // diagnostics; does not keep the link alive
   server.on("/app.css", HTTP_GET, handleAppCss);       // shared cached stylesheet
   server.on("/app.js", HTTP_GET, handleAppJs);         // shared cached engine
   server.on("/json", handleJson);
@@ -6165,6 +7107,7 @@ void setup() {
       HTTPUpload& u = server.upload();
       if (u.status == UPLOAD_FILE_START) {
         g_otaActive = true;                 // core 0 stops touching the filesystem
+        server.client().setTimeout(OTA_STALL_MS);   // ride out link stalls; see OTA_STALL_MS
         Serial.printf("OTA start: %s\n", u.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
           Update.printError(Serial);
@@ -6363,7 +7306,7 @@ void loop() {
     flushRunsToFlash();                             // and any engine start/stop events
     flushDailyToFlash();                            // and the daily bucket, at midnight
     // Never while a scan or connect test is live -- it owns the stack until it finishes.
-    if (g_btUp && g_btState != BTS_RUNNING && g_bcState != BCS_RUNNING && g_btLastEnd &&
+    if (g_btUp && g_btState != BTS_RUNNING && g_bcState != BCS_RUNNING && !g_obdAlive && g_btLastEnd &&
         millis() - g_btLastEnd > BT_IDLE_OFF_MS) {
       btStackDown(); g_btLastEnd = millis();
       logLine("BT: radio auto-off after %lu min idle", (unsigned long)(BT_IDLE_OFF_MS / 60000));

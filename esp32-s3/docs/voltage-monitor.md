@@ -301,13 +301,18 @@ been driven holds **surface charge** and can sit at 12.9–13.0 V for over half 
 hour, so a threshold at 12.90 V never fires at all. See
 [power-budget.md](../../docs/power-budget.md) section 7.
 
-### The two badges — never trust a number that carries one
+### The badges — two say "less certain", one says "more"
 
 | Badge | Means | Trust the duration? |
 |---|---|---|
-| *(none)* | recorded live, both edges measured | yes |
+| *(none)* | recorded live, both edges measured from battery voltage | yes |
+| **OBD** | an edge was timed by the engine computer over the OBD link (fw 4.75, flags bit 5): RPM reaching zero, or the ECU's own run-time counter for a start | yes — the most precise edge the board records |
 | **reconstructed** | hand-derived from other evidence when the log was first created | it is the best available account, not a measurement |
 | **recovered** | the board rebooted while this run was open; the end time was rebuilt from the voltage history | approximately — good to about a minute in the normal case |
+
+An **OBD** run is not a different kind of run, only a better-timed one. It appears
+when the OBD link was live at the edge — see section 7d — and a run's other edge may
+still come from voltage.
 
 ### What happens if the board reboots mid-drive
 
@@ -558,8 +563,9 @@ firmware change. Close any phone app connected to the dongle first.
 
 ### When the board holds the link
 
-**Only while an OBD page is open.** Every page poll (each 2&nbsp;s) keeps the link
-alive, and 60&nbsp;s after the last one the board disconnects. A live BLE
+**While an OBD page is open, or while logging is on and the engine runs.** Every
+page poll (each 2&nbsp;s) keeps the link alive, and 60&nbsp;s after the last one the
+board disconnects &mdash; unless the log still wants it (see *The OBD log* below). A live BLE
 connection costs about 88&nbsp;KB of heap on a board whose real job is the
 auto-start, so holding it for a page nobody is looking at is the wrong trade. The
 Bluetooth stack stays up for the usual 5&nbsp;minutes afterwards, so coming straight
@@ -607,6 +613,47 @@ g++ -std=c++17 -Wall -Wextra -I esp32-s3/voltage_monitor \
 **Adding a value** is one row in `OBD_PIDS`, plus a formula case in `obdDecode()` if
 the formula is new. **Adding a page** is one row in `OBD_CATS`; its tab and its card
 on the Overview follow from the table.
+
+### The OBD log
+
+With **logging on**, which is the default, the board writes a row to `/obdlog.csv`
+every 30&nbsp;s while the car answers. The first column is local date and time.
+Then comes one column per value, with the unit in the name (`coolant_C`,
+`speed_kmh`, `rpm`), then the dongle's supply, the board's battery reading, the
+check-engine light and the stored-code count. A value the car did not report is an
+empty cell, so the columns never shift. **Nothing is written while the car is off.**
+
+A log needs the link while you drive, not only while a page is open. So with logging
+on, **the board connects to the reader by itself when the engine starts** and holds
+the link for the drive. That is about 88&nbsp;KB of heap, accepted while driving,
+when the auto-start has nothing to do. The connection follows the engine-start
+voltage edge, which itself takes 5&nbsp;s to confirm.
+
+The Overview's **OBD log** card turns logging on and off (remembered in NVS),
+downloads the whole log as one CSV, and clears it. Two generations of about
+512&nbsp;KB each are kept; when the newer fills, the older is dropped. Rows are built
+by the Bluetooth task in RAM and written by the loop core along with every other file
+write, never while an OTA upload is streaming.
+
+### Engine start and stop from the ECU
+
+While the link has a fresh reading, **the engine computer times the run log's
+edges** instead of battery voltage. RPM falling to zero ends a run at once, where
+voltage has to stay below 13.10&nbsp;V for 120&nbsp;s to see past surface charge.
+A voltage dip also cannot end a run the ECU says is still going. When the ECU is the
+first to see a start, its own run-time counter (PID&nbsp;1F) dates it. Such runs carry
+an **OBD** badge in the run log (flags bit&nbsp;5).
+
+Two guards keep it honest:
+
+- An OBD "stopped" is only accepted once voltage agrees the alternator has stopped
+  charging. A link that loses the ECU mid-drive cannot end a run early.
+- Silence from the ECU only counts as a stop if it had been reporting the engine
+  running. A car that never answered says nothing about its engine.
+
+**None of this touches the auto-start decision.** That stays on voltage alone
+(`g_parkS`). A Start sent to a running Compustar engine switches it off, and nothing
+on the fire path reads the run state that OBD now helps decide.
 
 ### API
 

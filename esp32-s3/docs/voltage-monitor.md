@@ -334,9 +334,11 @@ older firmware bug, not a drive still in progress.
 
 ## 7c. Debug tab &mdash; the BLE scanner
 
-`/debug` scans for nearby Bluetooth LE devices. **The radio is off in normal
-operation and this is the only thing that turns it on**: it brings the stack up,
-listens, and puts it back down. Nothing is stored, connected to, or paired.
+`/debug` scans for nearby Bluetooth LE devices, and tests whether the board can
+actually talk to one. **The radio is off in normal operation and this page is the
+only thing that turns it on**: a scan brings the stack up, listens, and puts it
+back down. Nothing is stored or paired, and nothing is connected to unless you
+press **Test** on a result (see *Connection test* below).
 
 Per device you get name, address, public/random, RSSI and advertised service
 UUIDs &mdash; enough to recognise a specific dongle.
@@ -426,6 +428,78 @@ unconditionally refused every scan while the radio was up.
   unauthenticated stranger in radio range. Real neighbours were already
   advertising non-UTF-8 bytes on day one.
 
+### Connection test &mdash; can the board talk to it?
+
+A scan proves a device is advertising. It does not prove the board can connect to
+it, find its serial service and get an answer back &mdash; and those are what
+decide whether a BLE OBD-II dongle is usable from here. **Test** on a scan row
+answers that (fw 4.73). One test is one short connection:
+
+1. connect to the address, as public or random exactly as the scan reported it;
+2. discover every service and characteristic;
+3. pick the serial pair &mdash; a notify characteristic for replies and a write
+   characteristic for commands. The usual ELM327 layouts (`FFF0`, `FFE0`, `18F0`
+   and the vLinker-style 128-bit service) win ties, but any vendor service with a
+   notify + write pair is tried. Where a service has both, the write
+   characteristic that is *not* also the notify one is used;
+4. subscribe, then send `ATZ`, `ATE0`, `ATI`, `ATRV` and collect each reply up to
+   the ELM327 `>` prompt. A reply arrives split across notifications, so the first
+   packet is not the answer;
+5. disconnect, and wait for the link to actually drop.
+
+The verdict says how far it got:
+
+| Verdict | Read it as |
+|---|---|
+| `no connection` | not advertising, out of range, or already held by a phone |
+| `connected, but no serial (notify + write) service found` | not an ELM327-style dongle, or it hides the service until paired |
+| `connected, but subscribing to its replies failed` | the dongle refused the subscription &mdash; often a sign it wants pairing |
+| `connected and subscribed, but the dongle never answered` | commands went to the wrong characteristic, or the dongle is wedged |
+| `connected and answering, but nothing identified an ELM327` | it talks, but not as an ELM327 |
+| `PASS: connected and the dongle answered as an ELM327` | usable from the board |
+
+**Measured on the car's Veepeak**, ignition off: connected in 8.3&nbsp;s at
+&minus;58&nbsp;dBm, serial pair `FFF1` (notify) / `FFF2` (write), `ATZ` and `ATI`
+answered `ELM327 v1.5`, `ATRV` answered `11.9V` &mdash; PASS.
+
+Worth knowing before you press it:
+
+- **Close the OBD app on your phone first.** A BLE dongle normally takes one
+  connection at a time and stops advertising while something holds it, so a
+  connected phone makes a working dongle look absent.
+- **`ATRV` is not a battery reference.** It is the dongle measuring its own supply
+  on OBD pin&nbsp;16, which is why it answers with the car off &mdash; but the
+  Veepeak read 11.9&nbsp;V while the board's calibrated divider read 12.89&nbsp;V.
+- **Query the car** adds `ATSP0`, `0100` and `010C`, which need the ignition ON;
+  with it off, `UNABLE TO CONNECT` or `NO DATA` is the normal answer from a working
+  dongle. Each OBD request waits up to 6&nbsp;s, and a first request that has to
+  search protocols can take longer &mdash; if `0100` comes back as `SEARCHING...`
+  with no prompt, run the test again.
+- **A device that is not there takes about 30&nbsp;s to report.** This core's
+  NimBLE `BLEClient::connect()` ignores its timeout argument and always waits its
+  own 30&nbsp;s.
+- **A connection is expensive.** Free heap fell 178&nbsp;KB &rarr; 91&nbsp;KB across
+  the Veepeak test with the radio left up, and the largest block 131&nbsp;KB &rarr;
+  47&nbsp;KB. Anything that holds a link open carries that for as long as it lasts.
+
+#### Only read-only commands
+
+The endpoint is unauthenticated on the LAN and the far side of the dongle is the
+car's diagnostic bus, so commands pass an **allow list**: `ATZ ATWS ATI AT@1 ATRV
+ATDP ATDPN ATE0 ATL0 ATS0 ATH0 ATH1 ATSP0`, plus OBD-II requests in the read-only
+modes `01 02 03 07 09 0A`. Mode `04` &mdash; clear codes, which also wipes the
+readiness monitors &mdash; cannot be reached, and neither can AT commands that
+rewrite the dongle's saved settings. `ATSP0` is the one save allowed, because it
+only restores the factory default, automatic protocol search.
+
+#### One client, reused &mdash; because the library deletes it
+
+`BLEDevice` keeps its own pointer to the last client it created and deletes it
+inside `deinit()`. Deleting the firmware's copy as well would be a double free, and
+creating a client per test would leak all but the last. So the firmware creates one
+client per radio session, reuses it, and forgets it at every teardown &mdash; which
+is why every teardown path now goes through one function.
+
 ### API
 
 | Call | Does |
@@ -434,6 +508,10 @@ unconditionally refused every scan while the radio was up.
 | `GET /btscan?s=<n>&keep=1` | ...and leave the radio up afterwards |
 | `GET /btscan` | poll; returns the result **once**, then resets to idle |
 | `GET /btscan?off=1` | put the radio down now |
+| `GET /btconnect?addr=<mac>&t=<public\|random>` | start a connect test, returns `202` at once |
+| `GET /btconnect?...&cmds=ATZ,ATI,...` | replace the default `ATZ,ATE0,ATI,ATRV` (allow list, at most 8) |
+| `GET /btconnect?...&keep=1` | ...and leave the radio up afterwards |
+| `GET /btconnect` | poll; returns the result **once**, then resets to idle |
 
 The start call answers *before* the radio comes up. It did the reverse once, and
 `BLEDevice::init()` starved the reply on the same core &mdash; a `202` that

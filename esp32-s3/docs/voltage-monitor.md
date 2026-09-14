@@ -523,6 +523,104 @@ Because a poll consumes the result, a second poll still in flight comes back
 
 ---
 
+## 7d. OBD tab &mdash; live data through a BLE OBD-II reader
+
+`/obd` shows what the car's engine computer reports, through a **BLE ELM327
+dongle** plugged into the OBD port (the car's is a Veepeak, proven with the
+*Connection test* in 7c). It is read-only: nothing here clears codes or changes
+anything in the car.
+
+### Pages
+
+An **Overview** &mdash; the reader's status, engine speed, road speed, coolant,
+ECU supply voltage, the check-engine light with its code count, and a card per
+category &mdash; plus one page per category:
+
+| Page | Shows |
+|---|---|
+| Engine | RPM, speed, coolant, load, throttle, intake air, timing advance, airflow, manifold pressure, oil temperature |
+| Fuel &amp; air | fuel system state, short- and long-term trims, O2 sensors, commanded lambda, fuel pressure and level, barometric pressure |
+| Electrical | ECU supply voltage beside the dongle's `ATRV` and the board's own battery reading |
+| Distance &amp; time | run time, distance and warm-ups since codes were cleared, distance with the light on, ambient temperature |
+| Fault codes | stored, pending and permanent codes; readiness monitors |
+| Vehicle | VIN, calibration ID, ECU name, OBD standard, fuel type, protocol, the reader |
+
+**Only values the car says it supports are read.** A connection first asks the car
+for its supported-PID maps (`0100`, `0120` ...); everything else shows as *not
+supported by this car* rather than as an error.
+
+### Setting up or changing the reader
+
+The reader is chosen on the page, not in the firmware. **Scan for readers** lists
+nearby BLE devices with likely OBD readers first, **Use** saves the choice to NVS,
+and **Change reader** forgets it and scans again &mdash; swapping dongles needs no
+firmware change. Close any phone app connected to the dongle first.
+
+### When the board holds the link
+
+**Only while an OBD page is open.** Every page poll (each 2&nbsp;s) keeps the link
+alive, and 60&nbsp;s after the last one the board disconnects. A live BLE
+connection costs about 88&nbsp;KB of heap on a board whose real job is the
+auto-start, so holding it for a page nobody is looking at is the wrong trade. The
+Bluetooth stack stays up for the usual 5&nbsp;minutes afterwards, so coming straight
+back reconnects without another bring-up.
+
+**A page in a background tab does not count.** The page stops polling while it is
+hidden, so the link drops about a minute after you switch away. This was found the
+hard way: during testing, an OBD page left open on another device kept the link
+up for 25&nbsp;minutes after the page under test had closed, and a browser still
+runs a background tab's timers roughly once a minute &mdash; often enough to keep a
+60-second timeout from ever running out. The log names the device that opened each
+link (`OBD: link opened for 192.168.15.x`), so a link nobody expects can be traced.
+
+While the link is held, the Debug page's scanner and connect test refuse, saying
+why &mdash; there is one radio.
+
+On connecting, the board resets the dongle (`ATZ`), sets the reply format the parser
+expects (`ATE0 ATL0 ATS1 ATH0`), selects automatic protocol search (`ATSP0`, the only
+one of these the dongle saves), then asks the car what it supports.
+
+### Ignition off
+
+The dongle stays powered &mdash; OBD pin&nbsp;16 is always live &mdash; but the car
+is not listening. The page says *Reader connected &mdash; the car is not answering*,
+and the board asks again every 15&nbsp;s, so turning the key to ON is picked up
+without touching the page. The engine does not have to run.
+
+### How the data is read
+
+One task owns the dongle and polls only what the open page shows: the four overview
+values on the Overview, one category's values on its own page. Fault codes are read
+when the codes page opens, again every minute while it stays open, or on **Read
+again**; vehicle details once per connection.
+
+The reply parsing lives in `obd_elm.cpp`, which has no Arduino dependencies, so it is
+tested on a PC against the reply shapes in the ELM327 datasheet and SAE J1979 &mdash;
+CAN and the older protocols, multi-frame VINs, several ECUs answering at once:
+
+```
+g++ -std=c++17 -Wall -Wextra -I esp32-s3/voltage_monitor \
+    esp32-s3/voltage_monitor/obd_elm.cpp esp32-s3/tests/test_obd_elm.cpp \
+    -o /tmp/test_obd_elm && /tmp/test_obd_elm
+```
+
+**Adding a value** is one row in `OBD_PIDS`, plus a formula case in `obdDecode()` if
+the formula is new. **Adding a page** is one row in `OBD_CATS`; its tab and its card
+on the Overview follow from the table.
+
+### API
+
+| Call | Does |
+|---|---|
+| `GET /obdjson` | Overview data; starts the link if a reader is set up, and keeps it alive |
+| `GET /obdjson?cat=<key>` | one category: `engine`, `fuel`, `electrical`, `trip`, `codes`, `vehicle` |
+| `GET /obdjson?cat=codes&refresh=1` | ...and re-read the fault codes now |
+| `POST /obdcfg?addr=<mac>&t=<public\|random>` | remember the reader |
+| `POST /obdcfg?forget=1` | forget it; an open link closes |
+| `GET /obdstate` | diagnostics: link state, idle time, poll count, last poller, task heartbeat and current step &mdash; **does not** keep the link alive |
+
+---
+
 ## 8. Roadmap / extensions
 
 - **Deep-sleep version:** wake every N minutes, read, push the value (HTTP POST or MQTT),

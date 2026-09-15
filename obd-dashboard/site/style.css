@@ -144,6 +144,8 @@ select {
   max-width: 280px;
 }
 
+#source { max-width: 360px; }
+
 .chip {
   border: 0;
   background: var(--surface);

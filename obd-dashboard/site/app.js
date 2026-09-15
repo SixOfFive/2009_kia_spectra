@@ -68,10 +68,12 @@
   const NUM = /^-?\d+(\.\d+)?$/;
 
   const tl = new Timeline($("tip"));
-  // A link can name the view: #range=7d, #range=all&gaps=0, #range=drive:3 (the 4th drive).
+  // A link can name the view: #range=7d, #range=all&gaps=0, #range=drive:3 (the 4th drive),
+  // #csv=obdlog_20260914_195210.csv&range=all (one kept board log instead of every row).
   const linked = new URLSearchParams(location.hash.slice(1));
   const state = {
     data: null, vehicle: null, status: null, zoom: null, tags: {}, chartSig: "", tableLimit: 200,
+    source: linked.get("csv") || "", pulled: [], pulledLoaded: false, fetching: false, pending: false,
     range: linked.get("range") || load("range") || "drive",
     compress: linked.has("gaps") ? linked.get("gaps") !== "0" : load("compress") !== "0",
   };
@@ -84,7 +86,8 @@
   function remember() {                            // this browser, and the address bar for sharing
     save("range", state.range);
     save("compress", state.compress ? "1" : "0");
-    history.replaceState(null, "", "#range=" + state.range + (state.compress ? "" : "&gaps=0"));
+    history.replaceState(null, "", "#" + (state.source ? "csv=" + encodeURIComponent(state.source) + "&" : "") +
+      "range=" + state.range + (state.compress ? "" : "&gaps=0"));
   }
 
   function el(tag, cls, text) {
@@ -572,6 +575,41 @@
     $("table-more").hidden = i1 - i0 <= state.tableLimit;
   }
 
+  // ---- which CSV ----------------------------------------------------------------------------
+
+  // "" is obdlog.csv, every row the VM holds; otherwise one board log kept in data/pulled/.
+  const sourcePath = () => (state.source ? "pulled/" + state.source : "obdlog.csv");
+
+  function stamp(s) {                              // "2026-09-14 19:52:10" -> ms, local time
+    const m = DT.exec(s || "");
+    return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() : NaN;
+  }
+
+  function renderSources() {
+    const sel = $("source");
+    const all = el("option", null, "All rows (obdlog.csv)");
+    all.value = "";
+    sel.replaceChildren(all);
+    for (const f of state.pulled.slice().reverse()) {
+      const a = stamp(f.first), b = stamp(f.last);
+      const sameDay = new Date(a).toDateString() === new Date(b).toDateString();
+      const o = el("option", null, fmtDay(a) + " " + fmtHM(a) + "–" + (sameDay ? "" : fmtDay(b) + " ") + fmtHM(b) +
+        " · " + Number(f.rows).toLocaleString() + " rows" + (f.cleared_ts ? "" : " · still on the board"));
+      o.value = f.file;
+      o.title = f.file + ", pulled " + fmtDateTime(f.pulled_ts * 1000);
+      sel.append(o);
+    }
+    if (state.source && state.pulledLoaded && !state.pulled.some((f) => f.file === state.source)) {
+      state.source = "";                            // not kept (any more): back to every row
+      state.pending = true;
+      remember();
+    }
+    sel.value = state.source;
+    const link = $("dl-csv");
+    link.href = "data/" + sourcePath();
+    link.textContent = state.source || "obdlog.csv";
+  }
+
   // ---- loading ------------------------------------------------------------------------------
 
   async function fetchChanged(name) {
@@ -590,12 +628,13 @@
     if (sig !== state.chartSig) { state.chartSig = sig; buildCharts(defs); }
     else for (const c of charts) for (const s of c.series) s.values = d.cols[s.key].num;
     renderDrives();
-    $("foot-parse").textContent = d.n.toLocaleString() + " rows, " + d.keys.length + " columns, read in " +
+    $("foot-parse").textContent = sourcePath() + ": " + d.n.toLocaleString() + " rows, " + d.keys.length + " columns, read in " +
       Math.max(1, Math.round(d.ms)) + " ms";
     $("tiles").hidden = !d.n;
     if (!d.n) {
       $("empty").hidden = false;
-      $("empty").textContent = "The log is empty so far. The board writes a row every 10 s while the engine runs, " +
+      $("empty").textContent = state.source ? "pulled/" + state.source + " has no readable rows." :
+        "The log is empty so far. The board writes a row every 10 s while the engine runs, " +
         "and the VM picks new rows up within a couple of minutes of the car being in WiFi range.";
     }
     renderCodes();
@@ -613,8 +652,11 @@
       state.error = null;
       const veh = await fetchChanged("vehicle.json").catch(() => null);
       if (veh) { state.vehicle = await veh.json(); renderVehicle(); renderCodes(); }
-      const csv = await fetchChanged("obdlog.csv");
-      if (csv) {
+      const idx = await fetchChanged("pulled/index.json").catch(() => null);
+      if (idx) { state.pulled = (await idx.json()).files || []; state.pulledLoaded = true; renderSources(); }
+      const path = sourcePath();
+      const csv = await fetchChanged(path);
+      if (csv && path === sourcePath()) {
         for (const c of charts) c.chart.host.parentElement.style.opacity = "0.6";
         setData(buildData(await csv.text()));
         for (const c of charts) c.chart.host.parentElement.style.opacity = "";
@@ -625,6 +667,7 @@
       state.fetching = false;
     }
     renderLive();
+    if (state.pending) { state.pending = false; refresh(); }   // the CSV was switched mid-fetch
   }
 
   // ---- wiring -------------------------------------------------------------------------------
@@ -651,6 +694,17 @@
     remember();
     tl.setCompress(state.compress);
   });
+  $("source").addEventListener("change", (e) => {
+    state.source = e.target.value;
+    state.range = "all";                            // a kept log is usually looked at whole
+    state.zoom = null;
+    delete state.tags[sourcePath()];                // load it even if unchanged since it was last shown
+    remember();
+    renderSources();
+    if (state.fetching) state.pending = true; else refresh();
+  });
+  $("dl-csv").href = "data/" + sourcePath();
+  $("dl-csv").textContent = state.source || "obdlog.csv";
   $("unzoom").addEventListener("click", () => { state.zoom = null; applyView(); });
   tl.on("zoom", (a, b) => { state.zoom = [a, b]; applyView(); });
   tl.on("unzoom", () => { if (state.zoom) { state.zoom = null; applyView(); } });

@@ -22,6 +22,10 @@ nothing.
 
 ## The page
 
+- **CSV:** *All rows* shows `obdlog.csv`, every row the VM holds. The list also offers
+  each kept board log from `pulled/`, newest first, marked while it is still on the board.
+  Picking one loads that file. Every graph, the drive list, the latest values, the text
+  states, the table and the download link then follow it, and the range resets to *All*.
 - **Range:** Last drive, 24 h, 7 days, 30 days, All, or any single drive from the
   *Drive* list. A drive is a run of rows with no silence longer than 5 minutes.
 - **Hide time between drives** (on by default) puts the drives in range side by side,
@@ -44,7 +48,8 @@ nothing.
   download, the log's size on the board and on the VM, and the firmware and uptime.
   From fw 4.80 it also shows the row interval and how long the last sweep took.
 - **Table** shows the rows in range, newest first, with every value the graphs draw.
-- **Links** can name a view: `#range=7d`, `#range=all&gaps=0`, `#range=drive:3`.
+- **Links** can name a view: `#range=7d`, `#range=all&gaps=0`, `#range=drive:3`, and
+  `#csv=obdlog_20260914_195210.csv&range=all` for one kept log.
 - The page re-reads `data/` every 30 s and redraws only when a file changed.
 
 ## Files in `data/`

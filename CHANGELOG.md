@@ -14,6 +14,40 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-15 — obd-dashboard: view one pulled CSV at a time
+
+### Added — a CSV list on the page
+
+- **The *CSV* list** starts the filter row. It offers *All rows (obdlog.csv)*, then each
+  kept board log from `data/pulled/`, newest first.
+  - Each log is labelled with its first and last row and its row count, for example
+    `14 Sep 19:52–19:56 · 10 rows`.
+  - A log is marked `still on the board` until the board's copy is cleared.
+- **Picking a log loads that file.** The graphs, drive list, latest values, text states,
+  table and download link all follow it, and the range resets to *All*. *All rows* goes
+  back to `obdlog.csv`.
+- **The choice is part of the link**, for example
+  `#csv=obdlog_20260914_195210.csv&range=all`.
+  - A file no longer listed falls back to *All rows*.
+  - Switching while a refresh is in flight fetches the new file right after it, instead of
+    dropping the switch.
+
+### Verified
+
+- **Preview with 334 synthetic rows in three kept logs:**
+  - The list showed the three logs newest first, with the uncleared one marked.
+  - Picking the oldest loaded its 154 rows and 3 drives. The download link and the address
+    switched to that file (`#csv=obdlog_20260912_074801.csv&range=all`).
+  - *All rows* brought back all 334 rows.
+  - A fresh browser opened on `#csv=obdlog_20260913_123000.csv&range=all` drew that file's
+    three drives.
+- **On the VM, rendered by headless Chrome:** the list offers *All rows* and the one real
+  kept log, `14 Sep 19:52–19:56 · 10 rows`. Opened on its `#csv=` link, the page loaded
+  just that file's 10 rows, and the download link pointed at
+  `pulled/obdlog_20260914_195210.csv`.
+
+---
+
 ## 2026-09-15 — obd-dashboard: each pull kept as its own file, and the board's log cleared
 
 ### Added — the board's log is cleared once the VM holds it

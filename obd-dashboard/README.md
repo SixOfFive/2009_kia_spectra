@@ -41,6 +41,7 @@ nothing.
   in the range.
 - **Board & pull** shows whether the board answers, the engine and link state, the last
   download, the log's size on the board and on the VM, and the firmware and uptime.
+  From fw 4.80 it also shows the row interval and how long the last sweep took.
 - **Table** shows the rows in range, newest first, with every value the graphs draw.
 - **Links** can name a view: `#range=7d`, `#range=all&gaps=0`, `#range=drive:3`.
 - The page re-reads `data/` every 30 s and redraws only when a file changed.
@@ -154,9 +155,10 @@ sites*. The page before that edit is `/var/www/html/index.html.bak-pre-vroom`.
 
 - **No login.** The page is open to the LAN like the other static sites on the VM. It
   shows the log, the VIN and fault codes. Nothing on it controls anything.
-- **The whole CSV is read in the browser.** At about 17 KB per hour of driving, that
-  stays fast for years. Splitting the archive by month would be the next step if it ever
-  is not.
+- **The whole CSV is read in the browser.** Since fw 4.80 writes a row every 10 s, that
+  is about 50 KB per hour of driving, roughly 20 MB for a year of an hour a day. That
+  still reads in about a second. Splitting the archive by month would be the next step
+  if it ever does not.
 - **Rows without a valid clock are not drawn.** These are rows dated before 2020, written
   before the board had the time. They stay in the CSV, and *Board & pull* counts them.
 - **Values from *Read codes & VIN now* with the engine off are not captured.** Single

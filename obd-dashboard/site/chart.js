@@ -4,7 +4,7 @@
  * time between drives is hidden, and the hovered row. A crosshair, a zoom or a range
  * change therefore moves every chart together.
  *
- * Rows come every 30 s while the engine runs and not at all otherwise, so a week is a
+ * Rows come every 10 s (30 s before fw 4.80) while the engine runs and not at all otherwise, so a week is a
  * few short drives separated by days of nothing. With the gaps hidden, each drive in
  * range gets width in proportion to its length and the drives sit side by side,
  * separated by a hairline; hovering still reports each reading's real date and time.

@@ -322,7 +322,7 @@ def read_json(path: Path) -> dict:
 # ---- one check --------------------------------------------------------------------------
 
 OBD_FIELDS = ("reader", "link", "engine", "since", "elm", "proto_name", "atrv", "board_v", "mil", "dtc")
-LOG_FIELDS = ("en", "bytes", "rows", "last")
+LOG_FIELDS = ("en", "bytes", "rows", "last", "every_s", "sweep_ms")   # the last two since fw 4.80
 # /json also carries the WiFi network's name and the access point's address. The data
 # folder is served to the LAN, so only these are kept.
 BOARD_FIELDS = ("fw", "build", "uptime_s", "rssi", "vbatt", "time_ok", "as_en", "as_state", "last_run")

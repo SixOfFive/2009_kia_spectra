@@ -115,6 +115,10 @@
     return h < 48 ? h + " h " + String(m % 60).padStart(2, "0") + " min" : Math.round(h / 24) + " days";
   }
 
+  // A run of n rows lasts one row interval longer than the time between its end rows. The
+  // interval is the run's own average: rows came every 30 s before fw 4.80, 10 s since.
+  function spanMs(a, b, n) { return n > 1 ? ((b - a) * n) / (n - 1) : 0; }
+
   function ago(ts) {                               // ts in seconds
     if (!ts) return "never";
     const s = Date.now() / 1000 - ts;
@@ -347,7 +351,7 @@
     tl.segs.map((s, k) => [s, k]).reverse().forEach(([s, k]) => {
       const a = T[s.i0], b = T[s.i1 - 1];
       const o = el("option", null, fmtDateTime(a).slice(0, 15) + "  " + fmtHM(a) + "–" + fmtHM(b) +
-        "  (" + (s.i1 - s.i0 > 1 ? fmtDur(b - a + 30e3) : "1 row") + ")");
+        "  (" + (s.i1 - s.i0 > 1 ? fmtDur(spanMs(a, b, s.i1 - s.i0)) : "1 row") + ")");
       o.value = "drive:" + k;
       sel.append(o);
     });
@@ -404,7 +408,7 @@
         const tr = el("tr");
         tr.append(el("td", null, s.value), el("td", "num", fmtDateTime(s.t0).slice(4)),
                   el("td", "num", fmtHM(s.t1) + ":" + String(new Date(s.t1).getSeconds()).padStart(2, "0")),
-                  el("td", "num", s.rows > 1 ? fmtDur(s.t1 - s.t0 + 30e3) : "1 row"));
+                  el("td", "num", s.rows > 1 ? fmtDur(spanMs(s.t0, s.t1, s.rows)) : "1 row"));
         table.append(tr);
       }
       host.append(table);
@@ -496,7 +500,12 @@
     }
     if (pull.error) row("Download problem", statusEl("warning", pull.error));
     if (s.pull_note) row("Puller", s.pull_note);
-    if (log.bytes !== undefined) row("Log on the board", fmtBytes(log.bytes), el("span", "when", log.en ? "logging on" : "logging off"));
+    if (log.bytes !== undefined) {
+      row("Log on the board", fmtBytes(log.bytes),
+          el("span", "when", (log.en ? "logging on" : "logging off") +
+             (log.every_s ? " · a row every " + log.every_s + " s" : "") +
+             (log.sweep_ms ? " · last sweep " + (log.sweep_ms / 1000).toFixed(1) + " s" : "")));
+    }
     if (arch.rows !== undefined) {
       row("Kept on the VM", arch.rows.toLocaleString() + " rows",
           el("span", "when", (arch.first ? arch.first + " → " + arch.last + " · " : "") + fmtBytes(arch.bytes)));
@@ -580,7 +589,7 @@
     $("tiles").hidden = !d.n;
     if (!d.n) {
       $("empty").hidden = false;
-      $("empty").textContent = "The log is empty so far. The board writes a row every 30 s while the engine runs, " +
+      $("empty").textContent = "The log is empty so far. The board writes a row every 10 s while the engine runs, " +
         "and the VM picks new rows up within a couple of minutes of the car being in WiFi range.";
     }
     renderCodes();

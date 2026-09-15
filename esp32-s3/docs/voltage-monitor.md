@@ -656,7 +656,7 @@ loop. If the engine starts mid-read, the link simply carries on as the drive's l
 
 While the engine runs, one task owns the dongle and polls only what the open page
 shows: the four overview values on the Overview, one category's values on its own page
-&mdash; plus RPM on every pass and the log's sweep every 30&nbsp;s. Fault codes are read
+&mdash; plus RPM on every pass and the log's sweep every 10&nbsp;s. Fault codes are read
 when the codes page opens, again every minute while it stays open, or on **Read
 again**; vehicle details once per connection.
 
@@ -677,7 +677,8 @@ on the Overview follow from the table.
 ### The OBD log
 
 With **logging on**, which is the default, the board writes a row to `/obdlog.csv`
-every 30&nbsp;s while the car answers. The first column is local date and time.
+every 10&nbsp;s while the car answers (every 30&nbsp;s before fw&nbsp;4.80). The first column
+is local date and time.
 Then comes one column per value **the car reports**, with the unit in the name
 (`coolant_C`, `speed_kmh`, `rpm`), then the dongle's supply, the board's battery
 reading, the check-engine light and the stored-code count. Since fw&nbsp;4.78 the car's
@@ -698,6 +699,15 @@ downloads the whole log as one CSV, and clears it. Two generations of about
 512&nbsp;KB each are kept; when the newer fills, the older is dropped. Rows are built
 by the Bluetooth task in RAM and written by the loop core along with every other file
 write, never while an OTA upload is streaming.
+
+**A row every 10&nbsp;s since fw&nbsp;4.80.** At about 140&nbsp;B a row and 360 rows an
+hour, a generation holds about 10 hours of engine running; the projects VM keeps the
+rows for good (`obd-dashboard/`). A row carries what its sweep read, or what was read in
+the last 10&nbsp;s, whichever reaches further back, so a sweep slowed by PIDs that time
+out (4&nbsp;s each) cannot blank the values it read first. `/obdstate` reports how long
+the last sweep took (`sweep_ms`) and the longest since boot (`sweep_max_ms`): a sweep
+close to 10&nbsp;s means rows run back to back. Up to 12 rows wait in RAM for the loop
+core, 2 minutes of driving, as 4 rows were at 30&nbsp;s.
 
 ### Engine start and stop from the ECU
 
@@ -732,13 +742,13 @@ on the fire path reads the run state that OBD now helps decide.
 
 | Call | Does |
 |---|---|
-| `GET /obdjson` | Overview data, plus `engine` (`running` / `off`); never opens or holds the link (4.77) |
+| `GET /obdjson` | Overview data, plus `engine` (`running` / `off`); never opens or holds the link (4.77). `log` carries `every_s`, the row interval, and `sweep_ms`, the last sweep's length (4.80) |
 | `GET /obdjson?cat=<key>` | one category: `engine`, `fuel`, `electrical`, `trip`, `codes`, `vehicle` |
 | `GET /obdjson?cat=codes&refresh=1` | ...and re-read the fault codes now |
 | `POST /obdcfg?addr=<mac>&t=<public\|random>` | remember the reader |
 | `POST /obdcfg?forget=1` | forget it; an open link closes |
 | `POST /obdnow` | Read codes &amp; VIN now: with the engine off, connect once, read codes and vehicle details, disconnect (409 with a reason if it cannot) |
-| `GET /obdstate` | diagnostics: link state, idle time, poll count, last poller, task heartbeat and current step &mdash; **does not** keep the link alive |
+| `GET /obdstate` | diagnostics: link state, idle time, poll count, last poller, task heartbeat and current step, and the log sweep's last and longest length `sweep_ms` / `sweep_max_ms` (4.80) &mdash; **does not** keep the link alive |
 
 ---
 

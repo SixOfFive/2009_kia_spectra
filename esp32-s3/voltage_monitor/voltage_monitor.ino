@@ -119,7 +119,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.79";
+const char* FW_VERSION = "4.80";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -351,7 +351,8 @@ const uint32_t BT_COOLDOWN_MS = 5000;
 // into PSRAM as well -- a setup the core does not support. It bought ~25 KB of
 // headroom, which is not worth running lwIP in an unsupported configuration. Leave it
 // at 4096. (An OTA under it rebooted reset=PANIC, but so did a later one on 4096: that
-// panic follows btYieldForOta()'s stack teardown, not this threshold. See /coredump.)
+// panic is core 0's 1024 B IPC task overflowing during the boot-time Bluetooth bring-up
+// on the first boot after an OTA -- the 4.79 core dump shows it -- not this threshold.)
 // Free heap is not the binding constraint -- CONTIGUITY is. The stack wants
 // sizeable blocks, and HTTP traffic fragments the heap with String churn, so a
 // board reporting 170 KB free can still fail to place a 70 KB stack. Gate on the
@@ -4228,7 +4229,7 @@ function overview(d){
 }
 function logCard(d){
   var L=d.log||{}, live=d.link==="live";
-  var state=!L.en?"off":(live?"recording a row every 30 s":"on \u2014 records whenever the car answers");
+  var state=!L.en?"off":(live?"recording a row every "+(L.every_s||10)+" s":"on \u2014 records whenever the car answers");
   return "<div class=\"clbl\">OBD log</div><div class=\"card\"><div class=\"pwrrow\"><div style=\"flex:1;min-width:220px\">"
     +"<div class=\"k\">Logging</div><div class=\"v\" style=\"font-size:15px;color:"+(!L.en?"#8b949e":(live?"#3fb950":"#e6edf3"))+"\">"+state+"</div>"
     +"<div class=\"sv\" style=\"white-space:normal\">"+(L.bytes?Math.max(1,Math.round(L.bytes/1024))+" KB stored":"nothing stored yet")
@@ -4236,7 +4237,7 @@ function logCard(d){
     +"<div style=\"text-align:right\"><button class=\"seg\" id=\"logtog\">"+(L.en?"Turn off":"Turn on")+"</button> "
     +"<a href=\"/obdlog.csv\" style=\"margin:0 6px\">Download CSV</a>"
     +"<button class=\"seg\" id=\"logclr\""+(L.bytes?"":" disabled")+">Clear</button></div></div>"
-    +"<div class=\"note\">A row every 30 s while the car answers, date and time first; nothing is written while it is off. Only the values this car reports get a column. "
+    +"<div class=\"note\">A row every "+(L.every_s||10)+" s while the car answers, date and time first; nothing is written while it is off. Only the values this car reports get a column. "
     +"The board connects to the reader by itself when it sees the engine running and holds the link for the drive, logging on or off. "
     +"Two generations of about 512 KB are kept.</div></div>";
 }
@@ -5514,9 +5515,9 @@ static IPAddress         g_obdPoller;                // who polled last
 static volatile uint32_t g_obdBeat  = 0;             // session loop passes (for /obdstate)
 static char              g_obdStage[16] = "idle";    // the command or step the session is on
 // ---- OBD log and the ECU's view of the engine (fw 4.75) ----
-const uint32_t OBD_LOG_EVERY_MS = 30000;              // one row per 30 s while the car answers
+const uint32_t OBD_LOG_EVERY_MS = 10000;              // one row per 10 s while the car answers (30 s before fw 4.80)
 const uint32_t OBD_ENG_FRESH_MS = 15000;              // an ECU view older than this is not used
-const int      OBD_LOGQ_N       = 4;
+const int      OBD_LOGQ_N       = 12;                 // rows awaiting the loop core: 2 min at 10 s, as 4 was at 30 s
 struct ObdLogRow {
   uint32_t ts;                                        // unix epoch of the row
   float    v[OBD_MAX_PIDS];                           // indexed like OBD_PIDS
@@ -5532,6 +5533,8 @@ static int          g_obdLogHead = 0, g_obdLogTail = 0;
 static portMUX_TYPE g_obdLogMux  = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t g_obdLogRows   = 0;          // rows written since boot
 static volatile uint32_t g_obdLogLastTs = 0;          // epoch of the newest row written
+static volatile uint32_t g_obdSweepMs    = 0;         // fw 4.80: how long the last log sweep took ...
+static volatile uint32_t g_obdSweepMaxMs = 0;         // ... and the longest since boot
 static uint32_t     g_obdLogBytes = 0;                // both generations on flash
 static ObdEngine    g_obdEng;                         // written by the OBD task ...
 static portMUX_TYPE g_obdEngMux  = portMUX_INITIALIZER_UNLOCKED;   // ... read by the safety task
@@ -5742,18 +5745,21 @@ static void obdEngSilent() {
   portEXIT_CRITICAL(&g_obdEngMux);
 }
 
-// Queue one log row from what the car reported in the last OBD_LOG_EVERY_MS. RAM
-// only: the loop core writes it (flushObdLogToFlash). A pass with nothing fresh from
-// the car queues nothing, which is what keeps a car that is off out of the log.
-static void obdLogQueueRow() {
+// Queue one log row from what the car reported during this sweep, or in the last
+// OBD_LOG_EVERY_MS. RAM only: the loop core writes it (flushObdLogToFlash). A pass with
+// nothing fresh from the car queues nothing, which is what keeps a car that is off out of
+// the log. fw 4.80: the window is never shorter than the sweep itself -- at 10 s rows, a
+// sweep slowed by PIDs that time out (4 s each) must not blank the values it read first.
+static void obdLogQueueRow(uint32_t sweepStart) {
   if (!timeIsValid()) return;                    // a row with no date is not worth keeping
   ObdLogRow row;
   memset(&row, 0, sizeof(row));
   row.ts = (uint32_t)time(nullptr);
   uint32_t now = millis();
+  uint32_t fresh = now - sweepStart > OBD_LOG_EVERY_MS ? now - sweepStart : OBD_LOG_EVERY_MS;
   portENTER_CRITICAL(&g_obdMux);
   for (int i = 0; i < OBD_PID_COUNT && i < OBD_MAX_PIDS; i++)
-    if (g_obd.val[i].state == 1 && now - g_obd.val[i].atMs <= OBD_LOG_EVERY_MS) {
+    if (g_obd.val[i].state == 1 && now - g_obd.val[i].atMs <= fresh) {
       row.v[i] = g_obd.val[i].v;
       row.have |= 1ULL << i;
     }
@@ -5952,7 +5958,9 @@ static void obdSession(const char* addr, uint8_t type) {
       if (answered && g_obdLogEn && timeIsValid() && (lastLog == 0 || millis() - lastLog >= OBD_LOG_EVERY_MS)) {
         lastLog = millis();                        // one sweep of every logged value, then a row
         obdReadMonitor(cl, tx, wr, r, sizeof(r));
-        if (obdPollValues(cl, tx, wr, OBD_WANT_LOG, r, sizeof(r)) > 0) obdLogQueueRow();
+        if (obdPollValues(cl, tx, wr, OBD_WANT_LOG, r, sizeof(r)) > 0) obdLogQueueRow(lastLog);
+        g_obdSweepMs = millis() - lastLog;         // fw 4.80: near OBD_LOG_EVERY_MS, rows run back to back
+        if (g_obdSweepMs > g_obdSweepMaxMs) g_obdSweepMaxMs = g_obdSweepMs;
       }
       int got = answered ? obdPollValues(cl, tx, wr, want, r, sizeof(r)) : 0;
       if (got == 0) obdEngSilent();
@@ -6079,6 +6087,8 @@ void handleObdJson() {
   o += ",\"bytes\":";         o += g_obdLogBytes;
   o += ",\"rows\":";          o += (uint32_t)g_obdLogRows;
   o += ",\"last\":";          o += (uint32_t)g_obdLogLastTs;
+  o += ",\"every_s\":";       o += (uint32_t)(OBD_LOG_EVERY_MS / 1000);   // fw 4.80
+  o += ",\"sweep_ms\":";      o += (uint32_t)g_obdSweepMs;
   o += "}";
   if (s.monKnown) {
     o += ",\"mil\":";          o += (s.mon[0] & 0x80) ? "true" : "false";
@@ -6331,15 +6341,17 @@ void handleObdState() {
   portENTER_CRITICAL(&g_obdMux);
   link = g_obd.link;
   portEXIT_CRITICAL(&g_obdMux);
-  char b[320];
+  char b[400];
   snprintf(b, sizeof(b),
            "{\"alive\":%s,\"link\":\"%s\",\"idle_ms\":%lu,\"polls\":%lu,\"poller\":\"%s\",\"beat\":%lu,"
-           "\"stage\":\"%s\",\"want\":%d,\"heap\":%lu,\"block\":%lu,\"bt_up\":%s}",
+           "\"stage\":\"%s\",\"want\":%d,\"heap\":%lu,\"block\":%lu,\"bt_up\":%s,"
+           "\"sweep_ms\":%lu,\"sweep_max_ms\":%lu}",
            g_obdAlive ? "true" : "false",
            (link >= OBD_OFF && link <= OBD_FAILED) ? OBD_LINK_NAMES[link] : "?",
            (unsigned long)(millis() - g_obdLastPoll), (unsigned long)g_obdPolls,
            g_obdPoller.toString().c_str(), (unsigned long)g_obdBeat, g_obdStage, (int)g_obdWant,
-           (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), g_btUp ? "true" : "false");
+           (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), g_btUp ? "true" : "false",
+           (unsigned long)g_obdSweepMs, (unsigned long)g_obdSweepMaxMs);
   g_out_total += strlen(b);
   server.send(200, "application/json", b);
 }
@@ -6381,7 +6393,8 @@ void handleObdCfg() {
 }
 
 // ---------------------------------------------------------------------------
-// OBD log (fw 4.75) -- a CSV row every 30 s while the car answers.
+// OBD log (fw 4.75) -- a CSV row every OBD_LOG_EVERY_MS while the car answers (10 s since
+// fw 4.80, 30 s before).
 //
 // Rows are built by the OBD task in RAM and written here, on the loop core, with
 // every other filesystem write: never from the BLE task, never while an OTA

@@ -14,6 +14,64 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-15 — fw 4.80: the OBD log takes a row every 10 s
+
+### Changed — a row every 10 s instead of 30 s
+
+The board now polls and logs the OBD values every 10 s instead of 30 s
+(`OBD_LOG_EVERY_MS` 30000 → 10000). Each sweep reads every logged PID and then queues a
+row.
+
+- **About three times the log.** At about 140 B a row, that is roughly 50 KB per hour of
+  engine running. A 512 KB generation now holds about 10 hours instead of 30. The
+  projects VM keeps every row (`obd-dashboard/`).
+- **The row queue holds 12 rows instead of 4.** Rows can still wait 2 minutes for the loop
+  core, as 4 rows could at 30 s. The loop core holds off while an OTA streams.
+- **A row's freshness window is never shorter than its sweep.** A row carried the values
+  read within the last `OBD_LOG_EVERY_MS`. At 30 s that covered any sweep. At 10 s, a
+  sweep slowed by PIDs that time out (4 s each) would have blanked the values it read
+  first. The window is now the longer of 10 s and the sweep's own length.
+- **The Overview's OBD log card** takes the interval from the board instead of saying
+  "30 s".
+
+### Added — how long a sweep takes
+
+- **`/obdstate`** reports `sweep_ms`, the last sweep, and `sweep_max_ms`, the longest since
+  boot. A sweep close to 10 s means rows run back to back.
+- **`/obdjson`**'s `log` carries `every_s` (10) and `sweep_ms`.
+
+### Fixed — a source comment still blamed the OTA teardown for the restart panic
+
+The NOT DONE note at the heap threshold now says what the 4.79 core dump showed: core 0's
+1024 B IPC task overflowing during the boot-time Bluetooth bring-up.
+
+### Changed — obd-dashboard follows
+
+- **The page** says 10 s. It works out a drive's length from its own rows, which are
+  30 s apart before 4.80 and 10 s since. *Board & pull* shows the row interval and the
+  last sweep.
+- **The puller** keeps `every_s` and `sweep_ms`.
+
+### Verified
+
+- **Build:** clean, 1,616,711 B (9 %) of program storage, 71,464 B (21 %) of globals.
+- **OTA 4.79 → 4.80 from MOBILE:** the upload was accepted (1,616,864 B). The board
+  restarted `reset=software`, with no boot panic this time. It came back on `4.80`
+  (`Sep 15 2026 09:44:14`) with the Bluetooth stack placed at boot.
+- **New fields:** `/obdjson`'s `log` reports `every_s: 10` and `sweep_ms: 0`. `/obdstate`
+  reports `sweep_ms` and `sweep_max_ms`, both 0 with no drive since boot.
+- **No new crash:** `/coredump?info=1` still holds only the fw 4.78 dump.
+- **Not verified:** a 10 s sweep on the car. That covers how long it takes
+  (`sweep_max_ms`), rows landing 10 s apart, and no cells blanked by the freshness window.
+  It needs the engine running.
+
+### To undo
+
+Flash 4.79. Nothing new is stored. Rows already written 10 s apart stay that way in the
+log and on the VM.
+
+---
+
 ## 2026-09-15 — OBD-II log dashboard on the projects VM
 
 ### Added — a page that graphs the car's OBD log, with the log kept on the projects VM

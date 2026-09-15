@@ -449,6 +449,15 @@ int obdLogColumns(int* cols, int max) {
   return n;
 }
 
+int obdLogColumnsFor(const uint32_t* sup, int* cols, int max) {
+  const int vehicle = obdCatIndex("vehicle");
+  int n = 0;
+  for (int i = 0; i < OBD_PID_COUNT && n < max; i++)
+    if (OBD_PIDS[i].cat != vehicle && (!sup || obdIsSupported(sup, OBD_PIDS[i].pid)))
+      cols[n++] = i;
+  return n;
+}
+
 void obdCsvHeaderCell(const ObdPid& p, char* out, size_t cap) {
   // Spreadsheets and scripts both cope better with plain ASCII column names, and a
   // unit that only repeats the key ("rpm") adds nothing.

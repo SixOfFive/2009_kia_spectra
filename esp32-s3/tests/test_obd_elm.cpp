@@ -302,6 +302,20 @@ static void testCsv() {
   CHECK(n == expect && n > 0);
   for (int c = 0; c < n; c++) CHECK(OBD_PIDS[cols[c]].cat != vehicle);
 
+  // fw 4.78: obdLogColumnsFor keeps only what the car reports. A map with just PIDs 05
+  // (coolant) and 0C (rpm) logs exactly those, in table order; nullptr logs everything.
+  {
+    uint32_t sup[4] = {0, 0, 0, 0};
+    CHECK(obdParseSupported("41 00 08 10 00 00", 0x00, sup));
+    CHECK(obdIsSupported(sup, 0x05) && obdIsSupported(sup, 0x0C) && !obdIsSupported(sup, 0x0D));
+    int cf[64];
+    int nf = obdLogColumnsFor(sup, cf, 64);
+    CHECK(nf == 2);
+    CHECK(nf == 2 && OBD_PIDS[cf[0]].pid == 0x0C && OBD_PIDS[cf[1]].pid == 0x05);
+    CHECK(obdLogColumnsFor(nullptr, cf, 64) == n);
+    CHECK(obdLogColumnsFor(sup, cf, 1) == 1);                    // never writes past max
+  }
+
   // Every header cell and every enum text that lands in a cell is CSV-safe.
   for (int c = 0; c < n; c++) {
     obdCsvHeaderCell(OBD_PIDS[cols[c]], cell, sizeof(cell));

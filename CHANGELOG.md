@@ -14,6 +14,82 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-14 — fw 4.78: runs credited to the right source and dated by the ECU; the log keeps only what the car reports
+
+### Fixed — runs the board started were logged as external, with a phantom start
+
+This showed up on the first remote start (19:51).
+
+- **Why:** "start VERIFIED" clears `g_verifying` on the first charging sample, but the ON edge only confirms `AS_RUN_ON_S` (5 s) later. So every run the board started was logged with source *external*. On top of that, `recordStart(v, 2, true)` added a phantom external start that printed as "ENGINE START (manual)". Run records back to August show the same pattern: a CMD with source 0 or 1, then an ON with source 2.
+- **Fix:** a start the board verified within the last `AS_VERIFY_S` stays the source of the ON edge that follows (`g_verifiedSrc`).
+- **External starts:** the external start record is now written only for a truly external start. Its log line reads "ENGINE START (external: key or FOB)".
+- History from before 4.78 is not rewritten.
+
+### Fixed — a Start pressed to stop the engine was logged as a failed start
+
+A Compustar start sent to a running engine switches it off. Before this fix, that press was logged as a start that ended "manual start UNVERIFIED: no charging after 180s".
+
+- **Dashboard Start with the engine confirmed running:** it logs `ENGINE STOP sent (manual)` and writes a CMD record flagged `RUN_F_STOPCMD` (0x10). It creates no start record and starts no verification.
+- **Engine off within 2 min:** that OFF edge is credited to the dashboard (source manual). The Logs page shows *Stop sent*, and the run reads "ran Xm · stopped from the dashboard".
+- **Limitation:** in the seconds before voltage confirms a start, a press still counts as a start. The board cannot tell a stop from a retry at that point.
+
+### Changed — the ECU dates a run's start
+
+On this car, voltage confirmed the start about 42 s late (the battery took that long to climb from 12.65 V to 13.2 V).
+
+- **What moves:** once the OBD link is up and PID 1F puts the start earlier, the board moves the run's start there. That covers the run length, `last_run`, and the ON record on flash, which gains the OBD badge.
+- **How:** run records are fixed-size, so the loop core rewrites that one record in place (`fixRunStartOnFlash`).
+- **Limits:** once per run, at most 30 min back, and never before the previous stop.
+- **Log line:** `ENGINE ON: the ECU dates this start N s earlier than voltage did`.
+- The fire decision reads none of this.
+
+### Changed — the OBD log and pages leave out what the car does not report
+
+- **Log columns** follow the car's own PID map (`obdLogColumnsFor`, host-tested). This Spectra's map marks manifold pressure, oil temperature, upstream O2 voltage and fuel pressure as unsupported. Those four columns are gone, giving 26 columns instead of 30.
+- **Column changes:** a row whose columns differ from the current file's header starts a new file generation, so no row ever sits under the wrong names. The first 4.78 row rotates today's 30-column file to `/obdlog.old`.
+- **OBD pages:** cards for values the car does not report are hidden.
+
+### Verified
+
+Car off, build `Sep 14 2026 20:15:13`.
+
+- Host tests: 646 checks, 0 failed (6 new ones cover `obdLogColumnsFor`). The OBD, Debug
+  and Logs page scripts pass `node --check`.
+- The board boots 4.78 with the stack placed at boot (159 KB before, 91 KB after), no
+  OBD link and WiFi power-save still off. `/runs` serves all 107 records. The OBD log
+  keeps its 30-column file until the first 4.78 row.
+- The car's PID map, still in RAM from the 19:52 run, marks exactly the four empty
+  columns as unsupported: `map`, `oil`, `o2s1` and `fuelpres` are all state 3. Filtering
+  by it drops those four and nothing the car reports.
+
+### Not verified
+
+- **Everything that needs the engine running.** That covers:
+  - a run the board starts being logged as manual or auto, with no phantom start;
+  - a stop press logged as *Stop sent*, with the OFF credited to the dashboard;
+  - the start re-dated from PID 1F on flash;
+  - the first 26-column row rotating the log.
+
+  One remote start followed by a stop press exercises all of it.
+- **The restart after the 4.77 → 4.78 OTA came up `reset=PANIC/exception`.** The image
+  was accepted and 4.78 boots normally, so the update itself worked. There have been six
+  OTAs since 4.76 began taking the Bluetooth stack down at upload start:
+  - The two panics (18:16 and 20:17) both took the stack down at upload start.
+  - Two other uploads did the same and restarted cleanly.
+  - The upload where the stack was already down and the one where it came down mid-upload
+    also restarted cleanly.
+
+  This corrects the 4.76 entry, which attributed the panic to the teardown combined with
+  the PSRAM threshold: the 20:17 panic happened on the default threshold. The cause is
+  still unexplained. The source comment at the old threshold constant still carries the
+  4.76 wording and is corrected with the next firmware change.
+
+### To undo
+
+Flash 4.77 (`git revert` this commit and rebuild). No NVS keys or files were added. Any ON records that 4.78 re-dated keep their new time.
+
+---
+
 ## 2026-09-14 — fw 4.77: the reader is left alone unless the engine runs, with a Read-now override
 
 ### Changed — no OBD link unless the engine runs

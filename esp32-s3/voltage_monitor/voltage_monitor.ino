@@ -117,7 +117,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.77";
+const char* FW_VERSION = "4.78";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -442,6 +442,7 @@ const uint8_t  RUN_F_TX_OK    = 0x01;         // the CC1101 accepted the burst
 const uint8_t  RUN_F_BACKFILL = 0x80;         // reconstructed, NOT recorded live
 const uint8_t  RUN_F_RECON    = 0x40;         // edge inferred at boot, timestamp is an estimate
 const uint8_t  RUN_F_OBD      = 0x20;         // edge timed by the engine computer over OBD, not by voltage
+const uint8_t  RUN_F_STOPCMD  = 0x10;         // fw 4.78: a CMD record that was a stop (Start sent to a running engine)
 const char*    RUN_FILE = "/runs.bin";
 const char*    RUN_OLD  = "/runs.old";
 const uint32_t RUN_MAGIC = 0x52554E31;        // "RUN1"
@@ -1032,6 +1033,13 @@ bool      g_verifying   = false;           // waiting to see the alternator come
 uint32_t  g_verifyMs    = 0;               // millis() when verification started
 int       g_pendingIdx  = -1;              // index of the start event awaiting verification
 bool      g_verifyAuto  = false;           // was the pending start automatic? (only those can lock out)
+// fw 4.78: run attribution and dating.
+int8_t    g_verifiedSrc = -1;              // source of a start the board verified; the ON edge that follows is its
+uint32_t  g_verifiedMs  = 0;               // millis() of that verification
+volatile uint32_t g_stopCmdMs = 0;         // millis() a Start was sent to a running engine (a stop)
+bool      g_runStartDated = false;         // this run's ON time already comes from the ECU
+uint32_t  g_lastOffTs   = 0;               // wall clock of the last OFF edge; no start is dated before it
+const uint32_t OBD_BACKDATE_MAX_S = 1800;  // PID 1F may move a run's start back by at most this
 uint32_t  g_win24Ms     = 0;               // millis() at the start of the rolling 24 h window
 uint8_t   g_fires24     = 0;               // auto-starts fired in that window (informational)
 int       g_as_max24    = AS_DEF_MAX24;    // cap per 24 h; <= 0 = unlimited  NVS "as_max24"
@@ -1829,6 +1837,37 @@ void flushRunsToFlash() {
   }
 }
 
+// fw 4.78: the safety task asks for a run's ON record to be re-dated when the ECU's
+// run-time counter puts the start earlier than voltage did (see evalAutoStart). Records
+// are fixed-size, so the loop rewrites that one record in place. LOOP CORE ONLY.
+static volatile uint32_t g_runFixOldTs = 0, g_runFixNewTs = 0;   // guarded by g_runqMux
+void fixRunStartOnFlash() {
+  uint32_t oldTs, newTs;
+  portENTER_CRITICAL(&g_runqMux);
+  oldTs = g_runFixOldTs; newTs = g_runFixNewTs; g_runFixOldTs = 0;
+  portEXIT_CRITICAL(&g_runqMux);
+  if (!oldTs) return;
+  flushRunsToFlash();                              // the ON record has to be on flash first
+  bool done = false;
+  File f = LittleFS.open(RUN_FILE, "r+");
+  if (f && f.size() >= 8 + sizeof(RunEvent)) {
+    size_t n = (f.size() - 8) / sizeof(RunEvent);
+    for (size_t k = 0; k < n && k < 8 && !done; k++) {   // the newest few records
+      size_t off = 8 + (n - 1 - k) * sizeof(RunEvent);
+      RunEvent e;
+      if (!f.seek(off) || f.read((uint8_t*)&e, sizeof(e)) != sizeof(e)) break;
+      if (e.kind == RUN_ON && e.ts == oldTs) {
+        e.ts = newTs;
+        e.flags |= RUN_F_OBD;
+        done = f.seek(off) && f.write((uint8_t*)&e, sizeof(e)) == sizeof(e);
+      }
+    }
+  }
+  if (f) f.close();
+  if (done) { g_fsBytes += sizeof(RunEvent); g_fsCommits++; }
+  else logLine("run log: could not re-date the ON record at %lu", (unsigned long)oldTs);
+}
+
 // Close a run that was left open by a reboot. LOOP CORE ONLY (touches LittleFS).
 //
 // engRunning used to be a plain function-static, so it zeroed on every boot. Two
@@ -2176,8 +2215,11 @@ int recordStart(float v, uint8_t src, bool ok) {
   g_startHead = (g_startHead + 1) % START_N;
   if (g_startCount < START_N) g_startCount++;
   saveStarts();                                 // write through -- don't risk losing it
-  logLine("ENGINE START (%s) at %.2f V, tx=%s",
-          src ? "manual" : "AUTO", v, ok ? "ok" : "FAILED");
+  if (src == 2)                                 // fw 4.78: this used to print as "manual"
+    logLine("ENGINE START (external: key or FOB) at %.2f V", v);
+  else
+    logLine("ENGINE START (%s) at %.2f V, tx=%s",
+            src ? "manual" : "AUTO", v, ok ? "ok" : "FAILED");
   return idx;
 }
 
@@ -2297,6 +2339,7 @@ void evalAutoStart(float v) {
 
   if (nowRun && !engRunning) {
     engOnMs     = edgeMs;
+    g_runStartDated = (runFlags != 0);            // fw 4.78: an ECU-timed ON edge is dated already
     g_lastRunTs = edgeTs;
     if (g_lastRunTs) prefs.putUInt("last_run", g_lastRunTs);
     cdMaybeFlush(now, true);
@@ -2304,13 +2347,21 @@ void evalAutoStart(float v) {
     // Attribute the run: a start we are verifying is ours, anything else is the
     // key or the FOB. This is what makes "time between manual and auto starts"
     // answerable months later.
-    runLogAt(edgeTs, RUN_ON, g_verifying ? (g_verifyAuto ? RSRC_AUTO : RSRC_MANUAL) : RSRC_EXT, v, 0, runFlags);
+    // fw 4.78: "start VERIFIED" fires on the first charging sample and clears g_verifying,
+    // while this edge confirms AS_RUN_ON_S later -- so a start the board sent and verified
+    // is still this run's source. Before 4.78 every such run was logged as external, and a
+    // phantom external start record was added below.
+    bool ours = g_verifying || (g_verifiedSrc >= 0 && now - g_verifiedMs <= AS_VERIFY_S * 1000UL);
+    uint8_t onSrc = g_verifying ? (g_verifyAuto ? RSRC_AUTO : RSRC_MANUAL)
+                  : ours ? (uint8_t)g_verifiedSrc : RSRC_EXT;
+    g_verifiedSrc = -1;
+    runLogAt(edgeTs, RUN_ON, onSrc, v, 0, runFlags);
     g_sbFlush = true;                             // don't strand the transition in RAM
     // The engine is running but WE did not ask for it -- key, FOB or someone
     // else. Record it in the start history so the log is a complete account of
-    // every run, not just board-fired ones. Guarded on g_verifying so a start
+    // every run, not just board-fired ones. Guarded on `ours` (fw 4.78) so a start
     // the board DID fire is not double-counted here.
-    if (!g_verifying) {
+    if (!ours) {
       recordStart(v, 2, true);                    // src 2 = external
       if (g_startCount) {                         // it is confirmed by definition
         int i = (g_startHead - 1 + START_N) % START_N;
@@ -2328,7 +2379,12 @@ void evalAutoStart(float v) {
     logLine(runFlags ? "ENGINE OFF: the ECU reports it stopped (%.2f V) after %lum %lus"
                      : "ENGINE OFF: charging ended at %.2f V after %lum %lus",
             v, (unsigned long)(ran / 60), (unsigned long)(ran % 60));
-    runLogAt(edgeTs, RUN_OFF, RSRC_EXT, v, ran, runFlags);
+    // fw 4.78: a Start the board sent to the running engine in the last 2 min is what
+    // stopped it (a Compustar start to a running engine switches it off).
+    uint8_t offSrc = (g_stopCmdMs && now - g_stopCmdMs <= 120000UL) ? RSRC_MANUAL : RSRC_EXT;
+    g_stopCmdMs = 0;
+    if (edgeTs) g_lastOffTs = edgeTs;
+    runLogAt(edgeTs, RUN_OFF, offSrc, v, ran, runFlags);
     g_sbFlush = true;                             // ditto -- this edge starts the drain clock
     if (edgeTs) {                                 // arm the settled reference
       g_ltDue = edgeTs + LT_SETTLE_S;
@@ -2338,6 +2394,27 @@ void evalAutoStart(float v) {
     }
   }
   engRunning = nowRun;
+
+  // fw 4.78: voltage confirms a start late on this car -- 42 s on 2026-09-14, the time the
+  // battery took to reach the charging threshold -- and the OBD link only opens once it
+  // has. When the ECU's run-time counter (PID 1F) then puts the start earlier, move the
+  // run's start there: the run length, last_run, and the ON record on flash (rewritten by
+  // the loop, fixRunStartOnFlash). Once per run, never before the previous stop, never by
+  // more than OBD_BACKDATE_MAX_S. The fire decision above does not read any of this.
+  if (engRunning && !g_runStartDated && obdUse && oe.state == OE_RUNNING && oe.onEpoch &&
+      g_lastRunTs && oe.onEpoch < g_lastRunTs && g_lastRunTs - oe.onEpoch <= OBD_BACKDATE_MAX_S &&
+      (!g_lastOffTs || oe.onEpoch >= g_lastOffTs)) {
+    uint32_t back = g_lastRunTs - oe.onEpoch;
+    portENTER_CRITICAL(&g_runqMux);
+    g_runFixOldTs = g_lastRunTs;
+    g_runFixNewTs = oe.onEpoch;
+    portEXIT_CRITICAL(&g_runqMux);
+    engOnMs -= back * 1000UL;                      // so the run length at the OFF edge is right
+    g_lastRunTs = oe.onEpoch;
+    prefs.putUInt("last_run", g_lastRunTs);
+    g_runStartDated = true;
+    logLine("ENGINE ON: the ECU dates this start %lu s earlier than voltage did", (unsigned long)back);
+  }
 
   // Take the settled reference once the 12 h wait is up. Also bootstrap one if
   // the engine last ran long ago and we simply have no anchor yet (e.g. this
@@ -2377,6 +2454,8 @@ void evalAutoStart(float v) {
     if (valid && v >= AS_ALT_V) {
       if (g_pendingIdx >= 0) { g_starts[g_pendingIdx].ver = 1; saveStarts(); }
       g_verifying = false; g_pendingIdx = -1;
+      g_verifiedSrc = g_verifyAuto ? RSRC_AUTO : RSRC_MANUAL;   // fw 4.78: the ON edge that follows is this start's
+      g_verifiedMs  = now;
       if (g_verifyAuto) { g_asFails = 0; prefs.putUChar("as_fails", 0); }
       Serial.println("start verified: engine running (charging seen)");
       logLine("start VERIFIED: engine running, charging at %.2f V", v);
@@ -4116,6 +4195,7 @@ function valHtml(x){
   return num(x)+(x.u?" <span style=\"font-size:13px;color:#8b949e\">"+esc(x.u)+"</span>":"");
 }
 function cards(vals){
+  vals=vals.filter(function(x){return x.s!==3});   // fw 4.78: values the car does not report are left out
   if(!vals.length)return "";
   var h="<div class=\"grid\" style=\"margin-top:0\">";
   vals.forEach(function(x){
@@ -4154,7 +4234,7 @@ function logCard(d){
     +"<div style=\"text-align:right\"><button class=\"seg\" id=\"logtog\">"+(L.en?"Turn off":"Turn on")+"</button> "
     +"<a href=\"/obdlog.csv\" style=\"margin:0 6px\">Download CSV</a>"
     +"<button class=\"seg\" id=\"logclr\""+(L.bytes?"":" disabled")+">Clear</button></div></div>"
-    +"<div class=\"note\">A row every 30 s while the car answers, date and time first; nothing is written while it is off. "
+    +"<div class=\"note\">A row every 30 s while the car answers, date and time first; nothing is written while it is off. Only the values this car reports get a column. "
     +"The board connects to the reader by itself when it sees the engine running and holds the link for the drive, logging on or off. "
     +"Two generations of about 512 KB are kept.</div></div>";
 }
@@ -5441,6 +5521,8 @@ struct ObdLogRow {
   uint64_t have;                                      // bit i set: v[i] is a fresh reading
   float    atrv, batt;
   int8_t   mil, dtc;                                  // -1 = not known
+  bool     supKnown;                                  // fw 4.78: sup holds the car's PID map,
+  uint32_t sup[4];                                    // and the row's columns follow it
 };
 static bool         g_obdLogEn   = true;              // NVS "obd_log"; on unless turned off
 static ObdLogRow    g_obdLogQ[OBD_LOGQ_N];            // filled by the OBD task, drained by the loop core
@@ -5676,6 +5758,8 @@ static void obdLogQueueRow() {
   row.atrv = g_obd.atrv;
   row.mil = g_obd.monKnown ? ((g_obd.mon[0] & 0x80) ? 1 : 0) : -1;
   row.dtc = g_obd.monKnown ? (int8_t)(g_obd.mon[0] & 0x7F) : -1;
+  row.supKnown = g_obd.supKnown;
+  memcpy(row.sup, g_obd.sup, sizeof(row.sup));
   portEXIT_CRITICAL(&g_obdMux);
   if (!row.have) return;
   row.batt = g_lastV;
@@ -6196,9 +6280,11 @@ const size_t OBD_LOG_CAP  = 512UL * 1024UL;       // per generation
 const char*  OBD_LOG_FILE = "/obdlog.csv";
 const char*  OBD_LOG_OLD  = "/obdlog.old";
 
-static void obdLogHeader(String& out) {
+// fw 4.78: the header for the columns a row carries -- only what the car reports, once
+// its PID map is known.
+static void obdLogHeaderFor(const ObdLogRow& row, String& out) {
   int cols[OBD_MAX_PIDS];
-  int n = obdLogColumns(cols, OBD_MAX_PIDS);
+  int n = obdLogColumnsFor(row.supKnown ? row.sup : nullptr, cols, OBD_MAX_PIDS);
   char cell[40];
   out += "datetime";
   for (int c = 0; c < n; c++) {
@@ -6207,6 +6293,11 @@ static void obdLogHeader(String& out) {
     out += cell;
   }
   out += ",atrv_V,battery_V,mil,dtc_count\n";
+}
+static void obdLogHeader(String& out) {            // every logged column, no car map
+  ObdLogRow none;
+  memset(&none, 0, sizeof(none));
+  obdLogHeaderFor(none, out);
 }
 
 static void obdLogFormatRow(const ObdLogRow& row, String& out) {
@@ -6217,7 +6308,7 @@ static void obdLogFormatRow(const ObdLogRow& row, String& out) {
   strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &lt);
   out += b;
   int cols[OBD_MAX_PIDS];
-  int n = obdLogColumns(cols, OBD_MAX_PIDS);
+  int n = obdLogColumnsFor(row.supKnown ? row.sup : nullptr, cols, OBD_MAX_PIDS);
   for (int c = 0; c < n; c++) {
     int i = cols[c];
     const ObdPid& p = OBD_PIDS[i];
@@ -6268,14 +6359,31 @@ void flushObdLogToFlash() {
     String line;
     line.reserve(360);
     obdLogFormatRow(row, line);
+    String hdr;
+    obdLogHeaderFor(row, hdr);
+    // fw 4.78: the columns follow what the car reports. A row whose columns differ from
+    // the current file's header starts a new generation, so no row sits under the wrong
+    // names.
+    static String fileHdr;                         // the current file's header, read once
+    if (LittleFS.exists(OBD_LOG_FILE)) {
+      if (!fileHdr.length()) {
+        File rf = LittleFS.open(OBD_LOG_FILE, FILE_READ);
+        if (rf) { fileHdr = rf.readStringUntil('\n'); fileHdr += '\n'; rf.close(); }
+      }
+      if (fileHdr != hdr) {
+        LittleFS.remove(OBD_LOG_OLD);
+        LittleFS.rename(OBD_LOG_FILE, OBD_LOG_OLD);
+        obdLogRecount();
+        logLine("OBD log: the columns changed (what the car reports) - started a new file");
+      }
+    }
     bool fresh = !LittleFS.exists(OBD_LOG_FILE);
     File f = LittleFS.open(OBD_LOG_FILE, FILE_APPEND);
     if (!f) return;
     size_t w = 0;
     if (fresh) {
-      String h;
-      obdLogHeader(h);
-      w += f.print(h);
+      w += f.print(hdr);
+      fileHdr = hdr;
     }
     w += f.print(line);
     size_t sz = f.size();
@@ -6422,8 +6530,19 @@ void handleTransmit() {
     sent = radio.transmitButtonWakeup(pattern, RF_WAKEUP_MS, RF_TRAIN_CELLS,
                                       RF_START_DATAREPS, RF_START_BURSTS, RF_GUARD_MS,
                                       RF_START_PKT_GAP_MS, RF_TAIL_CARRIER_MS);
-    beginVerify(recordStart(g_lastV, 1, sent), false);   // log the attempt
-    runLog(RUN_CMD, RSRC_MANUAL, g_lastV, 0, sent ? 1 : 0);
+    if (engRunning) {
+      // fw 4.78: a Start sent to a running Compustar engine switches it off, so with the
+      // engine confirmed running this press is a stop: no start record, nothing to verify
+      // (before 4.78 it was logged as a start that ended "manual start UNVERIFIED"). In
+      // the seconds before voltage confirms a start, a press still counts as a start --
+      // the board cannot tell a stop from a retry then.
+      logLine("ENGINE STOP sent (manual) at %.2f V, tx=%s", g_lastV, sent ? "ok" : "FAILED");
+      if (sent) g_stopCmdMs = millis();
+      runLog(RUN_CMD, RSRC_MANUAL, g_lastV, 0, (sent ? 1 : 0) | RUN_F_STOPCMD);
+    } else {
+      beginVerify(recordStart(g_lastV, 1, sent), false);   // log the attempt
+      runLog(RUN_CMD, RSRC_MANUAL, g_lastV, 0, sent ? 1 : 0);
+    }
   } else {
     sent = radio.transmitButton(pattern, RF_REPEATS, RF_GUARD_MS);
   }
@@ -6958,14 +7077,14 @@ function loadRuns(){
     if(!rows.length){$("rhtab").innerHTML='<tbody><tr><td class="k">no runs recorded yet</td></tr></tbody>';return}
     var h='<thead><tr><th>When</th><th>Event</th><th>Source</th><th>Volts</th><th>Detail</th></tr></thead><tbody>';
     for(var i=rows.length-1;i>=0;i--){
-      var r=rows[i],k=KIND[r.kind]||["?","p-off"];
-      if(r.kind===1||r.kind===0){
+      var r=rows[i],k=(r.kind===0&&(r.flags&16))?["Stop sent","p-cmd"]:(KIND[r.kind]||["?","p-off"]);
+      if(r.kind===1||(r.kind===0&&!(r.flags&16))){
         for(var j=i-1;j>=0;j--){ if(rows[j].kind===2){
           h+='<tr class="gap"><td colspan="5">&darr; sat '+fmtDur(r.ts-rows[j].ts)+' between runs</td></tr>'; break;}
           if(rows[j].kind===1)break; }
       }
       var det="";
-      if(r.kind===2)det="ran "+fmtDur(r.dur);
+      if(r.kind===2)det="ran "+fmtDur(r.dur)+(r.src===1?" \u00b7 stopped from the dashboard":"");
       else if(r.kind===3)det="no charge after "+fmtDur(r.dur);
       else if(r.kind===0)det=(r.flags&1)?"RF sent ok":"RF transmit FAILED";
       h+='<tr><td>'+new Date(r.ts*1000).toLocaleString()
@@ -7793,6 +7912,7 @@ void loop() {
     loopMark("logflush"); flushLogToFlash();        // persist any new event-log lines (idle-cheap)
     flushDrainToFlash();                            // and the hourly drain bucket, if one completed
     flushRunsToFlash();                             // and any engine start/stop events
+    fixRunStartOnFlash();                           // fw 4.78: re-date a start the ECU dated earlier
     flushObdLogToFlash();                           // and any OBD log rows
     flushDailyToFlash();                            // and the daily bucket, at midnight
     // (fw 4.76: no idle auto-off -- the Bluetooth stack stays up from boot.)

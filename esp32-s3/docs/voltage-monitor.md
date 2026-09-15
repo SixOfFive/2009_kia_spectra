@@ -306,13 +306,27 @@ hour, so a threshold at 12.90 V never fires at all. See
 | Badge | Means | Trust the duration? |
 |---|---|---|
 | *(none)* | recorded live, both edges measured from battery voltage | yes |
-| **OBD** | an edge was timed by the engine computer over the OBD link (fw 4.75, flags bit 5): RPM reaching zero, or the ECU's own run-time counter for a start | yes — the most precise edge the board records |
+| **OBD** | an edge was timed by the engine computer over the OBD link (fw 4.75, flags bit 5): RPM reaching zero, or the ECU's own run-time counter for a start — since 4.78 also a start that voltage confirmed late and the counter moved earlier | yes — the most precise edge the board records |
 | **reconstructed** | hand-derived from other evidence when the log was first created | it is the best available account, not a measurement |
 | **recovered** | the board rebooted while this run was open; the end time was rebuilt from the voltage history | approximately — good to about a minute in the normal case |
 
 An **OBD** run is not a different kind of run, only a better-timed one. It appears
 when the OBD link was live at the edge — see section 7d — and a run's other edge may
 still come from voltage.
+
+### Who started it
+
+The **Source** column says what started or stopped a run: *auto*, *manual* (the
+dashboard) or *key / FOB*. Before fw&nbsp;4.78, runs the board itself started were
+shown as *key / FOB*. The start check passes on the first charging sample, while the
+run's ON edge confirms 5&nbsp;s later and had forgotten the start by then, so a
+phantom external start was also recorded. Runs from before 4.78 keep that label.
+
+A dashboard **Start** sent while the engine runs is a **stop** — a Compustar start to a
+running engine switches it off. Since 4.78 the log shows it as *Stop sent* (flags bit
+4) with no start record and nothing to verify, and the run's end reads *stopped from
+the dashboard*. In the seconds before voltage confirms a start, a press still counts as
+a start: the board cannot tell a stop from a retry then.
 
 ### What happens if the board reboots mid-drive
 
@@ -390,14 +404,17 @@ about 147&nbsp;KB).
   core's 4&nbsp;KB "`malloc()` prefers internal RAM up to here" threshold to 128&nbsp;bytes
   bought about 25&nbsp;KB of headroom, but lwIP in this core allocates with plain
   `malloc` (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` is off), so its packet buffers moved
-  into PSRAM too &mdash; a setup the core does not support. The one OTA that combined it
-  with the stack being taken down at upload start took 202&nbsp;s and rebooted
-  `reset=PANIC`; either change alone was clean (133&nbsp;s and 137&nbsp;s). It was
-  reverted before release.
+  into PSRAM too &mdash; a setup the core does not support. It was reverted before
+  release. (An OTA under it rebooted `reset=PANIC`, but so did a later one on the default
+  threshold, so that panic belongs to the OTA stack teardown below, not the threshold.)
 - **An OTA upload is the one exception.** It ends any OBD link and takes the stack down
   as soon as nothing is using it; a good image reboots anyway. That keeps the stack's
   heap out of the upload's way, and it is the one remaining way to take the stack down
   remotely &mdash; the board lives in the car, so OTA must never depend on Bluetooth.
+  **Known issue (2026-09-14):** 2 of the 4 OTAs that took the stack down at upload start
+  rebooted `reset=PANIC/exception` after `OK - flashed` instead of cleanly. The new image
+  was already committed and booted each time, so updates work, but the restart is not
+  clean. Not explained yet.
 
 The idle stack's cost is mainly heap: nothing scans, advertises or connects unless
 asked, and with WiFi power-save off the shared radio is powered for WiFi anyway. Its
@@ -633,10 +650,14 @@ on the Overview follow from the table.
 
 With **logging on**, which is the default, the board writes a row to `/obdlog.csv`
 every 30&nbsp;s while the car answers. The first column is local date and time.
-Then comes one column per value, with the unit in the name (`coolant_C`,
-`speed_kmh`, `rpm`), then the dongle's supply, the board's battery reading, the
-check-engine light and the stored-code count. A value the car did not report is an
-empty cell, so the columns never shift. **Nothing is written while the car is off.**
+Then comes one column per value **the car reports**, with the unit in the name
+(`coolant_C`, `speed_kmh`, `rpm`), then the dongle's supply, the board's battery
+reading, the check-engine light and the stored-code count. Since fw&nbsp;4.78 the car's
+own PID map decides the columns: this Spectra has no manifold pressure, oil
+temperature, upstream O2 voltage or fuel pressure, so those have none (26 columns, not
+30). A supported value that did not answer in time is an empty cell, so the columns
+never shift within a file; if the set changes, a new file generation starts with its
+own header. **Nothing is written while the car is off.**
 
 A log needs the link while you drive, and the board holds it then regardless: **it
 connects to the reader by itself when the engine starts**, logging on or off, and keeps
@@ -658,6 +679,15 @@ voltage has to stay below 13.10&nbsp;V for 120&nbsp;s to see past surface charge
 A voltage dip also cannot end a run the ECU says is still going. When the ECU is the
 first to see a start, its own run-time counter (PID&nbsp;1F) dates it. Such runs carry
 an **OBD** badge in the run log (flags bit&nbsp;5).
+
+**Since fw&nbsp;4.78 the counter also corrects a start voltage saw first.** On this car
+voltage confirmed a start about 42&nbsp;s late &mdash; the battery took that long to
+climb from 12.65&nbsp;V to the 13.2&nbsp;V charging threshold &mdash; and the OBD link
+only opens once it has. When PID&nbsp;1F then puts the start earlier, the board moves
+the run's start there: the run length, `last_run`, and the ON record on flash
+(fixed-size records, so that one is rewritten in place), which gains the **OBD** badge.
+Once per run, at most 30&nbsp;minutes back, never before the previous stop. The log
+says `ENGINE ON: the ECU dates this start N s earlier than voltage did`.
 
 Two guards keep it honest:
 

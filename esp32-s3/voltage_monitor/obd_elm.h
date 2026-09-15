@@ -106,5 +106,8 @@ void obdEngObserve(ObdEngine* e, bool rpmOk, float rpm, bool carSilent, long run
 // The logged columns: every PID except the Vehicle page's static facts. Writes
 // indices into OBD_PIDS and returns how many.
 int  obdLogColumns(int* cols, int max);
+// fw 4.78: the logged columns this car reports. sup is its PID map (0100, 0120, ...);
+// nullptr gives every logged column, exactly like obdLogColumns().
+int obdLogColumnsFor(const uint32_t* sup, int* cols, int max);
 // A header cell: the key plus an ASCII unit -- "coolant_C", "speed_kmh", "rpm".
 void obdCsvHeaderCell(const ObdPid& p, char* out, size_t cap);

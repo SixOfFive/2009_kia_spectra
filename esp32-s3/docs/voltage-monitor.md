@@ -568,24 +568,24 @@ firmware change. Close any phone app connected to the dongle first.
 
 ### When the board holds the link
 
-**While the engine runs, and while an OBD page is open.** Since fw&nbsp;4.76 the board
-connects by itself as soon as it sees the engine running (charging voltage, confirmed
-in 5&nbsp;s) &mdash; no page needed, logging on or off &mdash; and holds the link for
-the drive. With the engine off, every page poll (each 2&nbsp;s) keeps the link alive,
-and 60&nbsp;s after the last one the board disconnects. So nothing talks to the car's
-bus while it is parked and nobody is looking, and the dongle is free to sleep. A live
-BLE connection costs about 88&nbsp;KB of heap on a board whose real job is the
-auto-start: accepted while driving, when the auto-start has nothing to do, and the
-wrong trade for a page nobody is looking at. The Bluetooth stack itself stays up from
-boot, so a new link never needs a bring-up.
+**Only while the engine runs.** Since fw&nbsp;4.77 the board connects by itself as soon
+as it sees the engine running (charging voltage, confirmed in 5&nbsp;s) &mdash; no page
+needed, logging on or off &mdash; holds the link for the drive, and disconnects when the
+engine stops. With the engine off it leaves the reader alone: opening an OBD page shows
+*engine off &mdash; the board connects to the reader when the engine starts* and changes
+nothing, so nothing talks to the car's bus while it is parked and the dongle is free to
+sleep. The one exception is **Read codes &amp; VIN now** (below). A live BLE connection
+costs about 88&nbsp;KB of heap on a board whose real job is the auto-start &mdash;
+accepted while driving, when the auto-start has nothing to do. The Bluetooth stack
+itself stays up from boot, so a new link never needs a bring-up.
 
-**A page in a background tab does not count.** The page stops polling while it is
-hidden, so the link drops about a minute after you switch away. This was found the
-hard way: during testing, an OBD page left open on another device kept the link
-up for 25&nbsp;minutes after the page under test had closed, and a browser still
-runs a background tab's timers roughly once a minute &mdash; often enough to keep a
-60-second timeout from ever running out. The log names the device that opened each
-link (`OBD: link opened for 192.168.15.x`), so a link nobody expects can be traced.
+**Before 4.77 an open page held the link,** and a page left open anywhere kept it up:
+during testing one on another device held it for 25&nbsp;minutes, because a browser
+still runs a background tab's timers roughly once a minute &mdash; often enough to keep a
+60-second timeout from running out. Pages no longer open or hold the link; a hidden tab
+still stops polling, to spare the board's one-connection web server. The log names what
+opened each link: `OBD: link opened for the running engine`, or for a Read-now request
+and the device that sent it.
 
 While the link is held, the Debug page's scanner and connect test refuse, saying
 why &mdash; there is one radio. While the engine runs, that is the whole drive. An OTA
@@ -595,18 +595,23 @@ On connecting, the board resets the dongle (`ATZ`), sets the reply format the pa
 expects (`ATE0 ATL0 ATS1 ATH0`), selects automatic protocol search (`ATSP0`, the only
 one of these the dongle saves), then asks the car what it supports.
 
-### Ignition off
+### Engine off: Read codes &amp; VIN now
 
-The dongle stays powered &mdash; OBD pin&nbsp;16 is always live &mdash; but the car
-is not listening. The page says *Reader connected &mdash; the car is not answering*,
-and while the page stays open the board asks again every 15&nbsp;s, so turning the key
-to ON is picked up without touching it. For a page the engine does not have to run;
-with no page open, the board only connects once the engine runs.
+The dongle stays powered &mdash; OBD pin&nbsp;16 is always live &mdash; but the board
+does not connect to it while the engine is off. To read fault codes or vehicle details
+without starting the engine, turn the key to ON and press **Read codes &amp; VIN now**
+on any OBD page (`POST /obdnow`). The board connects once, waits up to 30&nbsp;s for the
+car to answer, reads the check-engine status, the stored, pending and permanent codes,
+and the VIN, calibration ID and ECU name, then disconnects until the engine starts. The
+results stay on the Fault codes and Vehicle pages. With the key off it reports *the car
+did not answer* and disconnects; a reader it cannot reach gets one attempt, not a retry
+loop. If the engine starts mid-read, the link simply carries on as the drive's link.
 
 ### How the data is read
 
-One task owns the dongle and polls only what the open page shows: the four overview
-values on the Overview, one category's values on its own page. Fault codes are read
+While the engine runs, one task owns the dongle and polls only what the open page
+shows: the four overview values on the Overview, one category's values on its own page
+&mdash; plus RPM on every pass and the log's sweep every 30&nbsp;s. Fault codes are read
 when the codes page opens, again every minute while it stays open, or on **Read
 again**; vehicle details once per connection.
 
@@ -633,10 +638,9 @@ Then comes one column per value, with the unit in the name (`coolant_C`,
 check-engine light and the stored-code count. A value the car did not report is an
 empty cell, so the columns never shift. **Nothing is written while the car is off.**
 
-A log needs the link while you drive, not only while a page is open &mdash; and since
-fw&nbsp;4.76 the board holds it regardless: **it connects to the reader by itself when
-the engine starts**, logging on or off, and keeps the link for the drive (see *When
-the board holds the link*). Logging only decides whether rows are written. The
+A log needs the link while you drive, and the board holds it then regardless: **it
+connects to the reader by itself when the engine starts**, logging on or off, and keeps
+the link for the drive (see *When the board holds the link*). Logging only decides whether rows are written. The
 connection follows the engine-start voltage edge, which itself takes 5&nbsp;s to
 confirm.
 
@@ -670,11 +674,12 @@ on the fire path reads the run state that OBD now helps decide.
 
 | Call | Does |
 |---|---|
-| `GET /obdjson` | Overview data; starts the link if a reader is set up, and keeps it alive while the engine is off (while it runs, the board holds the link anyway) |
+| `GET /obdjson` | Overview data, plus `engine` (`running` / `off`); never opens or holds the link (4.77) |
 | `GET /obdjson?cat=<key>` | one category: `engine`, `fuel`, `electrical`, `trip`, `codes`, `vehicle` |
 | `GET /obdjson?cat=codes&refresh=1` | ...and re-read the fault codes now |
 | `POST /obdcfg?addr=<mac>&t=<public\|random>` | remember the reader |
 | `POST /obdcfg?forget=1` | forget it; an open link closes |
+| `POST /obdnow` | Read codes &amp; VIN now: with the engine off, connect once, read codes and vehicle details, disconnect (409 with a reason if it cannot) |
 | `GET /obdstate` | diagnostics: link state, idle time, poll count, last poller, task heartbeat and current step &mdash; **does not** keep the link alive |
 
 ---

@@ -14,6 +14,82 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-14 — fw 4.77: the reader is left alone unless the engine runs, with a Read-now override
+
+### Changed — no OBD link unless the engine runs
+
+The user reported the OBD page showing *Reader connected — the car is not answering*
+with the car parked: *"it shouldnt even connect. It should see that the car is not
+running and do nothing ... Connect the bt to it when the board detects the vehicle is
+running."* Firmware 4.76 had still let a polling OBD page open a link with the engine
+off.
+
+- `obdShouldStop()` is now `g_otaActive || (!engRunning && !g_obdOneShot) || reader changed`.
+  The link ends when the engine stops.
+- `/obdjson` never starts a session. It gains `"engine":"running"|"off"`, and the page
+  says *engine off — the board connects to the reader when the engine starts*.
+- When a link ends, the page says why: *the engine stopped - disconnected until it starts
+  again*, *an OTA upload ended the link*, or *the reader setting changed*. A fatal
+  problem or a Read-now result keeps its own reason.
+- The engine-start connection (`obdEngineMaybeStart`, 4.76) is unchanged.
+
+### Added — "Read codes & VIN now"
+
+The user asked for *"an override button there to do just that [read fault codes and VIN]
+and then stop the bt until the board detects the engine starts."*
+
+- A button on every OBD page with the engine off sends `POST /obdnow`. One session
+  connects and waits up to 30 s for the car to answer (key at ON). It reads the monitor
+  status, the stored, pending and permanent codes, and the VIN, calibration ID and ECU
+  name, then disconnects. The results stay on the Fault codes and Vehicle pages.
+- With the key off it reports *the car did not answer* and disconnects. A reader it
+  cannot reach gets one attempt, not a retry loop. If the engine starts mid-read, the
+  link carries on as the drive's link.
+- Refusals (no reader, engine running, OTA in progress, radio busy) return 409 with a
+  reason, which the page shows for 8 s. With a link already up, the request only asks for
+  the codes to be read again.
+- "Stop the bt" drops the link to the reader. The Bluetooth stack itself stays placed
+  (4.76), idle, because taking it down is what fragmented the heap.
+
+### Changed — texts
+
+- The *turn the key to ON — the engine does not have to run* notes now say values are
+  read while the engine runs, and point at the override.
+- The Debug page's radio-busy refusals now say the link is held while the engine runs.
+
+### Verified
+
+Car off, on the board in the car. Build `Sep 14 2026 19:30:57`.
+
+- **An open page no longer connects.** Acting as an open OBD page for 30 s saw only
+  `link=off engine=off`, and the link never came alive. The user's own reloaded OBD page
+  had polled 15 times by then without opening one either.
+- **Read codes & VIN now, key off.** `POST /obdnow` answered 202. The link went from
+  connecting (0.1 s) to starting (6.9 s) to no-car (19.8 s, *no OBD bus found*), then
+  off at 48.4 s with *the car did not answer - turn the key to ON, then press Read codes &
+  VIN now again*. The log shows `link opened for a Read codes & VIN request from <laptop>`,
+  `read-now request: the car did not answer` and `link closed after 45 s`. The stack
+  stayed up.
+- **The button renders** on a reloaded OBD page (confirmed by the user). Both page
+  scripts pass `node --check`.
+- **OTA with a link open at upload start**, for the first time. The upload ended the
+  page's link and took the stack down in the same second (19:33:51). The image was
+  accepted and the board rebooted `reset=software`. The upload took 177 s with a page
+  polling throughout. curl lost the `OK - flashed` reply to a connection reset, but the
+  new build stamp confirmed the flash.
+
+### Not verified
+
+- A drive: the link opening at engine start and closing at engine stop, logged rows, and
+  OBD-timed edges (as for 4.76).
+- A successful Read-now with the key at ON. It needs someone at the car.
+
+### To undo
+
+Flash 4.76 (`git revert` this commit and rebuild). No NVS keys or files were added.
+
+---
+
 ## 2026-09-14 — fw 4.76: Bluetooth is placed once at boot, and a running engine opens the OBD link
 
 ### Found — bring-ups, not scans or links, were fragmenting the heap into refusals

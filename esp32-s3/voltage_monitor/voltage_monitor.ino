@@ -117,7 +117,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.76";
+const char* FW_VERSION = "4.77";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -3858,7 +3858,7 @@ const char DEBUG_HTML[] PROGMEM = R"HTML(
 <div class="k" style="margin-top:10px;line-height:1.7;text-transform:none;letter-spacing:0">
 The Bluetooth stack is <b>placed once at boot and stays up</b>; the radio only works while
 something scans or holds a link. Nothing is stored or paired, and nothing is connected to
-unless you press <b>Test</b> on a result, or the OBD link is up (engine running, or an OBD page open).
+unless you press <b>Test</b> on a result, or the OBD link is up (while the engine runs, or for <b>Read codes &amp; VIN now</b>).
 <br><br><b>This is BLE only &mdash; the ESP32-S3 has no Bluetooth Classic radio at all.</b>
 A Classic (SPP) device is invisible here, so <b>an empty result does not mean nothing is
 there</b>. Most cheap ELM327 dongles are Classic; the BLE ones exist because iOS will not do
@@ -4125,7 +4125,7 @@ function cards(vals){
 }
 function needCar(d,what){
   return d.link==="live"?"":"<div class=\"note\" style=\"margin:0 0 14px\">"+what
-    +" need the car to answer: turn the key to ON &mdash; the engine does not have to run.</div>";
+    +" are read while the engine runs. With it off, <b>Read codes &amp; VIN now</b> reads the fault codes and vehicle details once (key at ON).</div>";
 }
 function milLine(d){
   return d.mil===undefined?"":"check-engine light <span class=\"badge "+(d.mil?"arm":"off")+"\" style=\"font-size:12px\">"
@@ -4217,9 +4217,16 @@ function render(d){
   if(d.atrv!==null)det.push("dongle supply "+d.atrv.toFixed(1)+" V");
   if(d.rssi&&(d.link==="live"||d.link==="no-car"||d.link==="starting"))det.push("signal "+d.rssi+" dBm");
   if(d.reader)det.push("reader <code>"+esc(d.reader)+"</code>");
-  if(d.link==="no-car")det.push("turn the key to ON and it picks up within about 15 s");
+  if(d.link==="no-car")det.push(d.engine==="running"?"the engine computer is not answering yet":"turn the key to ON \u2014 the read waits up to 30 s");
+  // fw 4.77: with the engine off the board leaves the reader alone; the override reads
+  // the fault codes and vehicle details once, then disconnects until the engine starts.
+  if(d.reader&&d.link==="off"&&d.engine!=="running"){
+    det.unshift("engine off \u2014 the board connects to the reader when the engine starts");
+    det.push("<button class=\"seg\" id=\"obdnow\">Read codes &amp; VIN now</button>");}
+  if(NOWMSG&&Date.now()<NOWUNTIL)det.unshift(esc(NOWMSG));
   $("ldet").innerHTML=det.join(" &middot; ");
   var ob=$("obdboot"); if(ob)ob.onclick=obdReboot;
+  var on=$("obdnow"); if(on)on.onclick=obdReadNow;
   $("chg").style.display=d.reader?"":"none";
   $("setup").style.display=(!d.reader||SCANNING)?"":"none";
   var h="";
@@ -4245,9 +4252,13 @@ function obdReboot(){ REBOOTING=true;
   $("ldet").textContent="the board is restarting; this page picks up again by itself in about 20 s \u00b7 auto-start protection re-arms 15 min after boot";
   fetch("/reboot",{method:"POST"}).catch(function(){});
   setTimeout(function(){REBOOTING=false},15000); }
-// A hidden tab stops polling, so the board drops the link a minute later instead of
-// holding ~88 KB for a page nobody is looking at. Browsers still run a background
-// tab's timers about once a minute, which would otherwise keep the link up forever.
+// Read codes & VIN now (fw 4.77). A refusal is shown for 8 s over the normal status.
+var NOWMSG="",NOWUNTIL=0;
+function obdReadNow(){ var b=$("obdnow"); if(b){b.disabled=true;b.textContent="connecting\u2026";}
+  fetch("/obdnow",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+    if(!d.ok){NOWMSG=d.detail||"could not start the read";NOWUNTIL=Date.now()+8000;}
+  }).catch(function(){NOWMSG="request failed";NOWUNTIL=Date.now()+8000;}); }
+// A hidden tab stops polling: nobody is looking, and the board serves one connection at a time.
 function tick(){
   if(SCANNING||REBOOTING||document.hidden){setTimeout(tick,2000);return;}
   var q="/obdjson"+(CAT?"?cat="+encodeURIComponent(CAT):"");
@@ -4917,7 +4928,7 @@ void handleBtScan() {
       say(409, "{\"ok\":false,\"detail\":\"a connect test is using the radio\"}"); return;
     }
     if (g_obdAlive) {
-      say(409, "{\"ok\":false,\"detail\":\"the OBD link is using the radio; it frees itself a minute after the OBD pages close, unless the engine is running\"}"); return;
+      say(409, "{\"ok\":false,\"detail\":\"the OBD link is using the radio (the engine is running, or a Read codes & VIN request); it frees itself when that ends\"}"); return;
     }
     int secs = server.arg("s").toInt();
     if (secs < 2) secs = 2;
@@ -5296,7 +5307,7 @@ void handleBtConnect() {
 
   if (server.hasArg("addr")) {                      // ---- start ----
     if (g_bcState == BCS_RUNNING || g_btState == BTS_RUNNING || g_obdAlive) {
-      say(409, "{\"ok\":false,\"detail\":\"the radio is busy with a scan, another test, or the OBD link (it frees itself a minute after the OBD pages close, unless the engine is running)\"}"); return;
+      say(409, "{\"ok\":false,\"detail\":\"the radio is busy with a scan, another test, or the OBD link (held while the engine runs)\"}"); return;
     }
     String a = server.arg("addr"); a.trim(); a.toLowerCase();
     bool addrOk = a.length() == 17;
@@ -5356,12 +5367,13 @@ void handleBtConnect() {
 // OBD-II pages (fw 4.74) -- live data from the car through the BLE ELM327
 // dongle whose connection 4.73 proved.
 //
-// The link is held while the engine runs -- since fw 4.76 the board connects by
-// itself when it sees charging voltage, page or no page -- and while an OBD page
-// polls; with the engine off it is dropped OBD_IDLE_MS after the last poll. A live
-// BLE connection cost ~88 KB of heap in the 4.73 measurements. The stack itself is
-// placed at boot and never taken down: bring-ups, not connections, are what
-// fragment the heap.
+// The link exists only while the engine runs (fw 4.77): the board connects by itself
+// when it sees charging voltage and disconnects when the engine stops. Pages only show
+// what the link has read; they never open it. The one exception is "Read codes & VIN
+// now" (POST /obdnow), which reads the codes and vehicle details once with the engine
+// off and disconnects again. A live BLE connection cost ~88 KB of heap in the 4.73
+// measurements. The stack itself is placed at boot and never taken down: bring-ups,
+// not connections, are what fragment the heap.
 //
 // One task owns the dongle: connect, initialise the ELM327, ask the car which
 // PIDs it supports, then poll only what the open page shows. Results go into
@@ -5441,6 +5453,10 @@ static ObdEngine    g_obdEng;                         // written by the OBD task
 static portMUX_TYPE g_obdEngMux  = portMUX_INITIALIZER_UNLOCKED;   // ... read by the safety task
 static volatile int      g_obdWant         = -1;     // category on screen; -1 = the main OBD page
 static volatile bool     g_obdCodesRefresh = false;
+// fw 4.77: "Read codes & VIN now" -- one session with the engine off that reads the
+// fault codes and vehicle details, then disconnects until the engine starts.
+static volatile bool     g_obdOneShot = false;   // set by POST /obdnow, cleared once that read is done
+static volatile bool     g_obdKeepWhy = false;   // the session left a reason the page should see as-is
 static volatile bool     g_obdFatal        = false;  // the last session hit something a retry cannot fix
 static uint32_t          g_obdHoldFrom     = 0;      // no new session until g_obdHoldMs after this
 static uint32_t          g_obdHoldMs       = 0;
@@ -5483,11 +5499,9 @@ static void obdJsonText(String& o, const char* s) {
 }
 
 static bool obdShouldStop(const char* addr) {
-  uint32_t last = g_obdLastPoll;                 // read before millis(), so never "in the future"
-  bool pageIdle = millis() - last > OBD_IDLE_MS;
-  // A running engine holds the link whatever the log setting (fw 4.76); with the
-  // engine off, only a page that is still polling does.
-  return g_otaActive || (pageIdle && !engRunning) || strcmp(addr, g_obdAddr) != 0;   // an OTA upload ends it
+  // fw 4.77: the link exists only while the board sees the engine running, or for one
+  // "Read codes & VIN now" request. A page never opens or holds it.
+  return g_otaActive || (!engRunning && !g_obdOneShot) || strcmp(addr, g_obdAddr) != 0;
 }
 
 // Sleep in short slices, waking early when the pages close or the reader changes.
@@ -5746,6 +5760,10 @@ static void obdSession(const char* addr, uint8_t type) {
     strlcpy(g_obdStage, "connect", sizeof(g_obdStage));
     if (!cl->connect(BLEAddress(String(addr), type), type)) {
       obdSetLink(OBD_FAILED, "could not connect - out of range, unpowered, or held by a phone app");
+      if (g_obdOneShot && !engRunning) {           // a Read-now gets one attempt, not a retry loop
+        g_obdKeepWhy = true;
+        g_obdOneShot = false;
+      }
       obdNap(OBD_RETRY_MS, addr);
       continue;
     }
@@ -5780,6 +5798,29 @@ static void obdSession(const char* addr, uint8_t type) {
 
     bool live = obdProbe(cl, tx, wr, r, sizeof(r));
     logLine("OBD: reader up, car %s", live ? "answering" : "not answering");
+    // fw 4.77: "Read codes & VIN now" with the engine off reads what it asked for and
+    // disconnects. The key has to be at ON for the car to answer, so give it 30 s.
+    if (g_obdOneShot) {
+      if (!engRunning) {
+        for (uint32_t t1 = millis(); !live && !engRunning && !g_otaActive &&
+                                     millis() - t1 < 30000UL && strcmp(addr, g_obdAddr) == 0; ) {
+          vTaskDelay(pdMS_TO_TICKS(3000));
+          live = obdProbe(cl, tx, wr, r, sizeof(r));
+        }
+        if (live) {
+          obdReadMonitor(cl, tx, wr, r, sizeof(r));
+          obdReadCodes(cl, tx, wr, r, sizeof(r));
+          obdReadInfo(cl, tx, wr, r, sizeof(r));
+          obdSetLink(OBD_LIVE, "codes and vehicle details read - disconnected until the engine starts");
+          logLine("OBD: codes and vehicle details read on request; disconnecting");
+        } else {
+          obdSetLink(OBD_NO_CAR, "the car did not answer - turn the key to ON, then press Read codes & VIN now again");
+          logLine("OBD: read-now request: the car did not answer");
+        }
+        g_obdKeepWhy = true;
+      }
+      g_obdOneShot = false;                       // done -- or the engine started and this is now its link
+    }
     uint32_t lastProbe = millis(), lastSlow = millis(), lastMon = 0, lastLog = 0;
     int silent = 0;
     while (cl->isConnected() && !obdShouldStop(addr)) {
@@ -5854,7 +5895,14 @@ void obdTask(void* arg) {
   uint8_t type = g_obdAddrType;
   uint32_t t0 = millis();
   obdSession(addr, type);
-  obdSetLink(OBD_OFF, nullptr);                   // keep the last reason for the page to show
+  // Keep a reason the page should see (a fatal problem, a Read-now result); otherwise
+  // say why the link is down -- since fw 4.77 opening a page cannot bring it back.
+  if (g_obdFatal || g_obdKeepWhy) obdSetLink(OBD_OFF, nullptr);
+  else obdSetLink(OBD_OFF, g_otaActive ? "an OTA upload ended the link"
+                         : strcmp(addr, g_obdAddr) != 0 ? "the reader setting changed"
+                         : "the engine stopped - disconnected until it starts again");
+  g_obdKeepWhy = false;
+  g_obdOneShot = false;
   g_obdHoldFrom = millis();
   g_obdHoldMs = g_obdFatal ? 60000UL : 0UL;
   g_btLastEnd = millis();                         // only a fallback bring-up's cooldown reads this now
@@ -5863,7 +5911,7 @@ void obdTask(void* arg) {
   vTaskDelete(nullptr);
 }
 
-// Start a session for a page that polled or the running engine, unless something else holds the
+// Start a session for the running engine or a Read-now request, unless something else holds the
 // radio or the heap cannot place the stack. `why` explains a refusal.
 static bool obdStartSession(String& why, const char* who) {
   if (g_btState == BTS_RUNNING || g_bcState == BCS_RUNNING) {
@@ -5903,8 +5951,8 @@ static bool obdStartSession(String& why, const char* who) {
 }
 
 // GET /obdjson[?cat=<key>][&refresh=1] -- everything the OBD pages show. Every
-// poll keeps the link alive and says which page is open, so the task reads what
-// that page shows and nothing else.
+// poll says which page is open, so a live link reads what that page shows. Since
+// fw 4.77 a poll never opens or holds the link.
 void handleObdJson() {
   trackReq();
   String cat = server.arg("cat");
@@ -5917,9 +5965,7 @@ void handleObdJson() {
   static bool logCounted = false;               // the log's size, read off flash once per boot
   if (!logCounted) { obdLogRecount(); logCounted = true; }
 
-  String note;
-  if (g_obdAddr[0] && !g_obdAlive && millis() - g_obdHoldFrom >= g_obdHoldMs)
-    obdStartSession(note, g_obdPoller.toString().c_str());
+  String note;                                    // fw 4.77: a poll never opens the link
 
   static ObdShared s;                             // loop task only; keeps ~1.3 KB off its stack
   portENTER_CRITICAL(&g_obdMux);
@@ -5933,6 +5979,7 @@ void handleObdJson() {
   o.reserve(2600);
   o += "{\"reader\":\"";       o += g_obdAddr;
   o += "\",\"link\":\"";       o += !g_obdAddr[0] ? "none" : (alive ? OBD_LINK_NAMES[link] : "off");
+  o += "\",\"engine\":\"";     o += engRunning ? "running" : "off";
   o += "\",\"why\":\"";        obdJsonText(o, note.length() ? note.c_str() : s.why);
   o += "\",\"elm\":\"";        obdJsonText(o, s.elm);
   o += "\",\"proto_name\":\""; obdJsonText(o, s.protoName);
@@ -6049,6 +6096,33 @@ void handleObdJson() {
 
 // GET /obdstate -- the session as seen from outside, WITHOUT counting as a page
 // poll, so it can watch the idle timeout run out. Diagnostics only.
+// POST /obdnow -- "Read codes & VIN now" (fw 4.77). With the engine off, one session
+// connects, reads the fault codes and vehicle details (key at ON), and disconnects
+// until the engine starts. With the link already up it only asks for the codes again.
+void handleObdNow() {
+  trackReq();
+  if (!g_obdAddr[0]) { server.send(409, "application/json", "{\"ok\":false,\"detail\":\"no reader is set up\"}"); return; }
+  if (g_obdAlive) {
+    g_obdCodesRefresh = true;
+    server.send(200, "application/json", "{\"ok\":true,\"detail\":\"the link is already up; the codes will be read again on the Fault codes page\"}");
+    return;
+  }
+  if (engRunning) { server.send(409, "application/json", "{\"ok\":false,\"detail\":\"the engine is running; the board is connecting by itself\"}"); return; }
+  if (g_otaActive) { server.send(409, "application/json", "{\"ok\":false,\"detail\":\"an OTA upload is running\"}"); return; }
+  String who = String("a Read codes & VIN request from ") + server.client().remoteIP().toString();
+  String why;
+  g_obdOneShot = true;                            // before the task exists, so it sees the request
+  if (!obdStartSession(why, who.c_str())) {
+    g_obdOneShot = false;
+    String body = "{\"ok\":false,\"detail\":\"";
+    obdJsonText(body, why.c_str());
+    body += "\"}";
+    server.send(409, "application/json", body);
+    return;
+  }
+  server.send(202, "application/json", "{\"ok\":true,\"detail\":\"connecting to read the codes and vehicle details\"}");
+}
+
 void handleObdState() {
   trackReq();
   int link;
@@ -7487,8 +7561,9 @@ void setup() {
   server.on("/obd", HTTP_GET, handleObdPage);          // OBD tab: overview
   for (int i = 0; i < OBD_CAT_COUNT; i++)              // one sub-page per category, all the same template
     server.on(String("/obd/") + OBD_CATS[i].key, HTTP_GET, handleObdPage);
-  server.on("/obdjson", HTTP_GET, handleObdJson);      // the OBD pages' data; each poll keeps the link up
+  server.on("/obdjson", HTTP_GET, handleObdJson);      // the OBD pages' data; a poll never opens the link (4.77)
   server.on("/obdcfg", HTTP_POST, handleObdCfg);       // remember or forget the reader
+  server.on("/obdnow", HTTP_POST, handleObdNow);       // Read codes & VIN now: one read with the engine off
   server.on("/obdstate", HTTP_GET, handleObdState);    // diagnostics; does not keep the link alive
   server.on("/obdlog.csv", HTTP_GET, handleObdLogCsv);  // the OBD log as one CSV
   server.on("/obdlog", HTTP_POST, handleObdLogCfg);      // logging on/off, clear

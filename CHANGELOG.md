@@ -14,6 +14,53 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-15 — obd-dashboard: each pull kept as its own file, and the board's log cleared
+
+### Added — the board's log is cleared once the VM holds it
+
+- **Every download is kept byte for byte** in `data/pulled/obdlog_<first row>.csv`, one
+  file per board log. A later download of the same log replaces its file. The log the
+  board starts after a clear gets a new one. `pulled/index.json` lists them.
+- **The puller then clears the board's log** with `POST /obdlog?clear=1`, the same request
+  as the OBD log card's *Clear*. It does so only when all of these hold:
+  - the engine is off and the link is down
+  - the download is whole: it ends in a newline, nothing in it is unreadable, and its
+    size is `log.bytes`, or that less one header line when both generations share it
+  - a fresh `/obdjson` shows `log.bytes` unchanged since the download
+- **A clear that fails** or cannot be verified waits an hour, unless the log changes.
+  `VROOM_CLEAR_BOARD=0` turns clearing off.
+- **A log still on the board with the engine off** is downloaded again and then cleared.
+  That covers the log pulled before this change.
+- **Board & pull** shows when the board's log was last cleared, or why it was not.
+
+### Why the checks
+
+The board's clear deletes both generations and also drops rows still queued in RAM. So
+nothing may still be on its way to flash. With the engine off no rows are written, and an
+unchanged `log.bytes` proves nothing was written between the download and the clear.
+
+### Verified
+
+- **Unit tests:** 30 pass. They cover:
+  - a clear after a verified download
+  - a re-download replacing its file, and a new log getting its own file
+  - no clear while running, when the log grew, or when the download is not the whole log
+  - a failed clear not retried every minute
+  - an already-pulled log downloaded again and cleared
+  - clearing turned off
+- **On the car, engine off:** the first check after the deploy downloaded the board's
+  10-row log (1,544 B, equal to `log.bytes`). It kept the log as
+  `pulled/obdlog_20260914_195210.csv`, cleared the board, and marked the entry cleared.
+  The board now reports `log.bytes` 0, and `obdlog.csv` still holds the 10 rows.
+- **Not verified:** a clear after a real drive with 10 s rows.
+
+### To undo
+
+Put `VROOM_CLEAR_BOARD=0` in `/etc/default/vroom-obd`, and the board keeps its log as
+before. Rows already cleared are in `data/pulled/` and `data/obdlog.csv` on the VM.
+
+---
+
 ## 2026-09-15 — fw 4.80: the OBD log takes a row every 10 s
 
 ### Changed — a row every 10 s instead of 30 s

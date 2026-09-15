@@ -2,7 +2,8 @@
 
 A page on the projects VM, **http://192.168.15.3/vroom/**, that graphs the car's OBD-II
 log. A puller on the VM checks the board in the car every minute and keeps every row the
-board has served. It also keeps the values the log has no column for, such as the VIN and
+board has served. Once a download is verified whole with the engine off, it clears the
+board's log, so the VM holds the only copy. It also keeps the values the log has no column for, such as the VIN and
 fault codes. The page reads those files and builds its graphs in the browser, straight
 from the CSV.
 
@@ -52,6 +53,8 @@ nothing.
 |---|---|
 | `obdlog.csv` | Every row the board has served, merged and de-duplicated, oldest first. It only grows; rows the board has since dropped stay here. One header, in the firmware's column order; columns with no value in any row are left out. |
 | `obdlog-board.csv` | The last download, byte for byte. |
+| `pulled/obdlog_<first row>.csv` | Every board log as downloaded, byte for byte: one file per log, named after its first row's date and time. A later download of the same log replaces its file; the log the board starts after a clear gets a new one. |
+| `pulled/index.json` | The kept logs, oldest first. Each entry has the file, its first and last row, rows, bytes, when it was pulled, and when the board's copy was cleared. |
 | `vehicle.json` | The single values, each with when it was last seen and since when it has been the same. |
 | `vehicle-info.txt` | The same values as a plain-text table, for download. |
 | `status.json` | The puller's last check: board reachable, engine and link state, log size, download result, archive size, board facts. |
@@ -66,6 +69,21 @@ One run is one check, started by `vroom-obd-pull.timer` every minute.
 | `GET /obdlog.csv` | When `log.bytes` differs from the last download. While the engine runs, at most every 2 minutes. After a failure, backs off to at most every 15 minutes. |
 | `GET /obdjson?cat=vehicle`, then `?cat=codes`, then `GET /obdjson` | While the engine runs and the link has been live for 20 s, every 30 minutes. |
 | `GET /json` | Every 10 minutes, for firmware, uptime, WiFi signal and auto-start state. |
+| `POST /obdlog?clear=1` | Right after a download, and only if the checks below pass. |
+
+**When the board's log is cleared.** The puller clears the log only after keeping the
+download in `pulled/` and merging its rows, and only if all of these hold:
+
+- the engine is off and the link is down
+- the download is whole: it ends in a newline, has no unreadable line, and its size is
+  the board's own `log.bytes`, or that less one header line when both generations share it
+- a fresh `GET /obdjson` shows `log.bytes` unchanged since the download
+
+Clearing also discards rows still queued in the board's RAM, which is why a running
+engine always waits. A log still on the board with the engine off is downloaded again to
+clear it. That covers a log pulled before clearing existed. A clear that fails those
+checks, or whose request fails, waits an hour before the next try, unless the log
+changes. Put `VROOM_CLEAR_BOARD=0` in `/etc/default/vroom-obd` to stop clearing.
 
 **Why the category requests look like that.** The board reads VIN, calibration ID, ECU
 name and fault codes only while a page asks for that category. Its OBD task polls
@@ -163,3 +181,7 @@ sites*. The page before that edit is `/var/www/html/index.html.bak-pre-vroom`.
   before the board had the time. They stay in the CSV, and *Board & pull* counts them.
 - **Values from *Read codes & VIN now* with the engine off are not captured.** Single
   values are written only while the engine runs.
+- **Rows the board drops before the VM sees them are gone.** The board drops its older
+  generation after about 10 hours of engine running at 10 s rows. If the car runs that
+  long without coming back into WiFi range, the rows are lost before the puller can
+  download or clear anything.

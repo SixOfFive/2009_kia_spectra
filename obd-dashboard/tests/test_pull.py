@@ -94,6 +94,15 @@ class FakeBoard(pull.Board):
             raise r
         return r if isinstance(r, bytes) else json.dumps(r).encode()
 
+    def post(self, path):
+        self.calls.append("POST " + path)
+        r = self.routes.get("POST " + path)
+        if r is None:
+            raise pull.BoardError("POST " + path + ": no route")
+        if isinstance(r, Exception):
+            raise r
+        return r
+
 
 class Tmp(unittest.TestCase):
     def setUp(self):
@@ -153,7 +162,20 @@ class Archive(unittest.TestCase):
 
 
 class PullDecision(unittest.TestCase):
-    cfg = pull.Config()
+    cfg = pull.Config(clear_board=0)
+
+    def test_a_log_not_yet_cleared_is_downloaded_to_clear_it(self):
+        cfg, ok = pull.Config(), {"ok_ts": 9_990, "board_bytes": 1544}
+
+        def decide(state, engine="off", bytes_=1544):
+            return pull.pull_decision(state, {"engine": engine, "log": {"bytes": bytes_}}, True, 10_000, cfg)[0]
+
+        self.assertTrue(decide(ok))                                                   # unchanged, still on the board
+        self.assertFalse(decide(dict(ok, clear_try_ts=9_000, clear_try_bytes=1544)))  # tried this hour
+        self.assertTrue(decide(dict(ok, clear_try_ts=6_000, clear_try_bytes=1544)))   # an hour ago
+        self.assertTrue(decide(dict(ok, clear_try_ts=9_000, clear_try_bytes=1400), bytes_=1400))
+        self.assertFalse(decide(ok, engine="running"))                                # never while running
+        self.assertFalse(decide(dict(ok, board_bytes=0), bytes_=0))                   # nothing to clear
 
     def decide(self, pull_state, engine="off", bytes_=1544, have=True, now=10_000):
         obd = {"engine": engine, "log": {"bytes": bytes_}}
@@ -305,6 +327,121 @@ class RunOnce(Tmp):
         board = FakeBoard(self.routes(**{"/obdjson": running(since=5)}))
         self.run_once(board, 5_000)
         self.assertFalse([c for c in board.calls if "cat=" in c])
+
+
+class KeepAndClear(Tmp):
+    DOWNLOAD = (csv_text(H30, [R1, R2]) + csv_text(H26, [R2, R3])).encode()   # two headers: nothing collapsed
+    CLEAR = "POST /obdlog?clear=1"
+
+    def routes(self, engine="off", bytes_=None, **over):
+        n = len(self.DOWNLOAD) if bytes_ is None else bytes_
+        overview = dict(OVERVIEW, engine=engine, link="live" if engine == "running" else "off",
+                        log={"en": True, "bytes": n, "rows": 3, "last": 0})
+        r = {"/obdjson": overview, "/json": dict(BOARD_JSON), "/obdlog.csv": self.DOWNLOAD,
+             self.CLEAR: {"ok": True, "en": True, "bytes": 0}}
+        r.update(over)
+        return r
+
+    def index(self):
+        return json.loads(self.read("pulled/index.json"))["files"]
+
+    def log_calls(self, board):
+        return [c for c in board.calls if "obdlog" in c]
+
+    def test_a_verified_download_with_the_engine_off_clears_the_board(self):
+        board = FakeBoard(self.routes())
+        status = self.run_once(board, 1_000)
+        self.assertEqual(self.log_calls(board), ["/obdlog.csv", self.CLEAR])
+        [entry] = self.index()
+        self.assertEqual((entry["file"], entry["rows"], entry["first"], entry["cleared_ts"]),
+                         ("obdlog_20260914_195210.csv", 4, R1["datetime"], 1_000))
+        self.assertEqual((self.dir / "pulled" / entry["file"]).read_bytes(), self.DOWNLOAD)
+        self.assertEqual((status["pull"]["board_bytes"], status["pull"]["clear_note"]), (0, "cleared"))
+        board2 = FakeBoard(self.routes(bytes_=0))
+        self.run_once(board2, 1_060)
+        self.assertEqual(self.log_calls(board2), [])                        # an empty log: nothing to do
+
+    def test_the_same_log_downloaded_again_replaces_its_file(self):
+        self.cfg.clear_board = 0
+        self.run_once(FakeBoard(self.routes()), 1_000)
+        r4 = reading("2026-09-14 19:53:41", 800)
+        grown = (csv_text(H30, [R1, R2]) + csv_text(H26, [R2, R3, r4])).encode()
+        self.run_once(FakeBoard(self.routes(bytes_=len(grown), **{"/obdlog.csv": grown})), 1_060)
+        [entry] = self.index()
+        self.assertEqual((entry["rows"], entry["pulled_ts"], entry["cleared_ts"]), (5, 1_060, None))
+        self.assertEqual((self.dir / "pulled" / entry["file"]).read_bytes(), grown)
+
+    def test_a_log_started_after_a_clear_gets_its_own_file(self):
+        self.run_once(FakeBoard(self.routes()), 1_000)
+        r5 = reading("2026-09-15 07:00:00", 900)
+        fresh = csv_text(H26, [r5]).encode()
+        self.run_once(FakeBoard(self.routes(bytes_=len(fresh), **{"/obdlog.csv": fresh})), 2_000)
+        self.assertEqual([f["file"] for f in self.index()],
+                         ["obdlog_20260914_195210.csv", "obdlog_20260915_070000.csv"])
+        self.assertEqual(pull.parse_log(self.read("obdlog.csv"))[0], [R1, R2, R3, r5])
+
+    def test_no_clear_while_the_engine_runs(self):
+        board = FakeBoard(self.routes(engine="running", **{
+            "/obdjson?cat=vehicle": vehicle_doc(), "/obdjson?cat=codes": codes_doc()}))
+        status = self.run_once(board, 1_000)
+        self.assertNotIn(self.CLEAR, board.calls)
+        self.assertIsNone(self.index()[0]["cleared_ts"])
+        self.assertIn("running", status["pull"]["clear_note"])
+
+    def test_no_clear_when_the_log_grew_after_the_download(self):
+        routes = self.routes()
+        grown = dict(routes["/obdjson"], log={"en": True, "bytes": len(self.DOWNLOAD) + 140, "rows": 4, "last": 0})
+        routes["/obdjson"] = [routes["/obdjson"], grown]
+        board = FakeBoard(routes)
+        status = self.run_once(board, 1_000)
+        self.assertNotIn(self.CLEAR, board.calls)
+        self.assertIn("grew", status["pull"]["clear_note"])
+
+    def test_no_clear_when_the_download_is_not_the_whole_log_and_no_retry_every_minute(self):
+        short = len(self.DOWNLOAD) + 500
+        board = FakeBoard(self.routes(bytes_=short))
+        status = self.run_once(board, 1_000)
+        self.assertNotIn(self.CLEAR, board.calls)
+        self.assertIn("not the whole log", status["pull"]["clear_note"])
+        board2 = FakeBoard(self.routes(bytes_=short))
+        self.run_once(board2, 1_060)
+        self.assertEqual(self.log_calls(board2), [])
+        board3 = FakeBoard(self.routes(bytes_=short))
+        self.run_once(board3, 1_000 + pull.CLEAR_RETRY_S)
+        self.assertIn("/obdlog.csv", board3.calls)                         # tried again an hour later
+
+    def test_a_failed_clear_is_not_retried_every_minute(self):
+        failing = {self.CLEAR: pull.BoardError(self.CLEAR + ": timed out")}
+        status = self.run_once(FakeBoard(self.routes(**failing)), 1_000)
+        self.assertIn("timed out", status["pull"]["clear_note"])
+        board2 = FakeBoard(self.routes(**failing))
+        self.run_once(board2, 1_060)
+        self.assertEqual(self.log_calls(board2), [])
+
+    def test_a_log_downloaded_before_clearing_existed_is_downloaded_again_and_cleared(self):
+        self.cfg.clear_board = 0
+        self.run_once(FakeBoard(self.routes()), 1_000)
+        self.cfg.clear_board = 1
+        board = FakeBoard(self.routes())
+        self.run_once(board, 1_060)
+        self.assertEqual(self.log_calls(board), ["/obdlog.csv", self.CLEAR])
+
+    def test_clearing_can_be_turned_off(self):
+        self.cfg.clear_board = 0
+        board = FakeBoard(self.routes())
+        self.run_once(board, 1_000)
+        self.assertNotIn(self.CLEAR, board.calls)
+
+    def test_download_complete(self):
+        header = len(",".join(H26)) + 1
+        text = csv_text(H26, [R1, R2]) + csv_text(H26, [R3])[header:]         # the board sent one header for two files
+        raw = text.encode()
+        self.assertTrue(pull.download_complete(raw, text, 0, len(raw)))
+        self.assertTrue(pull.download_complete(raw, text, 0, len(raw) + header))
+        self.assertFalse(pull.download_complete(raw, text, 0, len(raw) + 7))
+        self.assertFalse(pull.download_complete(raw, text, 1, len(raw)))
+        self.assertFalse(pull.download_complete(raw[:-1], text[:-1], 0, len(raw) - 1))
+        self.assertFalse(pull.download_complete(raw, text, 0, 0))
 
 
 class ConfigFromEnv(unittest.TestCase):

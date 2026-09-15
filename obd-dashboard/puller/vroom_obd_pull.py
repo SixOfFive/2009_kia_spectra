@@ -12,16 +12,20 @@ One run is one check. vroom-obd-pull.timer starts it every minute:
      big the log is (log.bytes) and whether the engine runs, and never opens the car
      link.
   2. When log.bytes changed, GET /obdlog.csv. The download is kept as
-     obdlog-board.csv and its rows are merged into obdlog.csv, which only grows.
+     obdlog-board.csv and as pulled/<its first row>.csv (one file per board log,
+     listed in pulled/index.json), and its rows are merged into obdlog.csv, which
+     only grows. With the engine off and the download verified whole, the board's
+     log is then cleared (POST /obdlog?clear=1): the VM holds the only copy.
   3. While the engine runs, read the values the log has no column for -- VIN,
      calibration ID, ECU name, OBD standard, fuel type, protocol, fault codes and
      readiness -- and keep the last non-empty value of each in vehicle.json and
      vehicle-info.txt. The board forgets them at every reboot.
   4. Write status.json for the page.
 
-Standard library only. Every request is a GET the board's own pages make. The board
-reads VIN and fault codes only while a page asks for that category, so step 3 asks the
-way the Vehicle and Fault codes pages do, then hands the board back to the Overview.
+Standard library only. Every request is one the board's own pages make: GETs, and the
+OBD log card's Clear. The board reads VIN and fault codes only while a page asks for that
+category, so step 3 asks the way the Vehicle and Fault codes pages do, then hands the
+board back to the Overview.
 """
 
 import argparse
@@ -53,6 +57,7 @@ class Config:
     board_every_s: int = 600         # board facts from /json
     settle_s: float = 5.0            # wait for the OBD task to read a category
     settle_tries: int = 4
+    clear_board: int = 1             # clear the board's log after a verified download, engine off
 
     ENV = {
         "VROOM_BOARD_URL": "board",
@@ -63,6 +68,7 @@ class Config:
         "VROOM_RESYNC_S": "resync_s",
         "VROOM_CAPTURE_EVERY_S": "capture_every_s",
         "VROOM_BOARD_EVERY_S": "board_every_s",
+        "VROOM_CLEAR_BOARD": "clear_board",
     }
 
     @classmethod
@@ -115,6 +121,21 @@ class Board:
         if not isinstance(doc, dict):
             raise BoardError(f"{path}: not a JSON object")
         return doc
+
+    def post(self, path: str) -> dict:
+        """One POST, never retried. The only one sent is the log clear."""
+        req = urllib.request.Request(self.base + path, data=b"", method="POST",
+                                     headers={"User-Agent": "vroom-obd-pull/" + VERSION})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
+                doc = json.loads(r.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            raise BoardError(f"POST {path}: HTTP {e.code}") from None
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+            raise BoardError(f"POST {path}: {getattr(e, 'reason', e)}") from None
+        except ValueError:
+            raise BoardError(f"POST {path}: not JSON") from None
+        return doc if isinstance(doc, dict) else {}
 
 
 # ---- the log ----------------------------------------------------------------------------
@@ -189,6 +210,53 @@ def render_csv(rows: list) -> str:
     for r in rows:
         w.writerow([r.get(c, "") for c in cols])
     return out.getvalue()
+
+
+# ---- downloads, one file per board log --------------------------------------------------
+
+PULLED = "pulled"          # data/pulled/: every board log as downloaded, and index.json
+CLEAR_RETRY_S = 3600       # a clear that could not be verified waits this long, unless the log changes
+
+
+def kept_name(rows: list) -> str:
+    """The file a board log is kept in, named after its first row: every download of the same
+    log replaces the last one, and the log the board starts after a clear gets its own."""
+    dt = rows[0]["datetime"]
+    return "obdlog_%s_%s.csv" % (dt[:10].replace("-", ""), dt[11:].replace(":", ""))
+
+
+def keep_download(d: Path, raw: bytes, rows: list, now: int) -> dict:
+    folder = d / PULLED
+    folder.mkdir(exist_ok=True)
+    name = kept_name(rows)
+    write_bytes(folder / name, raw)
+    times = [r["datetime"] for r in rows]
+    entry = {"file": name, "first": min(times), "last": max(times), "rows": len(rows),
+             "bytes": len(raw), "pulled_ts": now, "cleared_ts": None}
+    index = read_json(folder / "index.json")
+    files = [f for f in index.get("files") or [] if f.get("file") != name] + [entry]
+    files.sort(key=lambda f: f.get("first") or "")
+    write_json(folder / "index.json", {"files": files})
+    return entry
+
+
+def mark_cleared(d: Path, name: str, now: int) -> None:
+    path = d / PULLED / "index.json"
+    index = read_json(path)
+    for f in index.get("files") or []:
+        if f.get("file") == name:
+            f["cleared_ts"] = now
+    write_json(path, index)
+
+
+def download_complete(raw: bytes, text: str, dropped: int, board_bytes) -> bool:
+    """Whether a download holds the whole log: nothing cut off or unreadable, and its size is
+    the board's own count (log.bytes) -- or that count less one header line, which the
+    download leaves out when both generations on the board share a header."""
+    if dropped or not text.endswith("\n") or not board_bytes:
+        return False
+    header = len(text.split("\n", 1)[0].encode("utf-8")) + 1
+    return len(raw) in (board_bytes, board_bytes - header)
 
 
 # ---- single values ----------------------------------------------------------------------
@@ -349,6 +417,11 @@ def pull_decision(pull: dict, obd: dict, have_archive: bool, now: int, cfg: Conf
         if obd.get("engine") == "running" and wait > 0:
             return False, f"log growing; next download in {wait} s"
         return True, "log changed"
+    if cfg.clear_board and board_bytes and obd.get("engine") == "off" and obd.get("link") != "live":
+        tried = (pull.get("clear_try_bytes") == board_bytes
+                 and now - (pull.get("clear_try_ts") or 0) < CLEAR_RETRY_S)
+        if not tried:                              # e.g. a log downloaded before clearing existed
+            return True, "downloading to clear the board's log"
     if board_bytes and now - last_ok >= cfg.resync_s:
         return True, "daily re-check"
     return False, "log unchanged"
@@ -377,7 +450,7 @@ def pull_log(cfg: Config, board, status: dict, now: int) -> None:
     merged, added = merge_rows(old, rows)
     if added or not archive.exists():
         write_text(archive, render_csv(merged))
-    pull.update(ok_ts=now, fails=0, fail_ts=None, error=None,
+    pull.update(ok_ts=now, fails=0, fail_ts=None, error=None, clear_note=None,
                 seconds=round(time.monotonic() - started, 1), bytes=len(raw), rows=len(rows),
                 added=added, dropped=dropped,
                 board_bytes=((status.get("obd") or {}).get("log") or {}).get("bytes"))
@@ -390,6 +463,50 @@ def pull_log(cfg: Config, board, status: dict, now: int) -> None:
     }
     if added:
         say(f"log: {added} new rows, {len(merged)} kept")
+    if rows:
+        entry = keep_download(d, raw, rows, now)
+        pull["kept"] = entry["file"]
+        if cfg.clear_board:
+            clear_after(cfg, board, status, entry, raw, text, dropped, now)
+
+
+def clear_after(cfg: Config, board, status: dict, entry: dict, raw: bytes, text: str,
+                dropped: int, now: int) -> None:
+    """Clear the board's log once the VM holds all of it: the engine off, the download whole,
+    and nothing written since. A clear also drops rows still queued in the board's RAM,
+    which is one more reason a running engine always waits."""
+    pull = status["pull"]
+    obd = status.get("obd") or {}
+    board_bytes = (obd.get("log") or {}).get("bytes")
+    if obd.get("engine") != "off" or obd.get("link") == "live":
+        pull["clear_note"] = "not cleared: the engine is running"
+        return
+    pull.update(clear_try_ts=now, clear_try_bytes=board_bytes)
+    if not download_complete(raw, text, dropped, board_bytes):
+        pull["clear_note"] = f"not cleared: the download ({len(raw)} B) is not the whole log ({board_bytes} B)"
+        say("board log " + pull["clear_note"])
+        return
+    try:
+        again = board.json("/obdjson")
+        if again.get("engine") != "off" or again.get("link") == "live":
+            pull["clear_note"] = "not cleared: the engine started"
+            return
+        if (again.get("log") or {}).get("bytes") != board_bytes:
+            pull["clear_note"] = "not cleared: the log grew after the download"
+            return
+        answer = board.post("/obdlog?clear=1")
+    except BoardError as e:
+        pull["clear_note"] = "not cleared: " + str(e)
+        say("board log " + pull["clear_note"])
+        return
+    if answer.get("ok") is not True or answer.get("bytes") != 0:
+        pull["clear_note"] = "not cleared: the board answered " + json.dumps(answer)
+        say("board log " + pull["clear_note"])
+        return
+    mark_cleared(cfg.data_dir, entry["file"], now)
+    pull.update(cleared_ts=now, clear_note="cleared", board_bytes=0)
+    obd.setdefault("log", {})["bytes"] = 0
+    say(f"board log cleared; its {entry['rows']} rows are in {PULLED}/{entry['file']}")
 
 
 def capture_due(status: dict, overview: dict, now: int, cfg: Config) -> bool:

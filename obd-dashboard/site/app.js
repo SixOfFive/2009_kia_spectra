@@ -499,6 +499,12 @@
              (pull.dropped ? " · " + pull.dropped + " unreadable lines" : "")));
     }
     if (pull.error) row("Download problem", statusEl("warning", pull.error));
+    if (pull.cleared_ts || pull.clear_note) {
+      const notes = [pull.kept ? "kept as pulled/" + pull.kept : "",
+                     pull.clear_note && pull.clear_note !== "cleared" ? pull.clear_note : ""];
+      row("Board's log cleared", pull.cleared_ts ? ago(pull.cleared_ts) : "not yet",
+          el("span", "when", notes.filter(Boolean).join(" · ")));
+    }
     if (s.pull_note) row("Puller", s.pull_note);
     if (log.bytes !== undefined) {
       row("Log on the board", fmtBytes(log.bytes),

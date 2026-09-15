@@ -26,6 +26,8 @@
 #include "esp_task_wdt.h"   // task watchdog -- auto-reboot if the loop or safety task stalls
 #include <lwip/sockets.h>   // select() -- gate chunked sends without blocking (see waitWritable)
 #include "esp_system.h"     // esp_reset_reason() -- why the last boot happened
+#include "esp_core_dump.h"  // fw 4.79: /coredump -- where the last panic was
+#include "esp_partition.h"  // fw 4.79: reading the coredump partition
 #include "esp_sntp.h"       // NTP sync notification callback
 #include "esp_wifi.h"       // esp_wifi_set_protocol() -- force 802.11b for range/stability
 #include <BLEDevice.h>      // stack placed once at boot and kept up (fw 4.76): scans, connect test, OBD link
@@ -117,7 +119,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.78";
+const char* FW_VERSION = "4.79";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -346,10 +348,10 @@ const uint32_t BT_COOLDOWN_MS = 5000;
 // "malloc() prefers internal RAM up to here" threshold (heap_caps_malloc_extmem_enable)
 // to move web strings and JSON into PSRAM. lwIP in this core allocates with plain
 // malloc (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is off), so its packet buffers moved
-// into PSRAM as well -- a setup the core does not support. The one OTA that combined
-// it with btYieldForOta() taking the stack down took 202 s (113-137 s otherwise) and
-// rebooted reset=PANIC; each change alone was clean. It bought ~25 KB of headroom,
-// which is not worth running lwIP in an unsupported configuration. Leave it at 4096.
+// into PSRAM as well -- a setup the core does not support. It bought ~25 KB of
+// headroom, which is not worth running lwIP in an unsupported configuration. Leave it
+// at 4096. (An OTA under it rebooted reset=PANIC, but so did a later one on 4096: that
+// panic follows btYieldForOta()'s stack teardown, not this threshold. See /coredump.)
 // Free heap is not the binding constraint -- CONTIGUITY is. The stack wants
 // sizeable blocks, and HTTP traffic fragments the heap with String churn, so a
 // board reporting 170 KB free can still fail to place a 70 KB stack. Gate on the
@@ -6180,6 +6182,122 @@ void handleObdJson() {
 
 // GET /obdstate -- the session as seen from outside, WITHOUT counting as a page
 // poll, so it can watch the idle timeout run out. Diagnostics only.
+// ---------------------------------------------------------------------------
+// Core dump (fw 4.79). The core writes an ELF core dump to the `coredump` partition on
+// every panic (CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH). The board lives in the car with no
+// serial cable, so this is the only way to see where a panic happened:
+//   GET  /coredump?info=1   summary: task, PC, backtrace, cause, fault address, app SHA
+//   GET  /coredump          the raw dump, for esp-coredump
+//   POST /coredump?erase=1  clear it, so the next panic is unambiguous
+// A new panic overwrites the previous dump. Decode addresses with addr2line against the
+// ELF whose sha256 starts with app_sha.
+// ---------------------------------------------------------------------------
+void logCoreDumpAtBoot() {
+  if (esp_reset_reason() != ESP_RST_PANIC) return;
+  esp_core_dump_summary_t s;
+  if (esp_core_dump_image_check() != ESP_OK || esp_core_dump_get_summary(&s) != ESP_OK) {
+    logLine("  ^ panic: no readable core dump in flash");
+    return;
+  }
+  char sha[sizeof(s.app_elf_sha256) + 1];
+  memcpy(sha, s.app_elf_sha256, sizeof(s.app_elf_sha256));
+  sha[sizeof(s.app_elf_sha256)] = 0;
+  logLine("  ^ panic in task '%.16s' at PC %08lx (cause %lu, addr %08lx), app %s",
+          s.exc_task, (unsigned long)s.exc_pc, (unsigned long)s.ex_info.exc_cause,
+          (unsigned long)s.ex_info.exc_vaddr, sha);
+  uint32_t depth = s.exc_bt_info.depth > 16 ? 16 : s.exc_bt_info.depth;
+  for (uint32_t i = 0; i < depth; i += 8) {        // 8 addresses a line keeps it readable
+    char bt[8 * 9 + 1];
+    size_t o = 0;
+    bt[0] = 0;
+    for (uint32_t j = i; j < depth && j < i + 8; j++)
+      o += snprintf(bt + o, sizeof(bt) - o, " %08lx", (unsigned long)s.exc_bt_info.bt[j]);
+    logLine("  ^ backtrace%s:%s", s.exc_bt_info.corrupted ? " (corrupted)" : "", bt);
+  }
+}
+
+void handleCoreDump() {
+  trackReq();
+  if (server.method() == HTTP_POST) {
+    if (!server.hasArg("erase")) {
+      server.send(400, "application/json", "{\"ok\":false,\"detail\":\"use POST /coredump?erase=1\"}");
+      return;
+    }
+    bool ok = esp_core_dump_image_erase() == ESP_OK;
+    logLine("core dump erased from the web (%s)", ok ? "ok" : "failed");
+    server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"detail\":\"erase failed\"}");
+    return;
+  }
+  size_t addr = 0, size = 0;
+  bool have = esp_core_dump_image_check() == ESP_OK &&
+              esp_core_dump_image_get(&addr, &size) == ESP_OK && size > 0;
+  if (server.hasArg("info")) {
+    String o = "{\"ok\":true,\"present\":";
+    o += have ? "true" : "false";
+    if (have) {
+      char b[32];
+      o += ",\"size\":";
+      o += (unsigned long)size;
+      esp_core_dump_summary_t s;
+      if (esp_core_dump_get_summary(&s) == ESP_OK) {
+        char sha[sizeof(s.app_elf_sha256) + 1];
+        memcpy(sha, s.app_elf_sha256, sizeof(s.app_elf_sha256));
+        sha[sizeof(s.app_elf_sha256)] = 0;
+        char task[sizeof(s.exc_task) + 1];
+        memcpy(task, s.exc_task, sizeof(s.exc_task));
+        task[sizeof(s.exc_task)] = 0;
+        o += ",\"task\":\"";     obdJsonText(o, task);
+        snprintf(b, sizeof(b), "0x%08lx", (unsigned long)s.exc_pc);
+        o += "\",\"pc\":\"";     o += b;
+        o += "\",\"cause\":";    o += (unsigned long)s.ex_info.exc_cause;
+        snprintf(b, sizeof(b), "0x%08lx", (unsigned long)s.ex_info.exc_vaddr);
+        o += ",\"vaddr\":\"";    o += b;
+        o += "\",\"app_sha\":\""; obdJsonText(o, sha);
+        o += "\",\"bt_corrupted\":"; o += s.exc_bt_info.corrupted ? "true" : "false";
+        o += ",\"bt\":[";
+        uint32_t depth = s.exc_bt_info.depth > 16 ? 16 : s.exc_bt_info.depth;
+        for (uint32_t i = 0; i < depth; i++) {
+          snprintf(b, sizeof(b), "%s\"0x%08lx\"", i ? "," : "", (unsigned long)s.exc_bt_info.bt[i]);
+          o += b;
+        }
+        o += "]";
+      }
+      char reason[200];
+      if (esp_core_dump_get_panic_reason(reason, sizeof(reason)) == ESP_OK) {
+        reason[sizeof(reason) - 1] = 0;
+        o += ",\"reason\":\""; obdJsonText(o, reason); o += "\"";
+      }
+    }
+    o += "}";
+    server.send(200, "application/json", o);
+    return;
+  }
+  if (!have) {
+    server.send(404, "application/json", "{\"ok\":false,\"detail\":\"no core dump in flash\"}");
+    return;
+  }
+  const esp_partition_t* part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                                         ESP_PARTITION_SUBTYPE_DATA_COREDUMP, nullptr);
+  if (!part || addr < part->address || addr + size > part->address + part->size) {
+    server.send(500, "application/json", "{\"ok\":false,\"detail\":\"core dump outside its partition\"}");
+    return;
+  }
+  boundSendStall();
+  server.sendHeader("Content-Disposition", "attachment; filename=\"vroom-coredump.bin\"");
+  server.setContentLength(size);
+  server.send(200, "application/octet-stream", "");
+  char buf[1024];
+  for (size_t off = 0; off < size; ) {
+    size_t n = (size - off < sizeof(buf)) ? size - off : sizeof(buf);
+    if (esp_partition_read(part, addr - part->address + off, buf, n) != ESP_OK) break;
+    if (!waitWritable(4000)) break;                 // stalled client -> abort rather than block
+    server.sendContent(buf, n);
+    g_out_total += n;
+    off += n;
+    esp_task_wdt_reset();
+  }
+}
+
 // POST /obdnow -- "Read codes & VIN now" (fw 4.77). With the engine off, one session
 // connects, reads the fault codes and vehicle details (key at ON), and disconnects
 // until the engine starts. With the link already up it only asks for the codes again.
@@ -7635,6 +7753,7 @@ void setup() {
   WiFi.onEvent(onWiFiEvent);                        // verbose WiFi diagnostics -> event log
   logLine("boot: fw %s, CPU %u MHz, reset=%s",
           FW_VERSION, (unsigned)getCpuFrequencyMhz(), resetReasonName());
+  logCoreDumpAtBoot();                              // fw 4.79: where a panic was, from its core dump
   // If the last reset was the task watchdog, the breadcrumbs in RTC memory say
   // what each watched task was doing when it hung -- the stuck one names the
   // blocking op. (Guarded by a magic so a cold power-on doesn't print garbage.)
@@ -7683,6 +7802,7 @@ void setup() {
   server.on("/obdjson", HTTP_GET, handleObdJson);      // the OBD pages' data; a poll never opens the link (4.77)
   server.on("/obdcfg", HTTP_POST, handleObdCfg);       // remember or forget the reader
   server.on("/obdnow", HTTP_POST, handleObdNow);       // Read codes & VIN now: one read with the engine off
+  server.on("/coredump", HTTP_ANY, handleCoreDump);    // fw 4.79: the last panic's core dump (?info=1, ?erase=1)
   server.on("/obdstate", HTTP_GET, handleObdState);    // diagnostics; does not keep the link alive
   server.on("/obdlog.csv", HTTP_GET, handleObdLogCsv);  // the OBD log as one CSV
   server.on("/obdlog", HTTP_POST, handleObdLogCfg);      // logging on/off, clear

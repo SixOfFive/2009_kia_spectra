@@ -405,16 +405,18 @@ about 147&nbsp;KB).
   bought about 25&nbsp;KB of headroom, but lwIP in this core allocates with plain
   `malloc` (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` is off), so its packet buffers moved
   into PSRAM too &mdash; a setup the core does not support. It was reverted before
-  release. (An OTA under it rebooted `reset=PANIC`, but so did a later one on the default
-  threshold, so that panic belongs to the OTA stack teardown below, not the threshold.)
+  release. (An OTA under it was followed by a `reset=PANIC` boot. That panic comes from
+  the boot-time Bluetooth bring-up described below, not from the threshold.)
 - **An OTA upload is the one exception.** It ends any OBD link and takes the stack down
   as soon as nothing is using it; a good image reboots anyway. That keeps the stack's
   heap out of the upload's way, and it is the one remaining way to take the stack down
   remotely &mdash; the board lives in the car, so OTA must never depend on Bluetooth.
-  **Known issue (2026-09-14):** 2 of the 4 OTAs that took the stack down at upload start
-  rebooted `reset=PANIC/exception` after `OK - flashed` instead of cleanly. The new image
-  was already committed and booted each time, so updates work, but the restart is not
-  clean. Not explained yet.
+  **Known issue (2026-09-14):** 2 of the 7 boots that placed the stack at boot panicked,
+  both of them the first boot after an OTA. The fw&nbsp;4.79 core dump shows why. The
+  controller's interrupt is allocated on core&nbsp;0's IPC task, whose stack is only
+  1&nbsp;KB in this core (`CONFIG_ESP_IPC_TASK_STACK_SIZE=1024`), and it overflowed into
+  the end-of-stack watchpoint. Each time, the board rebooted and the next boot came up
+  cleanly. The OTA teardown is not involved.
 
 The idle stack's cost is mainly heap: nothing scans, advertises or connects unless
 asked, and with WiFi power-save off the shared radio is powered for WiFi anyway. Its
@@ -527,6 +529,29 @@ creating a client per test would leak all but the last. So the firmware creates 
 client per radio session, reuses it, and forgets it at every teardown &mdash; which
 is why every teardown path now goes through one function.
 
+### Core dumps (fw 4.79)
+
+Every panic leaves an ELF core dump in the `coredump` flash partition: the core is built
+with `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`. The board lives in the car with no serial
+cable, so 4.79 makes the dump readable over WiFi:
+
+- **After a panic reset**, the event log records the crashing task, program counter,
+  fault cause and address, the first characters of the crashing firmware's ELF SHA-256,
+  and the backtrace (`  ^ panic in task ...` and `  ^ backtrace: ...`).
+- **`GET /coredump?info=1`** returns the same as JSON, plus the core's own panic reason.
+- **`GET /coredump`** downloads the raw dump for `esp-coredump`.
+- **`POST /coredump?erase=1`** clears it. A new panic overwrites the previous dump anyway.
+
+To find the crash, run the backtrace through `addr2line` with the ELF of the firmware
+that crashed, the one whose `sha256sum` starts with `app_sha`:
+
+```
+xtensa-esp32s3-elf-addr2line -pfiaC -e voltage_monitor.ino.elf 0x42xxxxxx 0x40xxxxxx ...
+```
+
+The ELF sits in the build path as `voltage_monitor.ino.elf`, and the next build
+overwrites it. Keep a copy of every flashed build's ELF.
+
 ### API
 
 | Call | Does |
@@ -539,6 +564,9 @@ is why every teardown path now goes through one function.
 | `GET /btconnect?...&cmds=ATZ,ATI,...` | replace the default `ATZ,ATE0,ATI,ATRV` (allow list, at most 8) |
 | `GET /btconnect?...&keep=1` | `keep` is ignored since 4.76 &mdash; the stack always stays up |
 | `GET /btconnect` | poll; returns the result **once**, then resets to idle |
+| `GET /coredump?info=1` | the last panic's core dump: task, PC, cause, fault address, app SHA, backtrace, reason (fw 4.79) |
+| `GET /coredump` | download the raw core dump (404 if there is none) |
+| `POST /coredump?erase=1` | erase it |
 
 The start call answers *before* the radio comes up. It did the reverse once, and
 `BLEDevice::init()` starved the reply on the same core &mdash; a `202` that

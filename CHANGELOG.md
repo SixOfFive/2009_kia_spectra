@@ -14,6 +14,67 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-14 — fw 4.79: core dumps readable over WiFi, to find the OTA restart panic
+
+### Added — the last panic's core dump, over WiFi
+
+The core writes an ELF core dump to the `coredump` partition on every panic
+(`CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`). The board lives in the car with no serial cable,
+so until now nothing could read it.
+
+- **`GET /coredump?info=1`** returns the crashing task, program counter, fault cause and
+  address, the crashing firmware's ELF SHA-256 prefix, the backtrace, and the core's panic
+  reason.
+- **`GET /coredump`** streams the raw dump for `esp-coredump`.
+- **`POST /coredump?erase=1`** clears it.
+- **After a panic reset**, the boot log records the task, PC and backtrace, so every future
+  panic documents itself in the event log.
+
+### Fixed — a source comment still blamed the PSRAM threshold
+
+The NOT DONE note at the old threshold now says the OTA restart panic follows the Bluetooth
+stack teardown at upload start, as corrected in the 4.78 entry.
+
+### Found
+
+**The "OTA restart panic" is a stack overflow in core 0's IPC task during the boot-time
+Bluetooth bring-up, not the OTA teardown.** The dump left by the 20:19 panic carries the
+fw 4.78 app SHA (`c6fbd3c69`), so it came from the new image's first boot, not from 4.77's
+restart. Loaded into gdb with the matching ELF, the relevant tasks were:
+
+| Task | Doing |
+|---|---|
+| `loopTask` | `setup()` → `btBootStack()` → `BLEDevice::init` → `esp_bt_controller_init`, waiting on a semaphore |
+| BT controller | `r_intc_init` → `esp_ipc_call_blocking(cpu 0, btdm_intr_alloc)`, waiting for core 0's IPC task |
+| `ipc0` (crashed) | `vTaskSwitchContext` → `xPortEnterCriticalTimeout`, backtrace corrupted |
+
+- **The stack ran out.** `ipc0` has a 1024 B stack (`CONFIG_ESP_IPC_TASK_STACK_SIZE=1024`)
+  spanning 0x3fcae1f4–0x3fcae5f4. Its SP at the crash was 0x3fcae210, 28 B from the bottom.
+- **The end-of-stack watchpoint fired.** `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK` is on,
+  and the processor was at interrupt level 6 (debug), which is what that watchpoint raises.
+- **Why only sometimes:** the interrupt allocation runs on that task and needs a context
+  switch when a lock is contended. 2 of the 7 boots that placed the stack at boot panicked,
+  both the first boot after an OTA, and the board came up on the following boot each time.
+- **Superseded:** the 4.78 entry's attribution to the OTA teardown, and the source comment
+  this build corrected, are both wrong. The IPC stack size is fixed in this core's prebuilt
+  libraries.
+
+### Verified
+
+- The 4.78 → 4.79 OTA took the stack down at upload start and restarted `reset=software`.
+- `GET /coredump?info=1` returned the stored dump's summary: 24,260 B, with task, PC,
+  cause, app SHA and backtrace.
+- `GET /coredump` downloaded the same 24,260 B. The ELF core inside it loads in
+  `xtensa-esp32s3-elf-gdb`, with every task's backtrace.
+- Not verified: the boot-log panic lines (this boot was not a panic), and
+  `POST /coredump?erase=1`, left unused so the evidence stays in flash.
+
+### To undo
+
+Flash 4.78. Nothing new is stored. Erasing a dump only clears the `coredump` partition.
+
+---
+
 ## 2026-09-14 — fw 4.78: runs credited to the right source and dated by the ECU; the log keeps only what the car reports
 
 ### Fixed — runs the board started were logged as external, with a phantom start

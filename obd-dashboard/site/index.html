@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kia Spectra OBD-II log</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231a1a19'/%3E%3Cpath d='M5 22 L11 14 L16 18 L21 9 L27 15' fill='none' stroke='%233987e5' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top">
+  <div>
+    <h1>Kia Spectra <span class="h1-sub">OBD-II log</span></h1>
+    <p class="lede">The vroom board in the car logs a row every 30&nbsp;s while the engine runs. The projects VM
+      pulls that log and keeps every row; this page draws it from the CSV.</p>
+  </div>
+  <div class="live" id="live" role="status" aria-live="polite">
+    <span class="live-dot" aria-hidden="true"></span><span id="live-text">Loading&hellip;</span>
+  </div>
+</header>
+
+<nav class="filters" aria-label="What to show">
+  <div class="seg" role="group" aria-label="Time range" id="ranges">
+    <button type="button" data-range="drive">Last drive</button>
+    <button type="button" data-range="24h">24 h</button>
+    <button type="button" data-range="7d">7 days</button>
+    <button type="button" data-range="30d">30 days</button>
+    <button type="button" data-range="all">All</button>
+  </div>
+  <label class="field">Drive <select id="drive"></select></label>
+  <label class="check"><input type="checkbox" id="gaps" checked> Hide time between drives</label>
+  <button type="button" id="unzoom" class="chip" hidden>Zoomed in &middot; show the whole range</button>
+  <span class="grow"></span>
+  <a class="dl" href="data/obdlog.csv" download>obdlog.csv</a>
+  <a class="dl" href="data/vehicle-info.txt" download>vehicle-info.txt</a>
+</nav>
+
+<main>
+  <p class="empty" id="empty" hidden></p>
+
+  <section class="tiles" id="tiles" aria-label="Latest values"></section>
+
+  <section class="panels">
+    <article class="panel">
+      <h2>Vehicle</h2>
+      <p class="panel-note">Values with no column in the log. Each is the last one the board reported while the engine ran; the board forgets them at reboot, the VM does not.</p>
+      <dl class="facts" id="vehicle"></dl>
+    </article>
+    <article class="panel">
+      <h2>Fault codes &amp; readiness</h2>
+      <div id="codes"></div>
+    </article>
+    <article class="panel">
+      <h2>Board &amp; pull</h2>
+      <dl class="facts" id="board"></dl>
+    </article>
+  </section>
+
+  <div id="charts"></div>
+
+  <section class="panel states-panel" aria-label="Text values in the log">
+    <h2>Text values in the log</h2>
+    <p class="panel-note">State changes in the range shown, newest first.</p>
+    <div id="states"></div>
+  </section>
+
+  <section class="panel table-panel" aria-label="Rows">
+    <div class="table-head">
+      <h2>Rows <span class="muted" id="table-count"></span></h2>
+      <button type="button" id="table-toggle" class="chip">Show the rows as a table</button>
+    </div>
+    <div id="table-wrap" hidden>
+      <div class="table-scroll"><table id="table"></table></div>
+      <button type="button" id="table-more" class="chip" hidden>Show more rows</button>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span id="foot-parse"></span>
+  <span>Drag across a graph to zoom, double-click to zoom back out. Arrow keys step through a focused graph.</span>
+</footer>
+
+<div class="tip" id="tip" role="tooltip" hidden></div>
+
+<script src="chart.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

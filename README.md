@@ -165,6 +165,7 @@ the monitoring, which is covered standalone.)
 | `esp32/src/` | MicroPython firmware: controller, drivers, UART, KeeLoq, packet replay | **Yes — this is the v1 build** |
 | `esp32/tests/` | CPython unit tests for the firmware (no hardware needed) | Yes |
 | `sdr/` | RTL-SDR capture walkthrough, demod scripts, synth-driven tests | Yes (one-time FOB capture) |
+| `obd-dashboard/` | The OBD-II log page on the projects VM, and the puller that keeps the log and the VIN and fault codes there ([README](obd-dashboard/README.md)) | No — optional |
 | `pi/app/` | Pi daemon: STATE, UART listener, MQTT, Flask dashboard, SNMP responder | No — v2 only |
 | `pi/systemd/` + `pi/setup/` | Pi systemd unit + idempotent `provision.sh` | No — v2 only |
 | `pi/tests/` | Pi-side unit tests | No — v2 only |
@@ -202,6 +203,9 @@ foreach ($f in Get-ChildItem pi/tests/test_*.py) { python $f.FullName }
 
 # SDR tests — synth-driven round-trips through the demod pipeline
 foreach ($f in Get-ChildItem sdr/tests/test_*.py) { python $f.FullName }
+
+# OBD dashboard puller tests — no board, no network
+python obd-dashboard/tests/test_pull.py
 
 # Lint (catches real bugs — unused imports, undefined names, etc.)
 python -m pip install ruff

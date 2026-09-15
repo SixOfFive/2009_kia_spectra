@@ -1,0 +1,12 @@
+# vroom OBD-II log: check the car's board every minute. A check that finds the log
+# unchanged costs the board one small JSON answer.
+[Unit]
+Description=vroom OBD-II log - check the car's board every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

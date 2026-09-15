@@ -53,6 +53,14 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Run OBD dashboard puller tests
+        run: |
+          for t in obd-dashboard/tests/test_*.py; do
+            echo "::group::$t"
+            python "$t"
+            echo "::endgroup::"
+          done
+
       - name: Smoke-test Flask routes
         run: |
           python -c "

@@ -14,6 +14,81 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-15 — OBD-II log dashboard on the projects VM
+
+### Added — a page that graphs the car's OBD log, with the log kept on the projects VM
+
+The board keeps its OBD log in two generations of about 512 KB and drops the older when the
+newer fills. Until now the only way to see it was the board's own *Download CSV* link.
+`obd-dashboard/` adds three things.
+
+- **A puller on the projects VM.** `puller/vroom_obd_pull.py` runs every minute from
+  `vroom-obd-pull.timer`. It asks the board `GET /obdjson`, and downloads `/obdlog.csv`
+  only when `log.bytes` changed. While the engine runs that is at most every 2 minutes, and
+  it backs off after a failure. Rows are merged into
+  `/var/www/html/vroom/data/obdlog.csv`, which only grows, so rows the board later drops
+  stay on the VM.
+- **The single values the log has no column for:** VIN, calibration ID, ECU name, OBD
+  standard, fuel type, protocol, reader, stored, pending and permanent codes, and readiness
+  monitors. Each is kept as the last non-empty value read while the engine ran, in
+  `vehicle.json` and the downloadable `vehicle-info.txt`. The board forgets them at every
+  reboot.
+- **The page, http://192.168.15.3/vroom/.** Graphs are built in the browser from the CSV.
+  - Hovering shows a crosshair on every graph, with the value and the reading's date and
+    time. Dragging zooms.
+  - Ranges: last drive, 24 h, 7 or 30 days, all, or any single drive. Drives sit side by
+    side with the time between them hidden.
+  - It also shows latest values, text-state changes, a table view and the board's state.
+  - It re-reads `data/` every 30 s and never talks to the car.
+
+CI now also runs `obd-dashboard/tests/test_pull.py`.
+
+### Found — the board reads VIN and fault codes only while a page asks for them
+
+During a normal drive with no page open, the OBD task polls only the Overview values and
+the log's sweep. `obdReadInfo` runs only when `g_obdWant` is the Vehicle category, or on
+*Read codes & VIN now*. Fault codes are read only when it is the Fault codes category.
+`g_obdWant` stays at whatever the last `/obdjson?cat=` asked for.
+
+So the puller asks for each category while the engine runs and waits up to 20 s for the
+read. It then asks for the Overview, which returns the task to its default, even when a
+request failed. The log's 30-second sweep does not depend on `g_obdWant`.
+
+### Found — the car's WiFi link makes requests slow, not the client
+
+Back-to-back requests to the parked car took 0.02 s one time and 2–3 s the next, with curl
+and Python alike. The CSV itself streamed in 0.1 s. One puller run hit a 15 s stall and
+succeeded on its retry, so the timeouts are 15 s with one retry for JSON and 180 s for the
+CSV.
+
+### Changed — on the projects VM, outside this repo
+
+- **Landing page** (`/var/www/html/index.html`): a *vroom — Kia OBD-II log* card under
+  *Static sites*. The page before the edit is `index.html.bak-pre-vroom`.
+- **New:** `/opt/vroom-obd/`, `/etc/systemd/system/vroom-obd-pull.{service,timer}`,
+  `/etc/apache2/conf-available/vroom.conf` (enabled) and `/var/www/html/vroom/`.
+
+### Verified
+
+- **Unit tests:** 19 pass. They cover merging across the 30- and 26-column formats,
+  cut-off downloads, pull decisions, the single-value rules, handing the board back after a
+  failed read, and no SSID or BSSID in `status.json`.
+- **A real run against the board, engine off:** 10 rows pulled into 26 columns, and
+  `status.json` held only the whitelisted fields.
+- **On the VM:** the timer checks every minute, and Apache serves the CSV gzip-compressed
+  with an ETag. The page draws the car's rows.
+- **With 334 synthetic rows over 7 drives:** both axis modes (gaps hidden and real time),
+  zoom, the tooltip (`2,310 rpm · Engine speed · Mon 2026-09-14 08:08:30`), and light and
+  dark themes.
+- **Not verified:** capturing the VIN and fault codes with the engine running. The car has
+  not run since the deploy.
+
+### To undo
+
+See *To undo* in `obd-dashboard/README.md`. The board's firmware is unchanged.
+
+---
+
 ## 2026-09-14 — fw 4.79: core dumps readable over WiFi, to find the OTA restart panic
 
 ### Added — the last panic's core dump, over WiFi

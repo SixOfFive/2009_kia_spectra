@@ -1,0 +1,18 @@
+# vroom OBD-II log: one check of the car's board (see puller/vroom_obd_pull.py).
+# Started every minute by vroom-obd-pull.timer. Installed by deploy/deploy.sh.
+[Unit]
+Description=vroom OBD-II log - check the car's board and keep its log
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=node
+Group=node
+Environment=VROOM_DATA_DIR=/var/www/html/vroom/data
+# Optional overrides (VROOM_BOARD_URL=..., see Config in the puller); not created by deploy.sh.
+EnvironmentFile=-/etc/default/vroom-obd
+ExecStart=/usr/bin/python3 /opt/vroom-obd/vroom_obd_pull.py
+Nice=10
+# A full log over the car's WiFi link is slow; a capture while the engine runs adds ~40 s.
+TimeoutStartSec=420

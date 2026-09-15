@@ -108,6 +108,7 @@ CHAT.txt
 # Claude Code local settings + agent worktrees (not shared)
 .claude/settings.local.json
 .claude/worktrees/
+.claude/launch.json
 
 # Auto-generated vault-context file (per-project Obsidian links); regenerated
 # from the vault and shouldn't be tracked.

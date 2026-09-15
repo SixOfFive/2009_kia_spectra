@@ -14,6 +14,130 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-14 — fw 4.76: Bluetooth is placed once at boot, and a running engine opens the OBD link
+
+### Found — bring-ups, not scans or links, were fragmenting the heap into refusals
+
+Reported from the OBD page: *"memory is too fragmented to start Bluetooth - reboot the
+board to fix it"*. The log shows why. 4.72's idle auto-off had taken the stack down at
+17:14:59, so the page's next use needed a fresh bring-up, and earlier test bring-ups had
+already left the largest free block below the 60 KB the stack needs. A reboot at
+17:30:50 cleared it and the link opened at 17:31:11. Half an hour and one link session
+later, 4.75 already read **186,016 B free with the largest block at 86,004 B**; a fresh
+boot measures about 147 KB.
+
+The board has **8 MB of PSRAM, 7.9 MB of it unused**. Every refusal was about the
+~310 KB of internal RAM. The core (3.3.10) ships `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`,
+so every allocation up to 4 KB — web strings, JSON bodies, the BLE library's objects —
+landed in the same internal RAM as the stack. NimBLE itself is built
+`CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL` and cannot move without rebuilding the core.
+
+### Changed — the Bluetooth stack is placed once at boot and never taken down
+
+- `btBootStack()` runs after WiFi connects, before `server.begin()` and before the
+  safety task is created. It logs the largest block before and after.
+- Removed the 5-minute idle auto-off (`BT_IDLE_OFF_MS`) and the per-scan and per-test
+  teardown (`keep` is now always on). The Debug page loses its *keep the radio up* box
+  and **Radio off** button; `GET /btscan?off=1` answers 409 with the reason.
+- If the boot bring-up ever fails, a scan, the connect test or the OBD link still
+  attempt their own bring-up behind the old heap checks.
+
+### Not done — moving general allocations into PSRAM (tried, reverted before release)
+
+Lowering the core's 4096 B "`malloc()` prefers internal RAM up to here" threshold to
+128 B (`heap_caps_malloc_extmem_enable`) bought about 25 KB of internal headroom with the
+stack up (129.7 KB free, against 102–116 KB on the default). But lwIP in this core
+allocates with plain `malloc` (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` is off,
+`lwipopts.h`), so its packet buffers moved into PSRAM too — a configuration the core does
+not support. The OTAs run while testing:
+
+| OTA | Threshold | Stack taken down at upload start | Upload | Reboot |
+|---|---|---|---|---|
+| 4.75 → 4.76 | 4096 | no (already down from the idle auto-off) | 113 s | software |
+| test | 128 | yes | 202 s | **PANIC/exception** |
+| reverting flash | 128 | no (already down) | 133 s | software |
+| test | 4096 | yes | 137 s | software |
+| test | 4096 | yes | 121 s | software |
+
+The panic came only with both changes together, one sample each, so no mechanism is
+proven. The threshold was the optional part, so it stays at the core's default, and a
+comment at the old constant records why. Page loads were no faster with it: five rounds
+of 14 pages took 68–99 s per round, against 21–75 s on the default.
+
+### Changed — the board connects to the OBD reader when it sees the engine running
+
+- `obdEngineMaybeStart()` replaces `obdLogMaybeStart()`. When the voltage detector
+  confirms the engine is running (5 s), the loop core opens the link, whatever the log
+  setting and with no page open, and holds it for the drive.
+- `obdShouldStop()` is now `g_otaActive || (pageIdle && !engRunning) || reader changed`. With the
+  engine off, only a polling OBD page holds a link, which drops 60 s after its last
+  poll. Nothing talks to the car's bus while it is parked, so the dongle can sleep.
+- The log reads `OBD: link opened for the running engine`. A refused start is retried
+  every 30 s and logged once per drive.
+- The log toggle now only decides whether rows are written.
+
+### Added — an OTA upload takes precedence over Bluetooth
+
+The board lives in the car, so OTA is the only practical way to update it, and 4.76
+removed the one remote way to take the stack down. `obdShouldStop()` now returns true
+while `g_otaActive`. `btYieldForOta()` runs at `UPLOAD_FILE_START` and on every chunk,
+and takes the stack down as soon as no link, scan or test is using it. A good image
+reboots; a failed one brings the stack back on its next use. The log reads
+`BT: stack taken down for the OTA upload (a good image reboots)`.
+
+### Added — a reboot button beside the advice to reboot
+
+- **OBD page:** a **Reboot board** button appears next to any link reason that advises
+  a reboot. It reboots at once, with no confirm, pauses polling for 15 s, and notes that
+  auto-start protection re-arms 15 min after boot.
+- **Debug page:** its existing button now appears for any refusal that advises a reboot,
+  not only the "fragmented" text. It keeps its confirm.
+- `obdStartSession()` now reports "too little free memory" separately from "too
+  fragmented". Both still advise a reboot.
+
+### Added — `/json` `wifi_ps_drv`
+
+This is the WiFi driver's actual power-save mode (0 none, 1 min-modem, 2 max-modem).
+`wifi_ps` only reports the requested setting, and the Bluetooth stack now stays up
+beside WiFi.
+
+### Verified
+
+Car off, on the board in the car. Shipped build `Sep 14 2026 18:41:50`.
+
+- **The stack is placed at boot.** Every 4.76 boot logged `BT: stack placed at boot and kept
+  up`, with the largest free block at 159–167 KB before and 87–99 KB after. With the engine
+  off and no page open, no OBD link opens.
+- **WiFi power-save stays off.** `wifi_ps_drv` reads 0 with the stack up.
+- **Scans** (run on the 128 B build, before the revert): four back to back, all completed
+  (14–16 devices), with the largest block flat at 69.6–81.9 KB. 4.71's keep-up mode fell
+  from 61 KB to 37 KB over six scans.
+- **Web load** (shipped build): five rounds of all 14 pages. Free heap stayed at 90–115 KB
+  and the largest block at 31.7–63.5 KB, dipping and recovering with no drift. 1 of 70
+  requests failed, an incomplete `/wifi`.
+- **Connections** (shipped build): three connect tests to the Veepeak took 4–17 s each.
+  Two OBD-page links opened in 2–4 s, reported *no OBD bus found* with the car off, and
+  closed 62–69 s after the last poll. Free heap after each read 82–89 KB with no
+  downward trend. The largest block stepped down once, at the first connection
+  (53 → 31.7 KB), and then held.
+- **OTA with the stack up:** see the table above. Both OTAs on the shipped threshold
+  took the stack down at upload start, answered `OK - flashed` and rebooted
+  `reset=software`.
+- **The OBD page's Reboot board button** renders beside a reason that advises a reboot, with its click handler bound, and not beside other reasons. This was checked in a browser against the served page by rendering a refusal; the button was not clicked. Both page scripts pass `node --check`.
+
+### Not verified
+
+- A drive: the link opening by itself when the engine starts, logged rows, and
+  OBD-timed run edges.
+- The idle stack's current draw.
+
+### To undo
+
+Flash 4.75 (`git revert` this commit and rebuild). No NVS keys or files were added or
+changed.
+
+---
+
 ## 2026-09-14 — fw 4.75: an OBD log, and the ECU times engine runs
 
 ### Added — a CSV of the OBD values, every 30 s while the car answers

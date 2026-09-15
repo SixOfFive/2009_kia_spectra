@@ -340,10 +340,11 @@ older firmware bug, not a drive still in progress.
 ## 7c. Debug tab &mdash; the BLE scanner
 
 `/debug` scans for nearby Bluetooth LE devices, and tests whether the board can
-actually talk to one. **The radio is off in normal operation and this page is the
-only thing that turns it on**: a scan brings the stack up, listens, and puts it
-back down. Nothing is stored or paired, and nothing is connected to unless you
-press **Test** on a result (see *Connection test* below).
+actually talk to one. **Since fw&nbsp;4.76 the Bluetooth stack is placed once at boot
+and stays up** (see *Why the stack stays up* below); the radio itself only works
+while something scans or holds a link. Nothing is stored or paired, and nothing is
+connected to unless you press **Test** on a result (see *Connection test* below) or
+the OBD link is up.
 
 Per device you get name, address, public/random, RSSI and advertised service
 UUIDs &mdash; enough to recognise a specific dongle.
@@ -359,53 +360,57 @@ clones are Classic; the BLE ones exist because iOS will not do arbitrary SPP,
 which makes &ldquo;works with iPhone&rdquo; a reliable tell. The scanner can
 prove a device *is* BLE. It can never prove one is not.
 
-### Scanning repeatedly &mdash; tick "keep the radio up"
+### Why the stack stays up
 
-**Bringing the BLE stack up and down is what fragments the heap. Scanning is much
-cheaper.** That distinction is the whole trick to using this page.
+**Bringing the BLE stack up and down is what fragments the heap &mdash; not scanning,
+and not connecting.** Each up/down cycle cost contiguity and never gave it back.
+Over three cycles the largest free block fell **131&nbsp;KB &rarr; 65&nbsp;KB &rarr;
+55&nbsp;KB** while *total* free heap barely moved: free heap is not the binding
+constraint, contiguity is. NimBLE needs roughly 70&nbsp;KB, including a ~60&nbsp;KB
+contiguous placement, and below that it could not be placed at all. Waiting never
+helped &mdash; a board left alone overnight was still refusing **16 hours later**
+(184&nbsp;KB free, largest block 55&nbsp;KB). Only a reboot did.
 
-Each up/down cycle costs contiguity and does not give it back. Over three cycles
-the largest free block fell **131&nbsp;KB &rarr; 65&nbsp;KB &rarr; 55&nbsp;KB**
-while *total* free heap barely moved &mdash; free heap is not the binding
-constraint, contiguity is. NimBLE needs roughly 70&nbsp;KB placed contiguously,
-so below a 60&nbsp;KB largest block it cannot be placed at all, and you get
-**about two scans per boot**.
+Firmware 4.71&ndash;4.75 managed that rather than removing it. A *keep the radio up*
+box reused one bring-up across scans (six scans instead of about two), and the radio
+dropped itself after 5&nbsp;minutes idle to hand its heap back &mdash; which meant a
+fresh bring-up the next time anything needed Bluetooth. On 2026-09-14 an OBD page
+opened after such a drop was refused with *memory is too fragmented to start
+Bluetooth*; after a reboot, half an hour and one link session later, 4.75's largest
+block was already down to 86&nbsp;KB with 186&nbsp;KB free (a fresh boot measures
+about 147&nbsp;KB).
 
-Ticking **keep the radio up** places the stack once and reuses it. Six scans back
-to back, all completing:
+**fw&nbsp;4.76 removes the cause.**
 
-| Scan | Devices | Largest block |
-|---|---|---|
-| 1 | 12 | 61428 |
-| 2 | 12 | 57332 |
-| 3 | 13 | 40948 |
-| 4 | 11 | 40948 |
-| 5 | 11 | 36852 |
-| 6 | 13 | 36852 |
-| *Radio off* | &mdash; | *65524 recovered* |
+- The stack is placed **once, at boot** &mdash; after WiFi connects, before the web
+  server takes traffic and before the safety task exists &mdash; and is never taken
+  down, so there is no later bring-up left to refuse. The *keep the radio up* box and
+  **Radio off** are gone; `GET /btscan?off=1` answers 409 and says why.
+- **Not done: moving general allocations into the 8&nbsp;MB of PSRAM.** Lowering the
+  core's 4&nbsp;KB "`malloc()` prefers internal RAM up to here" threshold to 128&nbsp;bytes
+  bought about 25&nbsp;KB of headroom, but lwIP in this core allocates with plain
+  `malloc` (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` is off), so its packet buffers moved
+  into PSRAM too &mdash; a setup the core does not support. The one OTA that combined it
+  with the stack being taken down at upload start took 202&nbsp;s and rebooted
+  `reset=PANIC`; either change alone was clean (133&nbsp;s and 137&nbsp;s). It was
+  reverted before release.
+- **An OTA upload is the one exception.** It ends any OBD link and takes the stack down
+  as soon as nothing is using it; a good image reboots anyway. That keeps the stack's
+  heap out of the upload's way, and it is the one remaining way to take the stack down
+  remotely &mdash; the board lives in the car, so OTA must never depend on Bluetooth.
 
-**An improvement, not a cure.** The block still steps down as you scan, so a
-session gets longer rather than unlimited &mdash; but six scans beats two.
+The idle stack's cost is mainly heap: nothing scans, advertises or connects unless
+asked, and with WiFi power-save off the shared radio is powered for WiFi anyway. Its
+current draw has not been measured. `/json` carries `bt_up`, `heap_free`,
+`heap_block` and, since 4.76, `wifi_ps_drv` &mdash; the WiFi driver's *actual*
+power-save mode (0 = off; `wifi_ps` is only the requested setting), which shows the
+stack did not quietly turn power-save back on.
 
-The box is **ticked by default**, and the radio **drops itself after 5 minutes
-with no scan**, so it cannot be left on by forgetting. **Radio off** ends it
-immediately. That matters because a radio left up holds ~70&nbsp;KB of heap and
-burns real current on a board whose whole purpose is not draining the battery.
-
-### The fragmentation does not recover on its own
-
-Worth being blunt about, because it is the failure you are most likely to hit.
-A board left alone **overnight** was still refusing scans **16 hours later** &mdash;
-184&nbsp;KB free, largest block 55&nbsp;KB. Two scans the previous afternoon had
-taken it from 147&nbsp;KB to 57&nbsp;KB and it simply stayed there. Normal
-operation neither worsens nor heals it.
-
-So once you are below the limit, **only a reboot helps** &mdash; waiting will not.
-
-Watch it coming: `/json` carries `heap_block` (largest contiguous block) and
-`bt_up`, and the page prints the block on every result. When it does run out a
-**Reboot board** button appears; a reboot defragments fully, at the cost of
-~20&nbsp;s of sampling and a 15-minute park-confirm re-arm before auto-start
+If the boot bring-up ever fails, the log says so, and a scan, the connect test or the
+OBD link each still attempt their own bring-up behind the old heap checks. A refusal
+that advises a reboot comes with a **Reboot board** button beside it &mdash; on the OBD
+page it reboots at once, with no confirm; on this page it still asks first. A reboot
+costs ~20&nbsp;s of sampling and a 15-minute park-confirm re-arm before auto-start
 protection is live again.
 
 ### Why a scan is refused rather than attempted
@@ -510,12 +515,12 @@ is why every teardown path now goes through one function.
 | Call | Does |
 |---|---|
 | `GET /btscan?s=<2..15>` | start a scan, returns `202` at once |
-| `GET /btscan?s=<n>&keep=1` | ...and leave the radio up afterwards |
+| `GET /btscan?s=<n>&keep=1` | `keep` is ignored since 4.76 &mdash; the stack always stays up |
 | `GET /btscan` | poll; returns the result **once**, then resets to idle |
-| `GET /btscan?off=1` | put the radio down now |
+| `GET /btscan?off=1` | retired in 4.76: answers 409 &mdash; the stack stays up from boot |
 | `GET /btconnect?addr=<mac>&t=<public\|random>` | start a connect test, returns `202` at once |
 | `GET /btconnect?...&cmds=ATZ,ATI,...` | replace the default `ATZ,ATE0,ATI,ATRV` (allow list, at most 8) |
-| `GET /btconnect?...&keep=1` | ...and leave the radio up afterwards |
+| `GET /btconnect?...&keep=1` | `keep` is ignored since 4.76 &mdash; the stack always stays up |
 | `GET /btconnect` | poll; returns the result **once**, then resets to idle |
 
 The start call answers *before* the radio comes up. It did the reverse once, and
@@ -563,13 +568,16 @@ firmware change. Close any phone app connected to the dongle first.
 
 ### When the board holds the link
 
-**While an OBD page is open, or while logging is on and the engine runs.** Every
-page poll (each 2&nbsp;s) keeps the link alive, and 60&nbsp;s after the last one the
-board disconnects &mdash; unless the log still wants it (see *The OBD log* below). A live BLE
-connection costs about 88&nbsp;KB of heap on a board whose real job is the
-auto-start, so holding it for a page nobody is looking at is the wrong trade. The
-Bluetooth stack stays up for the usual 5&nbsp;minutes afterwards, so coming straight
-back reconnects without another bring-up.
+**While the engine runs, and while an OBD page is open.** Since fw&nbsp;4.76 the board
+connects by itself as soon as it sees the engine running (charging voltage, confirmed
+in 5&nbsp;s) &mdash; no page needed, logging on or off &mdash; and holds the link for
+the drive. With the engine off, every page poll (each 2&nbsp;s) keeps the link alive,
+and 60&nbsp;s after the last one the board disconnects. So nothing talks to the car's
+bus while it is parked and nobody is looking, and the dongle is free to sleep. A live
+BLE connection costs about 88&nbsp;KB of heap on a board whose real job is the
+auto-start: accepted while driving, when the auto-start has nothing to do, and the
+wrong trade for a page nobody is looking at. The Bluetooth stack itself stays up from
+boot, so a new link never needs a bring-up.
 
 **A page in a background tab does not count.** The page stops polling while it is
 hidden, so the link drops about a minute after you switch away. This was found the
@@ -580,7 +588,8 @@ runs a background tab's timers roughly once a minute &mdash; often enough to kee
 link (`OBD: link opened for 192.168.15.x`), so a link nobody expects can be traced.
 
 While the link is held, the Debug page's scanner and connect test refuse, saying
-why &mdash; there is one radio.
+why &mdash; there is one radio. While the engine runs, that is the whole drive. An OTA
+upload ends the link (see *Why the stack stays up* in &sect;7c).
 
 On connecting, the board resets the dongle (`ATZ`), sets the reply format the parser
 expects (`ATE0 ATL0 ATS1 ATH0`), selects automatic protocol search (`ATSP0`, the only
@@ -590,8 +599,9 @@ one of these the dongle saves), then asks the car what it supports.
 
 The dongle stays powered &mdash; OBD pin&nbsp;16 is always live &mdash; but the car
 is not listening. The page says *Reader connected &mdash; the car is not answering*,
-and the board asks again every 15&nbsp;s, so turning the key to ON is picked up
-without touching the page. The engine does not have to run.
+and while the page stays open the board asks again every 15&nbsp;s, so turning the key
+to ON is picked up without touching it. For a page the engine does not have to run;
+with no page open, the board only connects once the engine runs.
 
 ### How the data is read
 
@@ -623,11 +633,12 @@ Then comes one column per value, with the unit in the name (`coolant_C`,
 check-engine light and the stored-code count. A value the car did not report is an
 empty cell, so the columns never shift. **Nothing is written while the car is off.**
 
-A log needs the link while you drive, not only while a page is open. So with logging
-on, **the board connects to the reader by itself when the engine starts** and holds
-the link for the drive. That is about 88&nbsp;KB of heap, accepted while driving,
-when the auto-start has nothing to do. The connection follows the engine-start
-voltage edge, which itself takes 5&nbsp;s to confirm.
+A log needs the link while you drive, not only while a page is open &mdash; and since
+fw&nbsp;4.76 the board holds it regardless: **it connects to the reader by itself when
+the engine starts**, logging on or off, and keeps the link for the drive (see *When
+the board holds the link*). Logging only decides whether rows are written. The
+connection follows the engine-start voltage edge, which itself takes 5&nbsp;s to
+confirm.
 
 The Overview's **OBD log** card turns logging on and off (remembered in NVS),
 downloads the whole log as one CSV, and clears it. Two generations of about
@@ -659,7 +670,7 @@ on the fire path reads the run state that OBD now helps decide.
 
 | Call | Does |
 |---|---|
-| `GET /obdjson` | Overview data; starts the link if a reader is set up, and keeps it alive |
+| `GET /obdjson` | Overview data; starts the link if a reader is set up, and keeps it alive while the engine is off (while it runs, the board holds the link anyway) |
 | `GET /obdjson?cat=<key>` | one category: `engine`, `fuel`, `electrical`, `trip`, `codes`, `vehicle` |
 | `GET /obdjson?cat=codes&refresh=1` | ...and re-read the fault codes now |
 | `POST /obdcfg?addr=<mac>&t=<public\|random>` | remember the reader |

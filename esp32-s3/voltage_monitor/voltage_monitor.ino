@@ -28,7 +28,7 @@
 #include "esp_system.h"     // esp_reset_reason() -- why the last boot happened
 #include "esp_sntp.h"       // NTP sync notification callback
 #include "esp_wifi.h"       // esp_wifi_set_protocol() -- force 802.11b for range/stability
-#include <BLEDevice.h>      // debug page only: a scan or a one-shot connect test, radio off otherwise
+#include <BLEDevice.h>      // stack placed once at boot and kept up (fw 4.76): scans, connect test, OBD link
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLEClient.h>      // /btconnect -- can the board talk to a dongle, not just see it
@@ -117,7 +117,7 @@ static uint8_t          protoBits();
 static wifi_power_t     txEnumFor(float dbm);
 
 
-const char* FW_VERSION = "4.75";
+const char* FW_VERSION = "4.76";
 // Compile stamp, so a board in the field can be matched to a build without
 // guessing from the version alone (two flashes can share a version during
 // development). Shown in the footer of every page and in /json.
@@ -337,11 +337,19 @@ const uint32_t BT_MIN_HEAP    = 130000;     // refuse to bring the stack up belo
 // NimBLE's teardown is not instantaneous. Starting a fresh init() seconds after
 // a deinit() panicked repeatedly; this gap lets the controller settle first.
 const uint32_t BT_COOLDOWN_MS = 5000;
-// Keeping the stack up is the difference between ~2 scans and a whole session,
-// but a radio left on by accident costs ~70 KB of heap and real current on a
-// board whose entire job is not draining the battery. So it turns itself off
-// once you stop using it, which is what makes keep-up safe to default ON.
-const uint32_t BT_IDLE_OFF_MS = 300000;     // 5 min with no scan -> radio down
+// fw 4.76: the stack is placed ONCE, at boot, and never taken down. 4.72 turned the
+// radio off after 5 min idle to hand its ~70 KB back, but every bring-up/teardown
+// cycle left the heap more fragmented until a bring-up could not be placed at all
+// ("memory is too fragmented to start Bluetooth"), and only a reboot cured that.
+// Placed at boot, there is no later bring-up left to refuse.
+// NOT DONE -- tried while testing 4.76, then reverted: lowering the core's 4096 B
+// "malloc() prefers internal RAM up to here" threshold (heap_caps_malloc_extmem_enable)
+// to move web strings and JSON into PSRAM. lwIP in this core allocates with plain
+// malloc (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is off), so its packet buffers moved
+// into PSRAM as well -- a setup the core does not support. The one OTA that combined
+// it with btYieldForOta() taking the stack down took 202 s (113-137 s otherwise) and
+// rebooted reset=PANIC; each change alone was clean. It bought ~25 KB of headroom,
+// which is not worth running lwIP in an unsupported configuration. Leave it at 4096.
 // Free heap is not the binding constraint -- CONTIGUITY is. The stack wants
 // sizeable blocks, and HTTP traffic fragments the heap with String churn, so a
 // board reporting 170 KB free can still fail to place a 70 KB stack. Gate on the
@@ -3839,20 +3847,18 @@ const char DEBUG_HTML[] PROGMEM = R"HTML(
 <div class="card">
 <div class="pwrrow">
 <div><div class="k">Scan for nearby BLE devices</div>
-<div class="v" style="font-size:15px" id="btstat">radio is off</div></div>
+<div class="v" style="font-size:15px" id="btstat">checking&hellip;</div></div>
 <div style="text-align:right">
 <button class="seg" id="btgo" data-s="6">Scan 6 s</button>
 <button class="seg" id="btgo2" data-s="12">Scan 12 s</button>
-<button class="seg" id="btoff" style="display:none;margin-left:6px">Radio off</button>
 <button class="seg" id="btboot" style="display:none;margin-left:6px">Reboot board</button>
 <div class="k" style="margin-top:8px;text-transform:none;letter-spacing:0">
-<label><input type="checkbox" id="btkeep" checked> keep the radio up between scans</label>
-<span style="opacity:.7"> &mdash; drops automatically after 5 min idle</span></div></div>
+<span style="opacity:.7">the Bluetooth stack stays up from boot</span></div></div>
 </div>
 <div class="k" style="margin-top:10px;line-height:1.7;text-transform:none;letter-spacing:0">
-The radio is <b>off in normal operation</b>. A scan brings the stack up, listens, and puts it
-back down; nothing is stored or paired, and nothing is connected to unless you press
-<b>Test</b> on a result.
+The Bluetooth stack is <b>placed once at boot and stays up</b>; the radio only works while
+something scans or holds a link. Nothing is stored or paired, and nothing is connected to
+unless you press <b>Test</b> on a result, or the OBD link is up (engine running, or an OBD page open).
 <br><br><b>This is BLE only &mdash; the ESP32-S3 has no Bluetooth Classic radio at all.</b>
 A Classic (SPP) device is invisible here, so <b>an empty result does not mean nothing is
 there</b>. Most cheap ELM327 dongles are Classic; the BLE ones exist because iOS will not do
@@ -3861,21 +3867,12 @@ arbitrary SPP, which is why &ldquo;works with iPhone&rdquo; is a reliable tell.
 this page arrived over. The scan runs on its own task, so the dashboard stays live throughout and the results appear
 when it finishes &mdash; a 5&nbsp;s scan takes about 8&nbsp;s door to door. Expect WiFi to feel
 slightly slower while it runs, since both radios share one antenna.
-<br><br><b>Bringing the stack up and down is what costs you, not scanning.</b> Each cycle
-fragments the heap and does not undo it &mdash; the largest free block fell 131&nbsp;KB &rarr;
-65&nbsp;KB &rarr; 55&nbsp;KB over three cycles. Below 60&nbsp;KB the ~70&nbsp;KB stack can no
-longer be placed and a scan is <b>refused rather than attempted</b>, because earlier firmware
-tried anyway and panicked the board.
-<br><br>So if you are going to scan more than once or twice, tick <b>keep the radio up</b>: the
-stack is placed once and reused instead of being rebuilt every time. Measured back to back,
-six scans in a row all completed that way (largest block 61&nbsp;&rarr;&nbsp;37&nbsp;KB) where
-tearing down each time refuses after about two. It is an improvement, <b>not a cure</b> &mdash;
-scanning still costs a few&nbsp;KB a time, so the session is longer, not unlimited.
-<br><br>It is ticked by default, and the radio <b>drops itself after 5&nbsp;minutes with no
-scan</b>, so it cannot be left on by accident &mdash; it holds ~70&nbsp;KB of heap and keeps a
-second radio powered while up. <b>Radio off</b> ends it immediately.
-<br><br>Note the fragmentation <b>does not recover on its own</b>: a board left alone overnight
-was still refusing scans 16&nbsp;hours later. Once you are below the limit only a reboot helps.
+<br><br><b>Bringing the stack up and down was what cost memory, not scanning.</b> Each cycle
+fragmented the heap and never undid it &mdash; the largest free block fell 131&nbsp;KB &rarr;
+65&nbsp;KB &rarr; 55&nbsp;KB over three cycles, and below 60&nbsp;KB the ~70&nbsp;KB stack could
+not be placed again until a reboot. Since fw&nbsp;4.76 the stack is placed <b>once, at boot</b>,
+while memory is still one clean block, and never taken down, so there is no later bring-up
+left to refuse.
 </div>
 </div>
 <div class="clbl">Result</div>
@@ -3919,15 +3916,12 @@ function btEnd(){ if(btTimer){clearInterval(btTimer);btTimer=null;}
   $("btgo").disabled=false; $("btgo2").disabled=false; }
 function btRender(d){
   var st=$("btstat"), meta=$("btmeta");
-  st.textContent=d.bt_up_now?"radio LEFT UP":"radio off again";
-  st.style.color=d.bt_up_now?"#d29922":"#3fb950";
+  st.textContent="scan finished";
+  st.style.color="#3fb950";
   meta.textContent=d.n+" device(s) in "+d.secs+" s \u00b7 heap "+Math.round(d.heap_before/1024)+" KB before, "
     +Math.round(d.heap_up/1024)+" KB with the stack up, "+Math.round(d.heap_after/1024)+" KB after"
     +" \u00b7 largest free block "+Math.round((d.block_before||0)/1024)+" KB before the scan"
     +" \u00b7 most of the dip returns within seconds, but fragmentation does not";
-  $("btoff").style.display = d.bt_up_now ? "" : "none";
-  // Only nag about rebooting when keeping the radio up is not already the answer.
-  if((d.block_before||0)<90000 && !d.bt_up_now) $("btboot").style.display="";
   var dv=(d.dev||[]).slice().sort(function(a,b){return b.rssi-a.rssi});
   if(!dv.length){ $("bttab").innerHTML='<tbody><tr><td class="k">nothing advertising &mdash; remember a '
     +'Bluetooth Classic device cannot appear here</td></tr></tbody>'; return; }
@@ -3962,23 +3956,17 @@ function btScan(sec){
   // filled the single-connection server and the browser logged a wall of
   // ERR_CONNECTION_RESET while the board itself was perfectly healthy.
   if(window.POLLIV){ clearInterval(window.POLLIV); window.POLLIV=null; }
-  fetch("/btscan?s="+sec+($("btkeep").checked?"&keep=1":""),{cache:"no-store"})
+  fetch("/btscan?s="+sec,{cache:"no-store"})
     .then(function(r){return r.json()}).then(function(d){
     if(!d.ok){ btEnd(); $("btstat").textContent="could not start"; $("btstat").style.color="#f85149";
                $("btmeta").textContent=d.detail||d.state||"";
-               if(/fragment/.test(d.detail||"")) $("btboot").style.display=""; return; }
+               if(/reboot/i.test(d.detail||"")) $("btboot").style.display=""; return; }
     if(btTimer)clearInterval(btTimer);
     btTimer=setInterval(btPoll,2000);
   }).catch(function(e){ btEnd(); $("btstat").textContent="could not start";
                         $("btstat").style.color="#f85149"; $("btmeta").textContent="request failed"; });
 }
 $("btgo").onclick=function(){btScan(6)};
-$("btoff").onclick=function(){ fetch("/btscan?off=1",{cache:"no-store"})
-  .then(function(r){return r.json()}).then(function(d){
-    $("btoff").style.display="none";
-    $("btstat").textContent="radio off again"; $("btstat").style.color="#3fb950";
-    $("btmeta").textContent="radio down \u00b7 largest free block "+Math.round((d.heap_block||0)/1024)+" KB";
-  }).catch(function(e){}); };
 $("btboot").onclick=function(){ if(!confirm("Reboot the board? Sampling pauses for ~20 s and "
   +"park-confirm re-arms, delaying auto-start protection by 15 min."))return;
   $("btmeta").textContent="rebooting\u2026 this page will come back on its own";
@@ -4016,7 +4004,6 @@ function bcRender(d){
   row("Heap","largest block "+Math.round((d.block_before||0)/1024)+" KB before, "
       +Math.round((d.block_after||0)/1024)+" KB after \u00b7 radio "+(d.bt_up_now?"left up":"off again"));
   $("bctab").innerHTML=h+"</tbody>";
-  $("btoff").style.display=d.bt_up_now?"":"none";
 }
 function bcPoll(){
   fetch("/btconnect",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
@@ -4035,12 +4022,11 @@ function bcRun(mac,t){
   bcMsg("working \u2014 a device that is not there takes about 30 s to give up on");
   if(window.POLLIV){ clearInterval(window.POLLIV); window.POLLIV=null; }
   var q="/btconnect?addr="+encodeURIComponent(mac)+"&t="+encodeURIComponent(t)
-    +($("btkeep").checked?"&keep=1":"")
     +($("bcobd").checked?"&cmds="+encodeURIComponent("ATZ,ATE0,ATI,ATRV,ATSP0,0100,010C"):"");
   fetch(q,{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
     if(!d.ok){ bcEnd(); $("bcstat").textContent="could not start"; $("bcstat").style.color="#f85149";
                bcMsg(d.detail||d.state||"");
-               if(/fragment/.test(d.detail||"")) $("btboot").style.display=""; return; }
+               if(/reboot/i.test(d.detail||"")) $("btboot").style.display=""; return; }
     if(bcTimer)clearInterval(bcTimer);
     bcTimer=setInterval(bcPoll,2000);
   }).catch(function(e){ bcEnd(); $("bcstat").textContent="could not start";
@@ -4051,10 +4037,10 @@ $("bttab").onclick=function(e){ var b=e.target.closest("button[data-mac]");
 $("bcagain").onclick=function(){ if(bcLast) bcRun(bcLast.mac,bcLast.t); };
 $("btgo2").onclick=function(){btScan(12)};
 fetch("/json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){
-  if(d.bt_up){ $("btoff").style.display="";
-    $("btstat").textContent="radio is UP"; $("btstat").style.color="#d29922"; }
+  $("btstat").textContent=d.bt_up?"ready \u00b7 Bluetooth stack up since boot":"Bluetooth stack is DOWN \u2014 the boot bring-up failed; a scan will retry it";
+  $("btstat").style.color=d.bt_up?"#3fb950":"#f85149";
   $("btmeta").textContent="no scan run yet \u00b7 largest free block "
-    +Math.round((d.heap_block||0)/1024)+" KB (the stack needs ~70 KB placed contiguously)";
+    +Math.round((d.heap_block||0)/1024)+" KB with the stack up";
 }).catch(function(e){});
 </script>
 </body></html>
@@ -4169,7 +4155,7 @@ function logCard(d){
     +"<a href=\"/obdlog.csv\" style=\"margin:0 6px\">Download CSV</a>"
     +"<button class=\"seg\" id=\"logclr\""+(L.bytes?"":" disabled")+">Clear</button></div></div>"
     +"<div class=\"note\">A row every 30 s while the car answers, date and time first; nothing is written while it is off. "
-    +"With logging on, the board connects to the reader by itself when the engine starts and holds the link for the drive. "
+    +"The board connects to the reader by itself when it sees the engine running and holds the link for the drive, logging on or off. "
     +"Two generations of about 512 KB are kept.</div></div>";
 }
 function electrical(d){
@@ -4224,13 +4210,16 @@ function render(d){
   $("lstat").textContent=L[0]+(d.link==="live"&&d.proto_name?" \u00b7 "+d.proto_name:"");
   $("lstat").style.color=L[1];
   var det=[];
-  if(d.why&&d.link!=="live")det.push(esc(d.why));
+  if(d.why&&d.link!=="live"){det.push(esc(d.why));
+    // Advice to reboot comes with the button that does it (fw 4.76).
+    if(/reboot/i.test(d.why))det.push("<button class=\"seg\" id=\"obdboot\">Reboot board</button>");}
   if(d.elm)det.push(esc(d.elm));
   if(d.atrv!==null)det.push("dongle supply "+d.atrv.toFixed(1)+" V");
   if(d.rssi&&(d.link==="live"||d.link==="no-car"||d.link==="starting"))det.push("signal "+d.rssi+" dBm");
   if(d.reader)det.push("reader <code>"+esc(d.reader)+"</code>");
   if(d.link==="no-car")det.push("turn the key to ON and it picks up within about 15 s");
   $("ldet").innerHTML=det.join(" &middot; ");
+  var ob=$("obdboot"); if(ob)ob.onclick=obdReboot;
   $("chg").style.display=d.reader?"":"none";
   $("setup").style.display=(!d.reader||SCANNING)?"":"none";
   var h="";
@@ -4249,11 +4238,18 @@ function render(d){
     if(!confirm("Delete the whole OBD log, both generations? This cannot be undone."))return;
     lc.disabled=true; fetch("/obdlog?clear=1",{method:"POST"}).catch(function(){});};
 }
+// One tap, no confirm: the button only appears beside the board's own advice to reboot.
+var REBOOTING=false;
+function obdReboot(){ REBOOTING=true;
+  $("lstat").textContent="rebooting\u2026"; $("lstat").style.color="#d29922";
+  $("ldet").textContent="the board is restarting; this page picks up again by itself in about 20 s \u00b7 auto-start protection re-arms 15 min after boot";
+  fetch("/reboot",{method:"POST"}).catch(function(){});
+  setTimeout(function(){REBOOTING=false},15000); }
 // A hidden tab stops polling, so the board drops the link a minute later instead of
 // holding ~88 KB for a page nobody is looking at. Browsers still run a background
 // tab's timers about once a minute, which would otherwise keep the link up forever.
 function tick(){
-  if(SCANNING||document.hidden){setTimeout(tick,2000);return;}
+  if(SCANNING||REBOOTING||document.hidden){setTimeout(tick,2000);return;}
   var q="/obdjson"+(CAT?"?cat="+encodeURIComponent(CAT):"");
   if(REFRESH){q+=(CAT?"&":"?")+"refresh=1";REFRESH=false;}
   fetch(q,{cache:"no-store"}).then(function(r){return r.json()}).then(render)
@@ -4406,6 +4402,14 @@ void handleCpuPage()     { trackReq(); sendPage(CPU_HTML); }
 void handleMemPage()     { trackReq(); sendPage(MEM_HTML); }
 
 
+// The driver's power-save mode, not the requested one (WiFi.getSleep() reports what
+// was asked for): 0 none, 1 min-modem, 2 max-modem, -1 unknown. fw 4.76 keeps the
+// BLE stack up beside WiFi; this shows it did not quietly turn power-save back on.
+static int wifiPsDrv() {
+  wifi_ps_type_t t;
+  return esp_wifi_get_ps(&t) == ESP_OK ? (int)t : -1;
+}
+
 void handleJson() {
   trackReq();
   float v  = g_lastV;                // cached by the safety task (it owns the ADC)
@@ -4427,7 +4431,7 @@ void handleJson() {
   char json[1650];
   snprintf(json, sizeof(json),
     "{\"vbatt\":%.2f,\"temp_c\":%.1f,\"adc_mv\":%d,\"divider\":%.3f,\"cal\":%.3f,"
-    "\"rssi\":%d,\"uptime_s\":%lu,\"heap_free\":%u,\"heap_total\":%u,\"heap_block\":%u,\"bt_up\":%s,"
+    "\"rssi\":%d,\"uptime_s\":%lu,\"heap_free\":%u,\"heap_total\":%u,\"heap_block\":%u,\"bt_up\":%s,\"wifi_ps_drv\":%d,"
     "\"psram_free\":%u,\"psram_total\":%u,\"disk_used\":%u,\"disk_total\":%u,"
     "\"mode\":\"%s\",\"ip\":\"%s\",\"interval_s\":%d,\"samples\":%d,\"led\":\"%s\",\"fw\":\"%s\",\"rf\":\"%s\","
     "\"ssid\":\"%s\",\"bssid\":\"%s\",\"ch\":%d,\"phy\":\"%s\",\"txpwr_dbm\":%.2f,\"proto\":\"%s\","
@@ -4446,7 +4450,7 @@ void handleJson() {
     "\"fs_wr_b\":%lu,\"fs_wr_n\":%lu,\"sb_n\":%d}",
     v, tC, g_last_mv, DIVIDER, CAL, rssi, (unsigned long)(millis() / 1000),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
-    (unsigned)ESP.getMaxAllocHeap(), g_btUp ? "true" : "false",
+    (unsigned)ESP.getMaxAllocHeap(), g_btUp ? "true" : "false", wifiPsDrv(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
     (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes(),
     apMode ? "ap" : "sta", ip.c_str(), (int)(SAMPLE_MS / 1000), histCount, voltStatus(v), FW_VERSION,
@@ -4763,6 +4767,34 @@ static void btStackDown() {
   g_bcClient = nullptr;
 }
 
+// fw 4.76: place the stack once, from setup(), while internal RAM is still one clean
+// block; nothing takes it down again. If it fails here, a scan, the connect test and
+// the OBD link each still attempt their own bring-up behind btBringUpRefusal().
+void btBootStack() {
+  uint32_t before = ESP.getMaxAllocHeap();
+  if (!BLEDevice::init("")) {
+    logLine("BT: stack bring-up FAILED at boot (largest block %u KB); a scan or the OBD link will retry",
+            (unsigned)(before / 1024));
+    return;
+  }
+  g_btUp = true;
+  logLine("BT: stack placed at boot and kept up (largest block %u KB before, %u KB after)",
+          (unsigned)(before / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024));
+}
+
+// fw 4.76: an OTA upload wants the internal RAM the stack holds, and a good image
+// reboots, so nothing after it needs the stack. obdShouldStop() ends any OBD link
+// once g_otaActive is set; the stack goes as soon as nothing is using it. With
+// "Radio off" retired this is also the one remaining way to take it down remotely.
+// Called from the upload handler (loop core) at start and on every chunk.
+static void btYieldForOta() {
+  if (g_btUp && !g_obdAlive && g_btState != BTS_RUNNING && g_bcState != BCS_RUNNING) {
+    btStackDown();
+    g_btLastEnd = millis();
+    logLine("BT: stack taken down for the OTA upload (a good image reboots)");
+  }
+}
+
 // EVERY guard here exists for BLEDevice::init(), so callers apply it only while
 // the stack is down (see the note in handleBtScan). Returns 0 when a bring-up may
 // go ahead, otherwise the HTTP status to refuse with, and the body to send.
@@ -4772,8 +4804,7 @@ static int btBringUpRefusal(String& body) {
     body = String("{\"ok\":false,\"detail\":\"heap is too fragmented to place the BLE stack: ")
          + (freeNow / 1024) + " KB free but the largest single block is only " + (blockNow / 1024)
          + " KB, and it needs ~60 KB contiguous. Reboot to defragment -- this does not recover "
-           "on its own. Leave 'keep the radio up' ticked afterwards and one bring-up covers the "
-           "whole session.\"}";
+           "on its own. After a reboot the stack is placed at boot and stays up.\"}";
     return 503;
   }
   if (freeNow < BT_MIN_HEAP) {
@@ -4886,7 +4917,7 @@ void handleBtScan() {
       say(409, "{\"ok\":false,\"detail\":\"a connect test is using the radio\"}"); return;
     }
     if (g_obdAlive) {
-      say(409, "{\"ok\":false,\"detail\":\"the OBD pages are using the radio; it frees itself a minute after they close\"}"); return;
+      say(409, "{\"ok\":false,\"detail\":\"the OBD link is using the radio; it frees itself a minute after the OBD pages close, unless the engine is running\"}"); return;
     }
     int secs = server.arg("s").toInt();
     if (secs < 2) secs = 2;
@@ -4903,7 +4934,7 @@ void handleBtScan() {
       if (code) { say(code, why); return; }
     }
     g_btSecs = secs; g_btJson = ""; g_btErr[0] = 0;
-    g_btKeep = server.hasArg("keep");
+    g_btKeep = true;                  // fw 4.76: the stack stays up; teardowns fragmented the heap
     g_btStart = millis(); g_btState = BTS_RUNNING;
     // ANSWER FIRST, THEN BRING THE RADIO UP. Spawning the task before sending
     // meant BLEDevice::init() starved the send on the same core: a 202 that
@@ -4917,13 +4948,8 @@ void handleBtScan() {
     return;
   }
 
-  if (server.hasArg("off")) {                        // ---- put the radio down ----
-    if (g_btState == BTS_RUNNING) { say(409, "{\"ok\":false,\"detail\":\"a scan is running\"}"); return; }
-    if (g_bcState == BCS_RUNNING) { say(409, "{\"ok\":false,\"detail\":\"a connect test is running\"}"); return; }
-    if (g_obdAlive) { say(409, "{\"ok\":false,\"detail\":\"the OBD pages are using the radio\"}"); return; }
-    if (g_btUp) { btStackDown(); g_btLastEnd = millis();
-                  logLine("BT: radio switched off from the debug page"); }
-    say(200, String("{\"ok\":true,\"bt_up_now\":false,\"heap_block\":") + ESP.getMaxAllocHeap() + "}");
+  if (server.hasArg("off")) {                        // ---- retired in fw 4.76 ----
+    say(409, "{\"ok\":false,\"detail\":\"the Bluetooth stack stays up from boot since fw 4.76 -- taking it down and bringing it back is what fragmented memory\"}");
     return;
   }
 
@@ -5270,7 +5296,7 @@ void handleBtConnect() {
 
   if (server.hasArg("addr")) {                      // ---- start ----
     if (g_bcState == BCS_RUNNING || g_btState == BTS_RUNNING || g_obdAlive) {
-      say(409, "{\"ok\":false,\"detail\":\"the radio is busy with a scan, another test, or the OBD pages\"}"); return;
+      say(409, "{\"ok\":false,\"detail\":\"the radio is busy with a scan, another test, or the OBD link (it frees itself a minute after the OBD pages close, unless the engine is running)\"}"); return;
     }
     String a = server.arg("addr"); a.trim(); a.toLowerCase();
     bool addrOk = a.length() == 17;
@@ -5304,7 +5330,7 @@ void handleBtConnect() {
     strlcpy(g_bcAddr, a.c_str(), sizeof(g_bcAddr));
     g_bcAddrType = (server.arg("t") == "random") ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
     g_bcCmds = cmds;
-    g_bcKeep = server.hasArg("keep");
+    g_bcKeep = true;                  // fw 4.76: the stack stays up
     g_bcJson = ""; g_bcErr[0] = 0;
     g_bcStart = millis(); g_bcState = BCS_RUNNING;
     // Answer first, then touch the radio -- the scan learned this in 4.71.
@@ -5330,12 +5356,12 @@ void handleBtConnect() {
 // OBD-II pages (fw 4.74) -- live data from the car through the BLE ELM327
 // dongle whose connection 4.73 proved.
 //
-// The link is held only while an OBD page is open. A live BLE connection cost
-// ~88 KB of heap in the 4.73 measurements, on a board whose real job is the
-// auto-start, so the pages keep the link alive by polling and it is dropped
-// OBD_IDLE_MS after the last poll. The stack itself then stays up for the usual
-// BT_IDLE_OFF_MS, so coming straight back does not pay another bring-up --
-// bring-ups, not connections, are what fragment the heap.
+// The link is held while the engine runs -- since fw 4.76 the board connects by
+// itself when it sees charging voltage, page or no page -- and while an OBD page
+// polls; with the engine off it is dropped OBD_IDLE_MS after the last poll. A live
+// BLE connection cost ~88 KB of heap in the 4.73 measurements. The stack itself is
+// placed at boot and never taken down: bring-ups, not connections, are what
+// fragment the heap.
 //
 // One task owns the dongle: connect, initialise the ELM327, ask the car which
 // PIDs it supports, then poll only what the open page shows. Results go into
@@ -5459,9 +5485,9 @@ static void obdJsonText(String& o, const char* s) {
 static bool obdShouldStop(const char* addr) {
   uint32_t last = g_obdLastPoll;                 // read before millis(), so never "in the future"
   bool pageIdle = millis() - last > OBD_IDLE_MS;
-  // With logging on, the log wants the link for as long as the engine runs.
-  bool logging = g_obdLogEn && engRunning;
-  return (pageIdle && !logging) || strcmp(addr, g_obdAddr) != 0;
+  // A running engine holds the link whatever the log setting (fw 4.76); with the
+  // engine off, only a page that is still polling does.
+  return g_otaActive || (pageIdle && !engRunning) || strcmp(addr, g_obdAddr) != 0;   // an OTA upload ends it
 }
 
 // Sleep in short slices, waking early when the pages close or the reader changes.
@@ -5831,13 +5857,13 @@ void obdTask(void* arg) {
   obdSetLink(OBD_OFF, nullptr);                   // keep the last reason for the page to show
   g_obdHoldFrom = millis();
   g_obdHoldMs = g_obdFatal ? 60000UL : 0UL;
-  g_btLastEnd = millis();                         // the idle auto-off counts from here
+  g_btLastEnd = millis();                         // only a fallback bring-up's cooldown reads this now
   logLine("OBD: link closed after %lu s", (unsigned long)((millis() - t0) / 1000));
   g_obdAlive = false;                             // LAST: a new session may start from here on
   vTaskDelete(nullptr);
 }
 
-// Start a session for the page that just polled, unless something else holds the
+// Start a session for a page that polled or the running engine, unless something else holds the
 // radio or the heap cannot place the stack. `why` explains a refusal.
 static bool obdStartSession(String& why, const char* who) {
   if (g_btState == BTS_RUNNING || g_bcState == BCS_RUNNING) {
@@ -5848,7 +5874,12 @@ static bool obdStartSession(String& why, const char* who) {
     String body;
     int code = btBringUpRefusal(body);
     if (code == 429) { why = "the radio is settling after its last use"; return false; }
-    if (code) { why = "memory is too fragmented to start Bluetooth - reboot the board to fix it"; return false; }
+    if (code) {                                   // only if the boot bring-up failed (fw 4.76)
+      why = ESP.getMaxAllocHeap() < BT_MIN_BLOCK
+          ? "memory is too fragmented to start Bluetooth - reboot the board to fix it"
+          : "too little free memory to start Bluetooth - reboot the board to fix it";
+      return false;
+    }
   }
   portENTER_CRITICAL(&g_obdMux);
   memset(&g_obd, 0, sizeof(g_obd));
@@ -6082,10 +6113,10 @@ void handleObdCfg() {
 // first column is local date and time. A value the car did not report is an empty
 // cell, so the columns never shift.
 //
-// Logging defaults ON. While it is on and the engine runs, the loop core starts
-// the link itself (obdLogMaybeStart) and the link is held for the whole drive --
-// the ~88 KB a held link costs is accepted while driving, when the auto-start has
-// nothing to do.
+// Logging defaults ON. Since fw 4.76 the link does not depend on it: the loop core
+// connects whenever the engine runs (obdEngineMaybeStart) and holds the link for the
+// whole drive -- the ~88 KB a held link costs is accepted while driving, when the
+// auto-start has nothing to do. Logging only decides whether rows are written.
 // ---------------------------------------------------------------------------
 const size_t OBD_LOG_CAP  = 512UL * 1024UL;       // per generation
 const char*  OBD_LOG_FILE = "/obdlog.csv";
@@ -6188,21 +6219,22 @@ void flushObdLogToFlash() {
   }
 }
 
-// With logging on, an engine that starts wants the link. LOOP CORE (a bring-up may
-// happen here). A refusal -- radio busy, heap too fragmented -- is retried every
-// 30 s rather than every pass, and logged once per drive.
-void obdLogMaybeStart() {
+// fw 4.76: when the board sees the engine running it connects to the reader itself --
+// no page needed, logging on or off. LOOP CORE. The stack is up from boot, so a
+// refusal means a Debug-page scan or test holds the radio (or the boot bring-up
+// failed); it is retried every 30 s and logged once per drive.
+void obdEngineMaybeStart() {
   static uint32_t lastTry = 0;
   static bool     warned  = false;
   if (!engRunning) { warned = false; return; }
-  if (!g_obdLogEn || !g_obdAddr[0] || g_obdAlive) return;
+  if (!g_obdAddr[0] || g_obdAlive) return;
   if (millis() - g_obdHoldFrom < g_obdHoldMs) return;
   if (lastTry && millis() - lastTry < 30000UL) return;
   lastTry = millis();
   String why;
-  if (obdStartSession(why, "the log")) return;
+  if (obdStartSession(why, "the running engine")) return;
   if (!warned) {
-    logLine("OBD: log link refused: %s", why.c_str());
+    logLine("OBD: could not connect for the running engine: %s", why.c_str());
     warned = true;
   }
 }
@@ -7485,6 +7517,7 @@ void setup() {
         g_otaActive = true;                 // core 0 stops touching the filesystem
         server.client().setTimeout(OTA_STALL_MS);   // ride out link stalls; see OTA_STALL_MS
         Serial.printf("OTA start: %s\n", u.filename.c_str());
+        btYieldForOta();                    // fw 4.76: the stack's RAM goes to the upload
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
           Update.printError(Serial);
           logLine("OTA REJECTED at start: %s", Update.errorString());
@@ -7493,6 +7526,7 @@ void setup() {
       } else if (u.status == UPLOAD_FILE_WRITE) {
         loopMark("ota");
         esp_task_wdt_reset();   // a 1.1 MB OTA over weak WiFi can span many seconds; keep the WDT fed
+        btYieldForOta();        // once an OBD link or a scan has let go of the radio
         if (Update.write(u.buf, u.currentSize) != u.currentSize) {
           Update.printError(Serial);
           logLine("OTA WRITE FAILED at %u bytes: %s",
@@ -7552,6 +7586,10 @@ void setup() {
     ESP.restart();
   });
   server.onNotFound(handleDash);
+  // fw 4.76: place the Bluetooth stack now -- WiFi is up, no HTTP traffic has carved up
+  // internal RAM yet, and the safety task does not exist yet -- and keep it for the
+  // life of the boot.
+  btBootStack();
   server.begin();
   Serial.println("HTTP up. / dashboard, /json data, /history CSV, /transmit RF.");
 
@@ -7682,13 +7720,8 @@ void loop() {
     flushRunsToFlash();                             // and any engine start/stop events
     flushObdLogToFlash();                           // and any OBD log rows
     flushDailyToFlash();                            // and the daily bucket, at midnight
-    // Never while a scan or connect test is live -- it owns the stack until it finishes.
-    if (g_btUp && g_btState != BTS_RUNNING && g_bcState != BCS_RUNNING && !g_obdAlive && g_btLastEnd &&
-        millis() - g_btLastEnd > BT_IDLE_OFF_MS) {
-      btStackDown(); g_btLastEnd = millis();
-      logLine("BT: radio auto-off after %lu min idle", (unsigned long)(BT_IDLE_OFF_MS / 60000));
-    }
-    obdLogMaybeStart();                             // with logging on, a running engine wants the link
+    // (fw 4.76: no idle auto-off -- the Bluetooth stack stays up from boot.)
+    obdEngineMaybeStart();                          // a running engine gets the OBD link, page or no page
     if (!g_runRecDone && timeIsValid() && g_lastV > 5.0f) reconcileOpenRun();
   }
   loopMark("loop");

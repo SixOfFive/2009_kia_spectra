@@ -14,6 +14,33 @@ anything earlier, see `logs/` and `git log`.
 
 ---
 
+## 2026-09-18 — verified on the road: 10 s rows, the VIN read while running, five logs cleared
+
+Three days of ordinary driving closed every verification the 2026-09-15 entries left open.
+No code changed.
+
+- **Rows land 10 s apart.** The 2026-09-17 log holds 542 rows across 4.5 hours, about
+  90 minutes of engine running: median gap 10.0 s, mean 10.16 s, widest gap inside a
+  drive 39 s.
+- **A sweep is far shorter than the interval.** `/obdstate` reports `sweep_ms` 2105 and
+  `sweep_max_ms` 3899 since the 4.80 boot: a full pass of every logged PID takes about
+  2 s, and 3.9 s at worst, against a 10 s row.
+- **No cell was blanked.** None of that log's 26 columns has an empty cell, so the
+  freshness window — the longer of 10 s and the sweep — does its job.
+- **The single values were read while the engine ran**, on the first drive after the
+  deploy: the VIN (matching the car), calibration ID `L9NCMN1ATLD2C20ND6`, ECU name
+  `TCM-TransmisCtrl`, protocol `AUTO, ISO 15765-4 (CAN 11/500)` and reader ELM327 v1.5 —
+  20 values in all, with no check-engine light and no stored codes.
+- **Clearing works after real drives.** Five board logs have been kept and cleared: 10,
+  265, 1, 21 and 542 rows. The board's log is empty and the VM holds 839 rows
+  (2026-09-14 19:52:10 → 2026-09-17 13:08:58, 104 KB).
+- **The page keeps up.** It reads the 839-row archive in 1 ms and draws 21 graphs over
+  13 drives, with six entries in the CSV list.
+- **The board is stable on 4.80:** up 3.1 days since the flash, no panic, auto-start
+  still watching.
+
+---
+
 ## 2026-09-15 — obd-dashboard: view one pulled CSV at a time
 
 ### Added — a CSV list on the page
